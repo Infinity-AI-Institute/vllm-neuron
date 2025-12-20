@@ -1,0 +1,11 @@
+# Core dependencies with Neuron-compatible constraints
+setuptools-scm>=8
+packaging>=24.2
+
+# vLLM installation
+vllm==0.11.0
+
+# Neuron dependencies
+torch-neuronx>=2.7.0
+neuronx-cc>=2.0.0a0
+torchvision
