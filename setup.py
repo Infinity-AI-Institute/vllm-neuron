@@ -26,7 +26,7 @@ for root, dirs, files in os.walk("configuration"):
 
 setup(
     name="vllm-neuron",
-    version="0.2.1-lts",
+    version="0.2.1+lts",
     author="AWS Neuron team",
     license="Apache 2.0",
     description="vLLM Neuron backend plugin",
