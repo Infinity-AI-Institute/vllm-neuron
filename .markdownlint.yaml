@@ -1,0 +1,11 @@
+# Markdownlint configuration
+# https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md
+
+# Disable line length - too strict for documentation with tables/URLs
+MD013: false
+
+# Allow inline HTML (needed for README badges/centering)
+MD033: false
+
+# Allow first line to not be a heading (README uses centered HTML div)
+MD041: false

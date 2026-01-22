@@ -1,0 +1,7 @@
+[files]
+extend-exclude = [
+    "*.patch",
+    "*.diff",
+]
+
+# Add any othher exceptions as they come up
