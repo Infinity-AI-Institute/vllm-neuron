@@ -859,94 +859,6 @@ def test_get_vllm_version():
         assert NeuronPlatform._get_vllm_version() == "unknown"
 
 
-def test_chat_completion_override_function_replacement():
-    """Test that override behavior is correct for version 0.11.0 in different environments."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="0.11.0"):
-        # Test the override function behavior - it should either succeed or fail gracefully
-        with patch("vllm_neuron.platform.logger") as mock_logger:
-            # Call the override function
-            NeuronPlatform._apply_chat_completion_stream_override()
-
-            # Check the logging to determine what happened
-            info_calls = [str(call) for call in mock_logger.info.call_args_list]
-            warning_calls = [str(call) for call in mock_logger.warning.call_args_list]
-
-            # The function should either:
-            # 1. Successfully apply the override (info log with "Applied Neuron chat completion...")
-            # 2. Gracefully handle import failure (warning log with "Could not import required modules...")
-
-            success_logged = any(
-                "Applied Neuron chat completion stream generator override" in call
-                for call in info_calls
-            )
-            import_error_logged = any(
-                "Could not import required modules for chat completion stream override"
-                in call
-                for call in warning_calls
-            )
-
-            # One of these should be true - either success or graceful failure
-            assert success_logged or import_error_logged, (
-                f"Expected either success or import error logging. Info calls: {info_calls}, Warning calls: {warning_calls}"
-            )
-
-
-def test_chat_completion_override_skipped_for_wrong_version():
-    """Test that override is skipped when version doesn't match 0.11.0."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="0.10.0"):
-        with patch("vllm.entrypoints.openai.serving_chat.OpenAIServingChat"):
-            # Override should be skipped for wrong version
-            NeuronPlatform._apply_chat_completion_stream_override()
-            # No assertion needed - we're just testing that no exception is raised
-
-
-def test_chat_completion_override_skipped_for_unknown_version():
-    """Test that override is skipped when version is unknown."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="unknown"):
-        with patch(
-            "vllm.entrypoints.openai.serving_chat.OpenAIServingChat"
-        ) as mock_class:
-            original_method = mock_class.chat_completion_stream_generator
-
-            NeuronPlatform._apply_chat_completion_stream_override()
-
-            # Verify the method was NOT replaced
-            assert mock_class.chat_completion_stream_generator == original_method
-
-
-def test_chat_completion_override_handles_import_error():
-    """Test that override handles import errors gracefully without raising."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="0.11.0"):
-        with patch(
-            "vllm.entrypoints.openai.serving_chat.OpenAIServingChat",
-            side_effect=ImportError("test error"),
-        ):
-            # Should not raise an exception
-            NeuronPlatform._apply_chat_completion_stream_override()
-
-
-def test_chat_completion_override_handles_runtime_error():
-    """Test that override handles runtime errors gracefully without raising."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="0.11.0"):
-        with patch(
-            "vllm.entrypoints.openai.serving_chat.OpenAIServingChat",
-            side_effect=RuntimeError("test error"),
-        ):
-            # Should not raise an exception
-            NeuronPlatform._apply_chat_completion_stream_override()
-
-
-def test_chat_completion_override_called_during_init():
-    """Test that override method is called during platform initialization."""
-    NeuronPlatform._config_overrides_applied = False
-
-    # Mock the method to check if it's called
-    with patch.object(NeuronPlatform, "_apply_config_overrides") as mock_apply:
-        # pre_register_and_update should call _apply_config_overrides
-        NeuronPlatform.pre_register_and_update()
-        mock_apply.assert_called_once()
-
-
 def test_get_attn_backend_cls():
     """Test get_attn_backend_cls method.
 
@@ -1185,37 +1097,6 @@ def test_get_vllm_version_with_warning():
             mock_logger.warning.assert_called_once_with(
                 "Could not determine vLLM version"
             )
-
-
-def test_chat_completion_override_with_successful_import():
-    """Test chat completion override with successful import and application."""
-    with patch.object(NeuronPlatform, "_get_vllm_version", return_value="0.11.0"):
-        with patch("vllm_neuron.platform.logger") as mock_logger:
-            # Mock all the required imports to succeed
-            mock_modules = {
-                "vllm.entrypoints.openai.serving_chat": Mock(),
-                "vllm.entrypoints.chat_utils": Mock(),
-                "vllm.entrypoints.harmony_utils": Mock(),
-                "vllm.entrypoints.openai.protocol": Mock(),
-                "vllm.entrypoints.openai.tool_parsers": Mock(),
-                "vllm.outputs": Mock(),
-                "vllm.transformers_utils.tokenizer": Mock(),
-                "vllm.utils": Mock(),
-            }
-
-            with patch.dict("sys.modules", mock_modules):
-                # Mock the main class that gets modified
-                with patch("vllm.entrypoints.openai.serving_chat.OpenAIServingChat"):
-                    NeuronPlatform._apply_chat_completion_stream_override()
-
-                    # Verify success logging with % formatting (lazy evaluation)
-                    mock_logger.info.assert_called_once()
-                    call_args = mock_logger.info.call_args[0]
-                    assert call_args[0] == (
-                        "Applied Neuron chat completion stream generator override for vLLM %s "
-                        "(fixes harmony parser delta_text accumulation bug during speculation)"
-                    )
-                    assert call_args[1] == "0.11.0"
 
 
 def test_cache_config_none():

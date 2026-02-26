@@ -42,7 +42,6 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
-from vllm_neuron.distributed.kv_transfer.local_transfer import copy_kv_blocks
 from vllm_neuron.worker.constants import NEURON_MULTI_MODAL_MODELS
 from vllm_neuron.worker.neuronx_distributed_model_loader import get_neuron_model
 from vllm_neuron.worker.utils import get_num_layers_from_hf_config
@@ -459,7 +458,6 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunner
                         kv_caches[f"tp{rank}_layer{layer}_v"] = kv_on_tp_rank[v_key]
 
             get_kv_transfer_group().register_kv_caches(kv_caches)
-            get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
 
     def _get_nxdi_lora_config(self):
         """

@@ -118,8 +118,6 @@ class NeuronPlatform(Platform):
                 platform_overrides.changed_get_and_verify_max_len
             )
 
-            # Apply chat completion stream generator override for vLLM 0.11.0
-            cls._apply_chat_completion_stream_override()
             # Apply the world_size_across_dp override using a different approach
             cls._apply_world_size_override(ParallelConfig)
 
@@ -140,50 +138,6 @@ class NeuronPlatform(Platform):
         except importlib.metadata.PackageNotFoundError:
             logger.warning("Could not determine vLLM version")
             return "unknown"
-
-    @classmethod
-    def _apply_chat_completion_stream_override(cls) -> None:
-        """
-        Apply chat completion stream generator override for vLLM 0.11.0.
-        This fixes a bug in the harmony parser where delta_text accumulation
-        was incorrect during speculation.
-        """
-        vllm_version = cls._get_vllm_version()
-
-        if vllm_version != "0.11.0":
-            logger.debug(
-                "Skipping chat completion stream override - vLLM version %s "
-                "does not match target version 0.11.0",
-                vllm_version,
-            )
-            return
-
-        try:
-            # Import the fixed streaming function from patches
-            from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-
-            from vllm_neuron.patches.chat_completion_stream_v0_11_0 import (
-                fixed_chat_completion_stream_generator,
-            )
-
-            # Apply the override by replacing the method
-            OpenAIServingChat.chat_completion_stream_generator = (
-                fixed_chat_completion_stream_generator
-            )
-
-            logger.info(
-                "Applied Neuron chat completion stream generator override for vLLM %s "
-                "(fixes harmony parser delta_text accumulation bug during speculation)",
-                vllm_version,
-            )
-
-        except ImportError as e:
-            logger.warning(
-                "Could not import required modules for chat completion stream override: %s",
-                e,
-            )
-        except Exception as e:
-            logger.error("Error applying chat completion stream override: %s", e)
 
     @classmethod
     def _apply_openai_overrides(cls) -> None:

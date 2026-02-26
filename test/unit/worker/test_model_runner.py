@@ -815,8 +815,8 @@ class TestModelRunner:
             assert "tp1_layer0_kv" in registered_caches
             assert "tp1_layer1_kv" in registered_caches
 
-            # Verify host transfer buffer operations were set
-            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_called_once()
+            # Verify KV caches were registered
+            mock_kv_transfer_group.register_kv_caches.assert_called_once()
 
             assert result is None
 
@@ -888,7 +888,7 @@ class TestModelRunner:
             assert "tp1_layer1_v" in registered_caches
 
             # Verify host transfer buffer operations were set
-            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_called_once()
+            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_not_called()
 
             assert result is None
 
@@ -973,8 +973,8 @@ class TestModelRunner:
             ]
             assert len(registered_caches) == 0
 
-            # Verify host transfer buffer operations were still set
-            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_called_once()
+            # Verify host transfer buffer operations were not set (removed)
+            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_not_called()
 
             assert result is None
 
@@ -1028,51 +1028,6 @@ class TestModelRunner:
 
             assert result is None
 
-    def test_initialize_kv_cache_copy_kv_blocks_import(self, model_runner):
-        """Test that copy_kv_blocks is properly imported and used.
-
-        Verifies that the copy_kv_blocks function from local_transfer module
-        is correctly passed to set_host_xfer_buffer_ops.
-
-        Args:
-            model_runner: Fixture providing configured ModelRunner instance
-        """
-        # Mock model state with combined keys
-        # The nxdi_kv_cache_state should be a list where each element is a dictionary
-        mock_kv_state_rank0 = {
-            "kv_mgr.past_key_values.combined.0": Mock(),
-        }
-        # This should be a list, not a dictionary with integer keys
-        mock_nxd_model_state = [mock_kv_state_rank0]
-
-        model_runner.model = Mock()
-        model_runner.model.model.context_encoding_model.model.nxd_model.state = (
-            mock_nxd_model_state
-        )
-
-        mock_kv_transfer_group = Mock()
-
-        with (
-            patch(
-                "vllm_neuron.worker.neuronx_distributed_model_runner.has_kv_transfer_group",
-                return_value=True,
-            ),
-            patch(
-                "vllm_neuron.worker.neuronx_distributed_model_runner.get_kv_transfer_group",
-                return_value=mock_kv_transfer_group,
-            ),
-            patch(
-                "vllm_neuron.worker.neuronx_distributed_model_runner.copy_kv_blocks"
-            ) as mock_copy_kv_blocks,
-            patch.dict(os.environ, {"NEURON_COMBINE_KV_ALLOCATIONS": "1"}),
-        ):
-            kv_cache_config = Mock()
-            model_runner.initialize_kv_cache(kv_cache_config)
-
-            # Verify copy_kv_blocks was passed to set_host_xfer_buffer_ops
-            mock_kv_transfer_group.set_host_xfer_buffer_ops.assert_called_once_with(
-                mock_copy_kv_blocks
-            )
 
     def test_get_nxdi_lora_config(self, model_runner):
         """Test LoRA configuration generation with different environment settings.
