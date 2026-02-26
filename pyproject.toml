@@ -1,0 +1,35 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<80.0.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest]
+testpaths = ["test/unit"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["vllm_neuron"]
+omit = [
+    "test/*",
+    "ci/*",
+    ".github/*",
+    "doc/*",
+    "*.md",
+    "setup.py",
+    "vllm_neuron/patches/*"
+]
+
+[tool.ruff.lint]
+# G004: Prevent f-strings in logging statements
+extend-select = ["G004"]
+
+[tool.ruff.lint.per-file-ignores]
+# Only enforce G004 (no f-strings in logging) in vllm_neuron folder
+"test/*" = ["G004"]
+"ci/*" = ["G004"]
+"docs/*" = ["G004"]
+"setup.py" = ["G004"]

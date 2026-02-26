@@ -1,0 +1,11 @@
+[files]
+extend-exclude = [
+    "*.patch",
+    "*.diff",
+]
+
+[default.extend-words]
+# thw = temporal/height/width - valid ML term for video/image grid dimensions
+thw = "thw"
+
+# Add any othher exceptions as they come up
