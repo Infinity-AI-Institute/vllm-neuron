@@ -1,0 +1,24 @@
+[files]
+extend-exclude = [
+    "*.patch",
+    "*.diff",
+    "test/evaluation/clients/vlmeval/overwrites/dataset/utils/vqa_eval.py",
+]
+
+[default.extend-words]
+# thw = temporal/height/width - valid ML term for video/image grid dimensions
+thw = "thw"
+# numpy.arange is a valid function name
+arange = "arange"
+aranges = "aranges"
+# nd = neuron device index (valid abbreviation in neuron code)
+nd = "nd"
+# interm = intermediate dimension (valid ML abbreviation)
+interm = "interm"
+# subtile = sub-tile in tensor operations (valid term)
+subtile = "subtile"
+subtiles = "subtiles"
+
+[default.extend-identifiers]
+# NCC_ITEN406 is a real NeuronX compiler error code
+NCC_ITEN406 = "NCC_ITEN406"
