@@ -25,6 +25,7 @@ from .cache_ops import (
 from .config import Glm52MoeDsaConfig
 from .dense_mlp import Glm52DenseMlp
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
+from .factory import GlmMoeDsaForCausalLM
 from .moe import Glm52ExpertRouter, select_glm52_experts
 from .indexer import (
     Glm52FullIndexer,
@@ -33,6 +34,12 @@ from .indexer import (
     advance_index_share_state,
 )
 from .mla import Glm52MlaAttention, Glm52MlaProjection
+from .model import (
+    Glm52DecoderLayer,
+    Glm52Model,
+    Glm52MoeDsaForCausalLM,
+    Glm52RotaryEmbedding,
+)
 from .parallelism import RoutedExpertPlan
 from .shared_expert import Glm52SharedExpert
 from .sparse_mlp import Glm52SparseMlp, glm52_rms_norm
@@ -52,6 +59,11 @@ __all__ = [
     "Glm52MlaAttention",
     "Glm52MlaProjection",
     "Glm52MoeDsaConfig",
+    "Glm52MoeDsaForCausalLM",
+    "Glm52Model",
+    "Glm52DecoderLayer",
+    "Glm52RotaryEmbedding",
+    "GlmMoeDsaForCausalLM",
     "Glm52DenseMlp",
     "Glm52RoutedExperts",
     "Glm52SharedExpert",

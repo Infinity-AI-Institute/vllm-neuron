@@ -63,6 +63,55 @@ def test_fp8_paged_cache_uses_explicit_quantization_multiplier() -> None:
     torch.testing.assert_close(gathered.squeeze(0), values, atol=0.02, rtol=0.02)
 
 
+def test_invalid_padded_writes_do_not_overwrite_live_cache_slots() -> None:
+    cache = torch.zeros(1, 1, 2, 2, dtype=torch.bfloat16)
+    cache[0, 0, 0] = torch.tensor([11.0, 12.0], dtype=torch.bfloat16)
+    values = torch.tensor(
+        [
+            [[21.0, 22.0]],
+            [[91.0, 92.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    write_paged_cache(
+        cache,
+        values,
+        torch.tensor([1, -1]),
+        block_size=2,
+    )
+
+    torch.testing.assert_close(
+        cache[0, 0, 0],
+        torch.tensor([11.0, 12.0], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(cache[0, 0, 1], values[0, 0])
+
+
+def test_all_invalid_padded_writes_preserve_cache() -> None:
+    cache = torch.tensor(
+        [[[[1.0, 2.0], [3.0, 4.0]]]],
+        dtype=torch.bfloat16,
+    )
+    original = cache.clone()
+    values = torch.tensor(
+        [
+            [[91.0, 92.0]],
+            [[93.0, 94.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    write_paged_cache(
+        cache,
+        values,
+        torch.tensor([-1, 10]),
+        block_size=2,
+    )
+
+    torch.testing.assert_close(cache, original)
+
+
 def test_selected_paged_gather_resolves_logical_to_physical_blocks() -> None:
     cache = torch.zeros(3, 1, 2, 2, dtype=torch.bfloat16)
     cache[0, 0] = torch.tensor([[50.0, 51.0], [52.0, 53.0]])

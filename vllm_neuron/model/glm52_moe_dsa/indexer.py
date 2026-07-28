@@ -79,6 +79,7 @@ class Glm52FullIndexer(nn.Module):
         cache_binding: IndexerCacheBinding,
         dtype: torch.dtype | None = None,
         topk_backend: str = "torch",
+        device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
         if config.indexer_types[layer_idx] != "full":
@@ -98,24 +99,29 @@ class Glm52FullIndexer(nn.Module):
             config.index_n_heads * config.index_head_dim,
             bias=False,
             dtype=self.dtype,
+            device=device,
         )
         self.wk = nn.Linear(
             config.hidden_size,
             config.index_head_dim,
             bias=False,
             dtype=self.dtype,
+            device=device,
         )
         self.k_norm = nn.LayerNorm(
             config.index_head_dim,
             eps=1e-6,
             dtype=self.dtype,
+            device=device,
         )
         self.weights_proj = nn.Linear(
             config.hidden_size,
             config.index_n_heads,
             bias=False,
             dtype=torch.float32,
+            device=device,
         )
+        self.requires_grad_(False)
         self.key_cache: torch.Tensor | None = None
         self.register_buffer(
             "cache_quant_multiplier",

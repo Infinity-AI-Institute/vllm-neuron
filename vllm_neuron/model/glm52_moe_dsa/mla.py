@@ -387,7 +387,8 @@ class Glm52MlaAttention(nn.Module):
                 layer_idx=layer_idx,
                 cache_binding=cache_layout.indexer_binding(layer_idx),
                 dtype=self.dtype,
-                topk_backend="neuron",
+                topk_backend="neuron" if static_fp8 else "torch",
+                device=device,
             )
             if config.indexer_types[layer_idx] == "full"
             else None
@@ -588,4 +589,141 @@ class Glm52MlaAttention(nn.Module):
         )
         if self.tp_group is not None and self.tp_group.world_size > 1:
             output = self.tp_group.all_reduce(output)
+        return output, index_state
+
+    def forward_paged_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
+        attn_metadata: dict[str, dict[str, torch.Tensor | int]],
+        *,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        previous_index_state: Glm52IndexShareState | None,
+        indexer_cache: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, Glm52IndexShareState]:
+        """Exact bounded prefill over paged DSA caches.
+
+        The initial serving gate accepts only contexts no longer than
+        ``index_topk``. In that envelope the selected set contains every
+        causally visible token, so sparse attention is mathematically equal
+        to dense causal attention without materializing dense K/V history.
+        """
+        metadata = attn_metadata[self.cache_name]
+        max_query_len = metadata.get("max_query_len")
+        if not isinstance(max_query_len, int):
+            raise TypeError("prefill max_query_len must be an integer")
+        if max_query_len > self.config.index_topk:
+            raise NotImplementedError(
+                "GLM-5.2 exact prefill is limited to index_topk tokens"
+            )
+        if metadata.get("kv_segment_size"):
+            raise NotImplementedError(
+                "GLM-5.2 segmented/chunked prefill is not integrated"
+            )
+
+        full_hidden = hidden_states
+        if self.tp_group is not None and self.tp_group.world_size > 1:
+            full_hidden = self.tp_group.all_gather(hidden_states, dim=0)
+        if full_hidden.shape[0] != position_ids.numel():
+            raise ValueError(
+                "sequence-parallel attention gather must reconstruct all "
+                "prefill positions"
+            )
+
+        cos, sin = position_embeddings
+        projection = self.project(full_hidden, cos, sin)
+        if self.indexer is not None:
+            if indexer_cache is None:
+                raise RuntimeError("full indexer layer requires its paged key cache")
+            computed_topk = self.indexer.forward_paged(
+                full_hidden,
+                projection.q_resid,
+                cos,
+                sin,
+                position_ids=position_ids.reshape(-1),
+                attn_metadata=attn_metadata,
+                key_cache=indexer_cache,
+            )
+        else:
+            computed_topk = None
+        index_state = advance_index_share_state(
+            self.config,
+            layer_idx=self.layer_idx,
+            previous=previous_index_state,
+            computed_topk=computed_topk,
+        )
+
+        slot_mapping = metadata["slot_mapping"]
+        block_size = metadata["block_size"]
+        block_table = metadata["block_table_tensor"]
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise TypeError("slot_mapping metadata must be a tensor")
+        if not isinstance(block_table, torch.Tensor):
+            raise TypeError("block_table_tensor metadata must be a tensor")
+        if not isinstance(block_size, int):
+            raise TypeError("block_size metadata must be an integer")
+
+        key_multiplier = (
+            self.key_cache_quant_multiplier
+            if key_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else None
+        )
+        value_multiplier = (
+            self.value_cache_quant_multiplier
+            if value_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else None
+        )
+        write_paged_cache(
+            key_cache,
+            projection.key,
+            slot_mapping,
+            block_size=block_size,
+            quant_multiplier=key_multiplier,
+        )
+        write_paged_cache(
+            value_cache,
+            projection.value,
+            slot_mapping,
+            block_size=block_size,
+            quant_multiplier=value_multiplier,
+        )
+
+        batch_size = block_table.shape[0]
+        tokens = full_hidden.shape[0]
+        if tokens % batch_size:
+            raise ValueError("flattened token count must divide over requests")
+        query_tokens = tokens // batch_size
+        positions = position_ids.reshape(batch_size, query_tokens)
+        query = projection.query.reshape(
+            batch_size,
+            query_tokens,
+            self.local_heads,
+            self.config.qk_head_dim,
+        )
+        topk_indices = index_state.topk_indices.reshape(
+            batch_size,
+            query_tokens,
+            -1,
+        )
+        key_lengths = positions.amax(dim=1).to(torch.int64) + 1
+        output = glm52_paged_sparse_attention(
+            query,
+            key_cache,
+            value_cache,
+            topk_indices,
+            block_table,
+            block_size=block_size,
+            position_ids=positions,
+            scaling=self.scaling,
+            key_lengths=key_lengths,
+            key_quant_multiplier=key_multiplier,
+            value_quant_multiplier=value_multiplier,
+        )
+        output = self.o_proj(
+            output.reshape(tokens, self.local_heads * self.config.v_head_dim)
+        )
+        if self.tp_group is not None and self.tp_group.world_size > 1:
+            output = self.tp_group.reduce_scatter(output, dim=0)
         return output, index_state

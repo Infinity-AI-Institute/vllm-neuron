@@ -60,15 +60,23 @@ class Glm52ExpertRouter(nn.Module):
         num_experts: int,
         top_k: int,
         routed_scaling_factor: float,
+        device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=torch.float32)
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.float32,
+                device=device,
+            ),
+            requires_grad=False,
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32)
+            torch.empty(num_experts, dtype=torch.float32, device=device),
+            requires_grad=False,
         )
 
     def forward(

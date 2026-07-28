@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from pathlib import Path
+
+import pytest
+from transformers import PretrainedConfig
+
+from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
+from vllm_neuron.model.glm52_moe_dsa.factory import GlmMoeDsaForCausalLM
+from vllm_neuron.model.neuron_config import NeuronConfig
+
+
+def _hf_config() -> PretrainedConfig:
+    frozen = Glm52MoeDsaConfig()
+    values = {
+        field: getattr(frozen, field)
+        for field in frozen.__dataclass_fields__
+        if field not in ("neuron_config", "torch_dtype")
+    }
+    values.update(
+        architectures=["GlmMoeDsaForCausalLM"],
+        torch_dtype="bfloat16",
+        quantization_config={
+            "quant_method": "modelopt",
+            "quantization": {
+                "quant_algo": "FP8",
+                "exclude_modules": ["lm_head"],
+            },
+        },
+        glm52_artifact={
+            "artifact_version": "glm52-trn2-static-fp8-v1",
+            "loader_ready": True,
+            "mtp_enabled": False,
+            "index_closure_status": "passed",
+        },
+    )
+    return PretrainedConfig(**values)
+
+
+def _neuron_config() -> NeuronConfig:
+    return NeuronConfig(
+        ep_degree=8,
+        on_device_sampling_config=None,
+    )
+
+
+def test_factory_accepts_only_frozen_tp64_trn2_static_fp8(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    monkeypatch.setattr(
+        "vllm_neuron.model.glm52_moe_dsa.factory._get_tp_world_size",
+        lambda: 64,
+    )
+
+    GlmMoeDsaForCausalLM._validate_config(_hf_config(), _neuron_config())
+
+
+def test_factory_rejects_native_block_fp8(monkeypatch) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.quantization_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+
+    try:
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+    except ValueError as error:
+        assert "native block-FP8" in str(error)
+    else:
+        raise AssertionError("native block-FP8 artifact was accepted")
+
+
+def test_factory_rejects_artifact_without_loader_closure(monkeypatch) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.glm52_artifact["loader_ready"] = False
+
+    try:
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+    except ValueError as error:
+        assert "loader_ready" in str(error)
+    else:
+        raise AssertionError("incomplete converted artifact was accepted")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("artifact_version", "forged-v2", "artifact_version"),
+        ("mtp_enabled", True, "MTP disabled"),
+        ("index_closure_status", "skipped", "index closure"),
+    ),
+)
+def test_factory_rejects_incompatible_artifact_markers(
+    monkeypatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.glm52_artifact[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
+def test_factory_rejects_dp_and_on_device_sampling(monkeypatch) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    monkeypatch.setattr(
+        "vllm_neuron.model.glm52_moe_dsa.factory._get_tp_world_size",
+        lambda: 64,
+    )
+    config = _neuron_config()
+    config.attention_dp_size = 2
+
+    try:
+        GlmMoeDsaForCausalLM._validate_config(_hf_config(), config)
+    except ValueError as error:
+        assert "attention_dp_size" in str(error)
+    else:
+        raise AssertionError("unsupported attention DP was accepted")
+
+    config.attention_dp_size = 1
+    config.on_device_sampling_config = object()
+    try:
+        GlmMoeDsaForCausalLM._validate_config(_hf_config(), config)
+    except ValueError as error:
+        assert "on-device sampling" in str(error)
+    else:
+        raise AssertionError("unsupported on-device sampling was accepted")
+
+
+def test_registry_uses_exact_hugging_face_architecture_key() -> None:
+    repository = Path(__file__).parents[4]
+    registry_source = (repository / "vllm_neuron" / "model" / "registry.py").read_text(
+        encoding="utf-8"
+    )
+    assert '("GlmMoeDsaForCausalLM", GlmMoeDsaForCausalLM)' in registry_source

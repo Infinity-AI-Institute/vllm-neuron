@@ -71,6 +71,7 @@ class Glm52SparseMlp(nn.Module):
             config.n_routed_experts,
             config.num_experts_per_tok,
             config.routed_scaling_factor,
+            device=device,
         )
         self.experts = Glm52RoutedExperts(
             config,

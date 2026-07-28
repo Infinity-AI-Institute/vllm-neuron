@@ -13,8 +13,7 @@ _TRN2_E4M3_MAX = 240.0
 def _validate_cache_shape(cache: torch.Tensor, block_size: int) -> None:
     if cache.ndim != 4:
         raise ValueError(
-            "paged cache must have shape "
-            "[num_blocks, num_heads, block_size, head_dim]"
+            "paged cache must have shape [num_blocks, num_heads, block_size, head_dim]"
         )
     if block_size <= 0:
         raise ValueError("block_size must be positive")
@@ -55,9 +54,10 @@ def write_paged_cache(
         block_size: Cache block size from attention metadata.
         quant_multiplier: For FP8, a scalar ``q = value * multiplier``.
 
-    Invalid padded slots are redirected to slot zero, matching the existing
-    Neuron attention cache path. The scheduler reserves padding entries so
-    they cannot be read as live sequence data.
+    Invalid padded slots are redirected to an identical valid-token write.
+    When every slot is invalid, they rewrite slot zero with its existing
+    value. This preserves static scatter shapes without allowing padding to
+    overwrite a live cache entry.
     """
     _validate_cache_shape(cache, block_size)
     _validate_quant_multiplier(cache, quant_multiplier)
@@ -71,13 +71,15 @@ def write_paged_cache(
     num_blocks, num_heads, _, head_dim = cache.shape
     max_slot = num_blocks * block_size
     flat_slots = slot_mapping.reshape(-1)
-    safe_slots = torch.where(
-        (flat_slots < 0) | (flat_slots >= max_slot),
-        torch.zeros_like(flat_slots),
-        flat_slots,
-    ).to(torch.long)
-    block_indices = safe_slots // block_size
-    block_offsets = safe_slots % block_size
+    valid_slots = (flat_slots >= 0) & (flat_slots < max_slot)
+    has_valid_slot = valid_slots.any()
+    first_valid = valid_slots & (valid_slots.to(torch.int64).cumsum(0) == 1)
+    reference_slot = torch.where(
+        has_valid_slot,
+        torch.where(first_valid, flat_slots, torch.zeros_like(flat_slots)).sum(),
+        torch.zeros((), dtype=flat_slots.dtype, device=flat_slots.device),
+    )
+    safe_slots = torch.where(valid_slots, flat_slots, reference_slot).to(torch.long)
 
     stored = values
     if cache.dtype in _FP8_DTYPES:
@@ -95,6 +97,22 @@ def write_paged_cache(
     else:
         stored = values.to(cache.dtype)
 
+    reference_from_values = (
+        stored.to(torch.float32) * first_valid.reshape(-1, 1, 1).to(torch.float32)
+    ).sum(dim=0)
+    reference_value = torch.where(
+        has_valid_slot,
+        reference_from_values,
+        cache[0, :, 0, :].to(torch.float32),
+    ).to(cache.dtype)
+    stored = torch.where(
+        valid_slots.reshape(-1, 1, 1),
+        stored,
+        reference_value.unsqueeze(0),
+    )
+
+    block_indices = safe_slots // block_size
+    block_offsets = safe_slots % block_size
     head_indices = torch.arange(
         num_heads,
         device=values.device,
@@ -179,8 +197,10 @@ def gather_selected_paged_cache(
 
     selected = selected_positions.to(torch.long)
     logical_limit = block_table.shape[1] * block_size
-    if not torch.compiler.is_compiling() and selected.numel() and (
-        selected.min().item() < 0 or selected.max().item() >= logical_limit
+    if (
+        not torch.compiler.is_compiling()
+        and selected.numel()
+        and (selected.min().item() < 0 or selected.max().item() >= logical_limit)
     ):
         raise ValueError("selected logical position is outside the block table")
 
