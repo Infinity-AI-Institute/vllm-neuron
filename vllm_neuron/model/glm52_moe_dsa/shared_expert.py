@@ -239,8 +239,9 @@ class Glm52SharedExpert(nn.Module):
         *,
         norm_weight: torch.Tensor,
         eps: float,
+        tp_group,
     ) -> torch.Tensor:
-        """Fuse RMSNorm+quantization before the static-FP8 CTE MLP."""
+        """Fuse norm+quant, gather subgroup SP, run MLP, then reduce-scatter."""
 
         from nkilib.core.utils.common_types import QuantizationType
 
@@ -253,4 +254,9 @@ class Glm52SharedExpert(nn.Module):
             eps=eps,
             quantization_type=QuantizationType.STATIC,
         )
-        return self._run(hidden_quantized)
+        if tp_group.world_size > 1:
+            hidden_quantized = tp_group.all_gather(hidden_quantized, dim=0)
+        output = self._run(hidden_quantized)
+        if tp_group.world_size > 1:
+            output = tp_group.reduce_scatter(output, dim=0)
+        return output
