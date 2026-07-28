@@ -10,6 +10,7 @@ from nkilib.core.utils.common_types import (
     MoEAllToAllVStrategy,
 )
 
+from vllm_neuron.compile.platform import get_platform_target
 from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
 
 
@@ -45,7 +46,7 @@ def moe_tkg(
 ) -> Tensor:
     """MoE expert MLP token generation kernel API.
 
-    Currently only supports MXFP4 on Trn3; support will be extended in the future to BF16/FP8 on Trn2 and MXFP8 on Trn3.
+    Supports BF16 and row-scale FP8 on Trn2, and MXFP4 on Trn3.
 
     This functional API should be used instead of the moe_block_tkg functional API when different
     sharding schemes are used in the norm/router region of the MoE block and in the expert MLPs region.
@@ -190,7 +191,9 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            f"moe_tkg currently only supports MXFP4 weights on Trn3, but got {expert_gate_up_weights.dtype=}"
+            "moe_tkg requires BF16 or row-scale FP8 weights on Trn2, "
+            "or MXFP4 weights on Trn3; "
+            f"got {expert_gate_up_weights.dtype=}"
         )
 
 
@@ -206,7 +209,7 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 or BF16 weights
+        - Must use MXFP4, BF16, or Trn2 row-scale FP8 weights
     """
     if not can_run_kernel(hidden_input):
         return False
@@ -216,6 +219,12 @@ def _can_use_kernel(
         return True  # MXFP4 always uses kernel
 
     if expert_down_weights.dtype == torch.bfloat16:
+        return True
+
+    if (
+        expert_down_weights.dtype == torch.float8_e4m3fn
+        and get_platform_target() == "trn2"
+    ):
         return True
 
     return False

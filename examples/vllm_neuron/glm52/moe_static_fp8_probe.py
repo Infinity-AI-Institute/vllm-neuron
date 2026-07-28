@@ -20,8 +20,6 @@ from nkilib.core.utils.common_types import (
 import vllm_neuron  # noqa: F401
 from vllm_neuron.envs import get_compile_backend_name
 from vllm_neuron.functional.moe.moe_tkg import moe_tkg
-from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
-from vllm_neuron.nki.nki_hop import wrap_nki
 
 _WORLD_SIZE = 64
 _NUM_EXPERTS = 256
@@ -112,14 +110,7 @@ class LocalMoeProbe(torch.nn.Module):
             activation_fn=ActFnType.SiLU,
             output_dtype=torch.bfloat16,
         )
-        if not self.use_fp8:
-            return moe_tkg(**kwargs)
-
-        # The public guard rejects float8 before it reaches the low-level API.
-        # This probe bypasses only that guard so hardware support can be proven
-        # before the production validator is relaxed.
-        wrapped = wrap_nki(moe_tkg_wrapper)
-        return wrapped[2](**kwargs)
+        return moe_tkg(**kwargs)
 
 
 def _make_inputs(
