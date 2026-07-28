@@ -123,8 +123,10 @@ class LocalMoeCteProbe(torch.nn.Module):
         down_weight: torch.Tensor,
         gate_up_scale: torch.Tensor | None,
         down_scale: torch.Tensor | None,
+        implementation: MoECTEImplementation,
     ) -> None:
         super().__init__()
+        self.implementation = implementation
         self.register_buffer("gate_up_weight", gate_up_weight)
         self.register_buffer("down_weight", down_weight)
         if gate_up_scale is not None:
@@ -154,7 +156,7 @@ class LocalMoeCteProbe(torch.nn.Module):
             token_position_to_id=token_position_to_id,
             block_to_expert=block_to_expert,
             block_size=128,
-            implementation=MoECTEImplementation.shard_on_block,
+            implementation=self.implementation,
             gate_up_proj_scale=self.gate_up_scale,
             down_proj_scale=self.down_scale,
             activation_function=ActFnType.SiLU,
@@ -233,6 +235,7 @@ def _make_cte_inputs(
     ep_degree: int,
     tokens: int,
     use_fp8: bool,
+    implementation: MoECTEImplementation,
 ) -> tuple[LocalMoeCteProbe, tuple[torch.Tensor, ...], torch.Tensor]:
     if tokens % 128 != 0:
         raise ValueError("CTE tokens must be divisible by block size 128")
@@ -305,6 +308,7 @@ def _make_cte_inputs(
         down_weight,
         gate_up_scale,
         down_scale,
+        implementation,
     )
     inputs = (
         hidden,
@@ -318,6 +322,11 @@ def _make_cte_inputs(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kernel", choices=("tkg", "cte"), default="tkg")
+    parser.add_argument(
+        "--cte-implementation",
+        choices=("shard_on_block", "shard_on_i"),
+        default="shard_on_block",
+    )
     parser.add_argument("--ep-degree", type=int, required=True)
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--dtype", choices=("bf16", "fp8"), default="fp8")
@@ -328,8 +337,18 @@ def main() -> None:
         raise ValueError("CTE tokens must be one of 128, 256, 512")
 
     use_fp8 = args.dtype == "fp8"
-    make_inputs = _make_tkg_inputs if args.kernel == "tkg" else _make_cte_inputs
-    model, inputs, expected = make_inputs(args.ep_degree, args.tokens, use_fp8)
+    if args.kernel == "tkg":
+        model, inputs, expected = _make_tkg_inputs(
+            args.ep_degree, args.tokens, use_fp8
+        )
+    else:
+        implementation = getattr(MoECTEImplementation, args.cte_implementation)
+        model, inputs, expected = _make_cte_inputs(
+            args.ep_degree,
+            args.tokens,
+            use_fp8,
+            implementation,
+        )
     device = torch.device("neuron:0")
     model = model.to(device)
     device_inputs = tuple(value.to(device) for value in inputs)
@@ -348,6 +367,9 @@ def main() -> None:
             {
                 "status": "passed",
                 "kernel": args.kernel,
+                "cte_implementation": (
+                    args.cte_implementation if args.kernel == "cte" else None
+                ),
                 "ep_degree": args.ep_degree,
                 "tokens": args.tokens,
                 "dtype": args.dtype,
