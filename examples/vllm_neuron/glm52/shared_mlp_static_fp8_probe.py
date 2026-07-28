@@ -97,7 +97,7 @@ class SharedMlpProbe(torch.nn.Module):
             down_w_scale=self.down_scale,
             gate_up_in_scale=self.gate_up_input_scale,
             down_in_scale=self.down_input_scale,
-            output_dtype=torch.bfloat16,
+            output_dtype="bfloat16",
         )
 
 
