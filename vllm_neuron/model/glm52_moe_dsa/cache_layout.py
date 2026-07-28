@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import ceil
+from collections.abc import Sequence
 
 import torch
 
@@ -104,6 +105,34 @@ class Glm52CacheLayout:
             if binding.layer_idx == layer_idx:
                 return binding
         raise KeyError(f"layer {layer_idx} does not own a full DSA indexer")
+
+    def indexer_cache_tensor(
+        self,
+        kv_caches: dict[str, Sequence[torch.Tensor]],
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Resolve one full indexer's tensor from its paired cache allocation."""
+        binding = self.indexer_binding(layer_idx)
+        try:
+            cache_pair = kv_caches[binding.cache_name]
+        except KeyError as error:
+            raise KeyError(
+                f"indexer cache {binding.cache_name!r} is not initialized"
+            ) from error
+        if len(cache_pair) != 2:
+            raise ValueError(
+                f"indexer cache {binding.cache_name!r} must have two slots"
+            )
+        cache = cache_pair[binding.cache_slot]
+        if cache.ndim != 4 or cache.shape[1] != 1:
+            raise ValueError("indexer cache tensor must contain one paged key head")
+        if cache.shape[-1] != next(
+            layer.head_size
+            for layer in self.kv_spec.layers
+            if layer.name == binding.cache_name
+        ):
+            raise ValueError("indexer cache tensor has an incorrect head dimension")
+        return cache
 
     def bytes_per_token_per_rank(self) -> int:
         return sum(

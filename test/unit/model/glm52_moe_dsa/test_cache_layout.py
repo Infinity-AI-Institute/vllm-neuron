@@ -57,3 +57,18 @@ def test_bf16_cache_cost_is_exactly_twice_fp8() -> None:
     )
 
     assert bf16.bytes_per_token_per_rank() == 2 * fp8.bytes_per_token_per_rank()
+
+
+def test_paired_indexer_slots_bind_to_distinct_tensors() -> None:
+    config = Glm52MoeDsaConfig()
+    layout = Glm52CacheLayout.build(
+        config,
+        world_size=64,
+        cache_dtype=torch.bfloat16,
+    )
+    first = torch.empty(2, 1, 4, config.index_head_dim)
+    second = torch.empty_like(first)
+    caches = {"glm52.indexer_cache.0": [first, second]}
+
+    assert layout.indexer_cache_tensor(caches, 0) is first
+    assert layout.indexer_cache_tensor(caches, 1) is second

@@ -89,17 +89,99 @@ def glm52_index_topk(
     attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply causal masking and return DSA token indices."""
-    if attention_mask is not None:
-        masked_scores = index_scores + attention_mask
-    else:
-        if position_ids is None:
-            raise ValueError("position_ids are required without an attention mask")
-        key_positions = torch.arange(
-            index_scores.shape[-1],
-            device=index_scores.device,
-        )
-        causal = key_positions[None, None, :] > position_ids[:, :, None]
-        masked_scores = index_scores.masked_fill(causal, float("-inf"))
-
+    masked_scores = glm52_mask_index_scores(
+        index_scores,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+    )
     selected = min(top_k, index_scores.shape[-1])
     return masked_scores.topk(selected, dim=-1).indices.to(torch.int32)
+
+
+def glm52_mask_index_scores(
+    index_scores: torch.Tensor,
+    *,
+    position_ids: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply the causal/padding mask shared by CPU and Neuron top-k paths."""
+    if attention_mask is not None:
+        return index_scores + attention_mask
+    if position_ids is None:
+        raise ValueError("position_ids are required without an attention mask")
+    key_positions = torch.arange(
+        index_scores.shape[-1],
+        device=index_scores.device,
+    )
+    causal = key_positions[None, None, :] > position_ids[:, :, None]
+    return index_scores.masked_fill(causal, float("-inf"))
+
+
+def glm52_sparse_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    scaling: float,
+    key_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference DSA attention over the indexer's selected token positions.
+
+    Args:
+        query: ``[batch, query_tokens, heads, qk_head_dim]``.
+        key_cache: ``[batch, key_tokens, heads, qk_head_dim]``.
+        value_cache: ``[batch, key_tokens, heads, value_head_dim]``.
+        topk_indices: ``[batch, query_tokens, selected_keys]``.
+        position_ids: Absolute position of every query token.
+        scaling: MLA attention softmax scale.
+        key_lengths: Optional valid cached-key count per request.
+    """
+    if query.ndim != 4 or key_cache.ndim != 4 or value_cache.ndim != 4:
+        raise ValueError("query and cache tensors must be four-dimensional")
+    if topk_indices.ndim != 3 or position_ids.ndim != 2:
+        raise ValueError("topk_indices and position_ids have unexpected rank")
+    if query.shape[:2] != topk_indices.shape[:2]:
+        raise ValueError("topk token axes must match the query")
+    if query.shape[:2] != position_ids.shape:
+        raise ValueError("position_ids must match the query token axes")
+    if key_cache.shape[:3] != value_cache.shape[:3]:
+        raise ValueError("key and value cache axes must match")
+    if query.shape[0] != key_cache.shape[0]:
+        raise ValueError("query and cache batch sizes differ")
+    if query.shape[2] != key_cache.shape[2]:
+        raise ValueError("query and cache head counts differ")
+    if query.shape[-1] != key_cache.shape[-1]:
+        raise ValueError("query and key head dimensions differ")
+
+    selected = topk_indices.to(torch.long)
+    if selected.numel() and (
+        selected.min().item() < 0 or selected.max().item() >= key_cache.shape[1]
+    ):
+        raise ValueError("top-k index is outside the key cache")
+
+    batch_indices = torch.arange(
+        query.shape[0],
+        device=query.device,
+    )[:, None, None]
+    selected_keys = key_cache[batch_indices, selected]
+    selected_values = value_cache[batch_indices, selected]
+    scores = (
+        query.to(torch.float32).unsqueeze(2)
+        * selected_keys.to(torch.float32)
+    ).sum(dim=-1)
+    scores = scores * scaling
+
+    invalid = selected > position_ids[:, :, None]
+    if key_lengths is not None:
+        if key_lengths.shape != (query.shape[0],):
+            raise ValueError("key_lengths must contain one value per request")
+        invalid = invalid | (selected >= key_lengths[:, None, None])
+    scores = scores.masked_fill(invalid.unsqueeze(-1), float("-inf"))
+    probabilities = torch.softmax(scores, dim=2)
+    probabilities = torch.nan_to_num(probabilities)
+    output = (
+        probabilities.unsqueeze(-1) * selected_values.to(torch.float32)
+    ).sum(dim=2)
+    return output.to(query.dtype)

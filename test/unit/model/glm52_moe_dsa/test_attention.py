@@ -8,6 +8,7 @@ from vllm_neuron.model.glm52_moe_dsa.attention import (
     apply_glm52_interleaved_rope,
     glm52_index_scores,
     glm52_index_topk,
+    glm52_sparse_attention,
 )
 
 
@@ -72,3 +73,32 @@ def test_index_topk_clamps_to_context() -> None:
 
     assert indices.shape == (1, 1, 4)
     assert set(indices[0, 0].tolist()) == {0, 1, 2, 3}
+
+
+def test_sparse_attention_gathers_only_selected_causal_tokens() -> None:
+    query = torch.tensor(
+        [[[[1.0, 0.0]], [[0.0, 1.0]]]],
+    )
+    key_cache = torch.tensor(
+        [[[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]]],
+    )
+    value_cache = torch.tensor(
+        [[[[10.0]], [[20.0]], [[30.0]]]],
+    )
+    topk_indices = torch.tensor([[[0, 2], [0, 1]]], dtype=torch.int32)
+
+    output = glm52_sparse_attention(
+        query,
+        key_cache,
+        value_cache,
+        topk_indices,
+        position_ids=torch.tensor([[0, 1]]),
+        scaling=1.0,
+    )
+
+    torch.testing.assert_close(output[0, 0], torch.tensor([[10.0]]))
+    expected = (
+        torch.softmax(torch.tensor([0.0, 1.0]), dim=0)
+        * torch.tensor([10.0, 20.0])
+    ).sum()
+    torch.testing.assert_close(output[0, 1], expected.reshape(1, 1))
