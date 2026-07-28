@@ -36,6 +36,10 @@ CheckpointSource = str | list[str]
 
 MTP_IGNORED_PREFIX = "model.layers.78."
 STATIC_WEIGHT_SCALE_SUFFIX = ".weight_scale"
+_OCP_E4M3_MAX = 448.0
+_NEURON_LEGACY_E4M3_MAX = 240.0
+_WEIGHT_DOWNSCALE = _NEURON_LEGACY_E4M3_MAX / _OCP_E4M3_MAX
+_SCALE_COMPENSATION = _OCP_E4M3_MAX / _NEURON_LEGACY_E4M3_MAX
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,16 @@ def _read_scalar(slice_obj: "PySafeSlice") -> torch.Tensor:
     return scalar[0]
 
 
+def _to_neuron_legacy_fp8(weight: torch.Tensor) -> torch.Tensor:
+    """Convert ModelOpt OCP E4M3 values to the Trn2 kernel's 240 range."""
+
+    return (
+        (weight.to(torch.float32) * _WEIGHT_DOWNSCALE)
+        .clamp(-_NEURON_LEGACY_E4M3_MAX, _NEURON_LEGACY_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+
 def _expert_tp_bounds(plan: RoutedExpertPlan, rank: int) -> tuple[int, int]:
     tp_rank = plan.expert_tp_rank(rank)
     start = tp_rank * plan.intermediate_per_rank
@@ -196,7 +210,7 @@ def routed_gate_up_weight_loader(
             gate = slices[offset][start:end, :]
             up = slices[offset + 1][start:end, :]
             experts.append(torch.stack((gate.T, up.T), dim=1))
-        return torch.stack(experts, dim=0)
+        return _to_neuron_legacy_fp8(torch.stack(experts, dim=0))
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -216,9 +230,11 @@ def routed_down_weight_loader(
                 f"got {len(slices)}"
             )
         start, end = _expert_tp_bounds(plan, rank)
-        return torch.stack(
-            [slice_obj[:, start:end].T for slice_obj in slices],
-            dim=0,
+        return _to_neuron_legacy_fp8(
+            torch.stack(
+                [slice_obj[:, start:end].T for slice_obj in slices],
+                dim=0,
+            )
         )
 
     return SafetensorsWeightLoader(transform=transform)
@@ -241,8 +257,14 @@ def routed_gate_up_scale_loader(
             )
         per_expert = []
         for offset in range(0, len(slices), 2):
-            pair = torch.stack(
-                (_read_scalar(slices[offset]), _read_scalar(slices[offset + 1]))
+            pair = (
+                torch.stack(
+                    (
+                        _read_scalar(slices[offset]),
+                        _read_scalar(slices[offset + 1]),
+                    )
+                )
+                * _SCALE_COMPENSATION
             )
             per_expert.append(
                 pair[:, None].expand(2, plan.intermediate_per_rank)
@@ -272,7 +294,10 @@ def routed_down_scale_loader(
                 f"expected {plan.experts_per_rank} local down scales, "
                 f"got {len(slices)}"
             )
-        scalars = torch.stack([_read_scalar(slice_obj) for slice_obj in slices])
+        scalars = (
+            torch.stack([_read_scalar(slice_obj) for slice_obj in slices])
+            * _SCALE_COMPENSATION
+        )
         return scalars[:, None].expand(plan.experts_per_rank, hidden_size).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)

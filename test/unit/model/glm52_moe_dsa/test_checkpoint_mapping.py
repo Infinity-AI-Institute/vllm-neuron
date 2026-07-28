@@ -112,9 +112,9 @@ def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
     gate_up_slices = []
     down_slices = []
     for expert in range(plan.experts_per_rank):
-        gate = torch.arange(8 * hidden).reshape(8, hidden) + expert * 1_000
+        gate = torch.arange(8 * hidden).reshape(8, hidden) + expert * 10
         up = gate + 100
-        down = torch.arange(hidden * 8).reshape(hidden, 8) + expert * 2_000
+        down = torch.arange(hidden * 8).reshape(hidden, 8) + expert * 20
         gate_up_slices.extend((FakeSlice(gate), FakeSlice(up)))
         down_slices.append(FakeSlice(down))
 
@@ -123,15 +123,21 @@ def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
 
     assert gate_up.shape == (2, hidden, 2, 4)
     assert down.shape == (2, 4, hidden)
-    torch.testing.assert_close(
-        gate_up[0, :, 0, :],
-        gate_up_slices[0].tensor[4:8, :].T,
-    )
-    torch.testing.assert_close(
-        gate_up[0, :, 1, :],
-        gate_up_slices[1].tensor[4:8, :].T,
-    )
-    torch.testing.assert_close(down[1], down_slices[1].tensor[:, 4:8].T)
+    assert gate_up.dtype == torch.float8_e4m3fn
+    assert down.dtype == torch.float8_e4m3fn
+    scale = 240.0 / 448.0
+    expected_gate = (
+        gate_up_slices[0].tensor[4:8, :].T.float() * scale
+    ).to(torch.float8_e4m3fn)
+    expected_up = (
+        gate_up_slices[1].tensor[4:8, :].T.float() * scale
+    ).to(torch.float8_e4m3fn)
+    expected_down = (
+        down_slices[1].tensor[:, 4:8].T.float() * scale
+    ).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(gate_up[0, :, 0, :], expected_gate)
+    torch.testing.assert_close(gate_up[0, :, 1, :], expected_up)
+    torch.testing.assert_close(down[1], expected_down)
 
 
 def test_routed_scalar_scales_broadcast_without_semantic_change() -> None:
@@ -153,9 +159,19 @@ def test_routed_scalar_scales_broadcast_without_semantic_change() -> None:
 
     assert gate_up.shape == (2, 2, 4)
     assert down.shape == (2, 3)
-    torch.testing.assert_close(gate_up[0, 0], torch.ones(4))
-    torch.testing.assert_close(gate_up[0, 1], torch.full((4,), 2.0))
-    torch.testing.assert_close(down[1], torch.full((3,), 6.0))
+    compensation = 448.0 / 240.0
+    torch.testing.assert_close(
+        gate_up[0, 0],
+        torch.full((4,), compensation),
+    )
+    torch.testing.assert_close(
+        gate_up[0, 1],
+        torch.full((4,), 2.0 * compensation),
+    )
+    torch.testing.assert_close(
+        down[1],
+        torch.full((3,), 6.0 * compensation),
+    )
 
 
 def test_native_block_scale_is_rejected_instead_of_broadcast() -> None:
