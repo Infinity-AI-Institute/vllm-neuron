@@ -151,6 +151,15 @@ def _make_probe(
     down, down_scale_scalar = _quantize_static(down_ref)
     _, hidden_scale_scalar = _quantize_static(hidden)
     hidden_dequant = _dequantize_activation(hidden, hidden_scale_scalar)
+    # Static-FP8 CTE requires the normalized activation to be quantized before
+    # NF.mlp. Decode/TKG accepts BF16 and performs this quantization internally.
+    model_hidden = (
+        (hidden.float() / hidden_scale_scalar)
+        .clamp(-_FP8_MAX, _FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        if tokens > 128
+        else hidden
+    )
     gate_dequant = gate.float() * gate_scale_scalar
     up_dequant = up.float() * up_scale_scalar
     intermediate = (
@@ -176,7 +185,7 @@ def _make_probe(
     )
     return (
         SharedMlpProbe(gate, up, down, scales),
-        hidden,
+        model_hidden,
         expected.to(torch.bfloat16),
     )
 
