@@ -14,6 +14,7 @@ from .checkpoint_mapping import (
     routed_gate_up_scale_loader,
     routed_gate_up_weight_loader,
 )
+from .cache_layout import Glm52CacheLayout, IndexerCacheBinding
 from .config import Glm52MoeDsaConfig
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
 from .moe import Glm52ExpertRouter, select_glm52_experts
@@ -29,10 +30,12 @@ from .weight_manifest import (
 __all__ = [
     "Glm52ExpertRouter",
     "Glm52CheckpointContract",
+    "Glm52CacheLayout",
     "Glm52MoeDsaConfig",
     "Glm52RoutedExperts",
     "Glm52SharedExpert",
     "Glm52SparseMlp",
+    "IndexerCacheBinding",
     "RoutedExpertPlan",
     "WeightSpec",
     "apply_glm52_interleaved_rope",
