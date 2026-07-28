@@ -161,3 +161,91 @@ def test_shared_index_layer_reuses_state_and_updates_main_cache() -> None:
         value_cache[1, 0, 1],
         torch.zeros(config.v_head_dim),
     )
+
+
+def test_full_index_layer_updates_fp8_index_and_main_caches() -> None:
+    config = _reduced_config()
+    layout = Glm52CacheLayout.build(
+        config,
+        world_size=1,
+        cache_dtype=torch.float8_e4m3fn,
+    )
+    module = Glm52MlaAttention(
+        config,
+        layer_idx=0,
+        cache_layout=layout,
+        world_size=1,
+        static_fp8=False,
+        dtype=torch.bfloat16,
+    )
+    assert module.indexer is not None
+    module.indexer.topk_backend = "torch"
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.zero_()
+        module.q_a_layernorm.fill_(1)
+        module.kv_a_layernorm.fill_(1)
+        module.indexer.k_norm.bias[0] = 1
+    module.set_cache_quant_multipliers(key=1, value=1)
+    module.indexer.set_cache_quant_multiplier(16)
+
+    key_cache = torch.zeros(
+        2,
+        1,
+        2,
+        config.qk_head_dim,
+        dtype=torch.float8_e4m3fn,
+    )
+    value_cache = torch.zeros(
+        2,
+        1,
+        2,
+        config.v_head_dim,
+        dtype=torch.float8_e4m3fn,
+    )
+    indexer_cache = torch.zeros(
+        2,
+        1,
+        2,
+        config.index_head_dim,
+        dtype=torch.float8_e4m3fn,
+    )
+    metadata = {
+        "layers.0.self_attn": {
+            "slot_mapping": torch.tensor([3]),
+            "block_size": 2,
+            "block_table_tensor": torch.tensor([[0, 1]], dtype=torch.int32),
+        },
+        "glm52.indexer_cache.0": {
+            "slot_mapping": torch.tensor([3]),
+            "block_size": 2,
+            "block_table_tensor": torch.tensor([[0, 1]], dtype=torch.int32),
+        },
+    }
+
+    output, state = module.forward_paged_decode(
+        torch.zeros(1, config.hidden_size, dtype=torch.bfloat16),
+        (
+            torch.ones(1, config.qk_rope_head_dim, dtype=torch.bfloat16),
+            torch.zeros(1, config.qk_rope_head_dim, dtype=torch.bfloat16),
+        ),
+        torch.tensor([3]),
+        metadata,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        indexer_cache=indexer_cache,
+        previous_index_state=None,
+    )
+
+    assert state.source_layer_idx == 0
+    assert state.topk_indices.shape == (1, config.index_topk)
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    assert float(indexer_cache[1, 0, 1, 0].detach()) == 16
+    torch.testing.assert_close(
+        key_cache[1, 0, 1].float(),
+        torch.zeros(config.qk_head_dim),
+    )
+    torch.testing.assert_close(
+        value_cache[1, 0, 1].float(),
+        torch.zeros(config.v_head_dim),
+    )

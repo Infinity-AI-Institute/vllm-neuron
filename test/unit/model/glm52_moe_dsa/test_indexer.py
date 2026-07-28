@@ -104,6 +104,27 @@ def test_full_indexer_paged_path_matches_dense_reference() -> None:
     torch.testing.assert_close(paged, dense.reshape(4, 1))
 
 
+def test_indexer_projection_preserves_unscaled_head_weights() -> None:
+    config = _tiny_config()
+    indexer = _indexer(config)
+    with torch.no_grad():
+        indexer.weights_proj.weight.zero_()
+        indexer.weights_proj.weight[0, 0] = 2
+        indexer.weights_proj.weight[1, 0] = -3
+
+    projection = indexer.project(
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.bfloat16),
+        torch.zeros(1, config.q_lora_rank, dtype=torch.bfloat16),
+        torch.ones(1, config.qk_rope_head_dim, dtype=torch.bfloat16),
+        torch.zeros(1, config.qk_rope_head_dim, dtype=torch.bfloat16),
+    )
+
+    torch.testing.assert_close(
+        projection.head_weights,
+        torch.tensor([[2.0, -3.0]], dtype=torch.float32),
+    )
+
+
 def test_index_share_state_preserves_and_replaces_exact_tensor() -> None:
     config = _tiny_config()
     first = torch.tensor([[1, 2]], dtype=torch.int32)

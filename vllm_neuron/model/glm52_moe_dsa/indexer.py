@@ -196,7 +196,6 @@ class Glm52FullIndexer(nn.Module):
             hidden_states.to(torch.float32),
             self.weights_proj.weight,
         )
-        head_weights = head_weights * (self.config.index_n_heads**-0.5)
         return Glm52IndexerProjection(
             query=query,
             key=key,

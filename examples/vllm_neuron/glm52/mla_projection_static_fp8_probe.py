@@ -100,7 +100,10 @@ class MlaProjectionProbe(torch.nn.Module):
         )
 
 
-def _make_probe() -> tuple[MlaProjectionProbe, tuple[torch.Tensor, ...], torch.Tensor]:
+def _make_probe(
+    *,
+    layer_idx: int = 3,
+) -> tuple[MlaProjectionProbe, tuple[torch.Tensor, ...], torch.Tensor]:
     config = Glm52MoeDsaConfig()
     layout = Glm52CacheLayout.build(
         config,
@@ -109,7 +112,7 @@ def _make_probe() -> tuple[MlaProjectionProbe, tuple[torch.Tensor, ...], torch.T
     )
     attention = Glm52MlaAttention(
         config,
-        layer_idx=3,
+        layer_idx=layer_idx,
         cache_layout=layout,
         world_size=64,
         static_fp8=True,
