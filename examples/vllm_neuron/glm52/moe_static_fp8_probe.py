@@ -10,8 +10,10 @@ import argparse
 import json
 import time
 
+import nki.language as nl
 import torch
 import torch.nn.functional as F
+from nkilib.core.moe.moe_cte.moe_cte import MoECTEImplementation
 from nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
@@ -19,6 +21,7 @@ from nkilib.core.utils.common_types import (
 
 import vllm_neuron  # noqa: F401
 from vllm_neuron.envs import get_compile_backend_name
+from vllm_neuron.functional.moe.moe_cte import moe_cte
 from vllm_neuron.functional.moe.moe_tkg import moe_tkg
 
 _WORLD_SIZE = 64
@@ -113,7 +116,55 @@ class LocalMoeProbe(torch.nn.Module):
         return moe_tkg(**kwargs)
 
 
-def _make_inputs(
+class LocalMoeCteProbe(torch.nn.Module):
+    def __init__(
+        self,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        gate_up_scale: torch.Tensor | None,
+        down_scale: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("gate_up_weight", gate_up_weight)
+        self.register_buffer("down_weight", down_weight)
+        if gate_up_scale is not None:
+            local_experts, _, intermediate = gate_up_scale.shape
+            self.register_buffer(
+                "gate_up_scale",
+                gate_up_scale.reshape(local_experts, 1, 2 * intermediate),
+            )
+            assert down_scale is not None
+            self.register_buffer("down_scale", down_scale.unsqueeze(1))
+        else:
+            self.gate_up_scale = None
+            self.down_scale = None
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        affinities: torch.Tensor,
+        token_position_to_id: torch.Tensor,
+        block_to_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        return moe_cte(
+            hidden_states=hidden,
+            expert_affinities_masked=affinities,
+            gate_up_proj_weight=self.gate_up_weight,
+            down_proj_weight=self.down_weight,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            block_size=128,
+            implementation=MoECTEImplementation.shard_on_block,
+            gate_up_proj_scale=self.gate_up_scale,
+            down_proj_scale=self.down_scale,
+            activation_function=ActFnType.SiLU,
+            compute_dtype=nl.bfloat16,
+            is_tensor_update_accumulating=True,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        )
+
+
+def _make_tkg_inputs(
     ep_degree: int,
     tokens: int,
     use_fp8: bool,
@@ -178,21 +229,107 @@ def _make_inputs(
     return model, (hidden, affinities, expert_indices, rank_id), expected
 
 
+def _make_cte_inputs(
+    ep_degree: int,
+    tokens: int,
+    use_fp8: bool,
+) -> tuple[LocalMoeCteProbe, tuple[torch.Tensor, ...], torch.Tensor]:
+    if tokens % 128 != 0:
+        raise ValueError("CTE tokens must be divisible by block size 128")
+    local_experts, intermediate = _shape_for_ep(ep_degree)
+    generator = torch.Generator().manual_seed(5252 + ep_degree + tokens)
+
+    gate_up_reference = torch.zeros(
+        local_experts,
+        _HIDDEN_SIZE,
+        2,
+        intermediate,
+        dtype=torch.bfloat16,
+    )
+    down_reference = torch.zeros(
+        local_experts,
+        intermediate,
+        _HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+    )
+    gate_up_reference[0].normal_(mean=0.0, std=0.02, generator=generator)
+    down_reference[0].normal_(mean=0.0, std=0.02, generator=generator)
+
+    if use_fp8:
+        gate_up_weight, gate_up_scale = _quantize_per_expert_projection(
+            gate_up_reference.float()
+        )
+        down_weight, down_scale = _quantize_per_expert(down_reference.float())
+    else:
+        gate_up_weight, down_weight = gate_up_reference, down_reference
+        gate_up_scale = down_scale = None
+
+    hidden = torch.randn(
+        tokens,
+        _HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    active_experts = min(_TOP_K, local_experts)
+    per_expert_affinity = 2.5 / active_experts
+    affinities = torch.zeros(tokens, local_experts, dtype=torch.bfloat16)
+    affinities[:, :active_experts] = per_expert_affinity
+
+    blocks_per_expert = tokens // 128
+    token_blocks = torch.arange(tokens, dtype=torch.int32).view(
+        blocks_per_expert, 128
+    )
+    token_position_to_id = (
+        token_blocks.unsqueeze(0)
+        .expand(local_experts, -1, -1)
+        .reshape(-1)
+        .contiguous()
+    )
+    block_to_expert = torch.arange(
+        local_experts, dtype=torch.int32
+    ).repeat_interleave(blocks_per_expert)
+
+    gate_up = torch.matmul(
+        hidden.float(),
+        gate_up_reference[0].float().reshape(_HIDDEN_SIZE, 2 * intermediate),
+    ).view(tokens, 2, intermediate)
+    gate, up = gate_up.unbind(dim=1)
+    expected = torch.matmul(
+        F.silu(gate) * up,
+        down_reference[0].float(),
+    )
+    expected = (expected * per_expert_affinity).to(torch.bfloat16)
+
+    model = LocalMoeCteProbe(
+        gate_up_weight,
+        down_weight,
+        gate_up_scale,
+        down_scale,
+    )
+    inputs = (
+        hidden,
+        affinities.reshape(tokens * local_experts, 1),
+        token_position_to_id,
+        block_to_expert,
+    )
+    return model, inputs, expected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--kernel", choices=("tkg", "cte"), default="tkg")
     parser.add_argument("--ep-degree", type=int, required=True)
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--dtype", choices=("bf16", "fp8"), default="fp8")
     args = parser.parse_args()
-    if args.tokens not in (1, 2, 4, 8, 16):
-        raise ValueError("tokens must be one of 1, 2, 4, 8, 16")
+    if args.kernel == "tkg" and args.tokens not in (1, 2, 4, 8, 16):
+        raise ValueError("TKG tokens must be one of 1, 2, 4, 8, 16")
+    if args.kernel == "cte" and args.tokens not in (128, 256, 512):
+        raise ValueError("CTE tokens must be one of 128, 256, 512")
 
     use_fp8 = args.dtype == "fp8"
-    model, inputs, expected = _make_inputs(
-        args.ep_degree,
-        args.tokens,
-        use_fp8,
-    )
+    make_inputs = _make_tkg_inputs if args.kernel == "tkg" else _make_cte_inputs
+    model, inputs, expected = make_inputs(args.ep_degree, args.tokens, use_fp8)
     device = torch.device("neuron:0")
     model = model.to(device)
     device_inputs = tuple(value.to(device) for value in inputs)
@@ -210,6 +347,7 @@ def main() -> None:
         json.dumps(
             {
                 "status": "passed",
+                "kernel": args.kernel,
                 "ep_degree": args.ep_degree,
                 "tokens": args.tokens,
                 "dtype": args.dtype,
