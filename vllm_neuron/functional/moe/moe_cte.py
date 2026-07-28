@@ -393,7 +393,10 @@ def moe_cte(
             MoECTEImplementation.shard_on_i_mx_hybrid,
         ]:
             output = output[0, ...]
-        elif is_tensor_update_accumulating:
+        elif (
+            is_tensor_update_accumulating
+            and implementation == MoECTEImplementation.shard_on_block
+        ):
             # Non-MX shard-on-block kernel allocates output as [T, 2, H+E] where E is
             # the number of experts. The extra E columns hold fused expert affinities
             # in shared HBM (compiler cannot return a partial shared_hbm tensor).
