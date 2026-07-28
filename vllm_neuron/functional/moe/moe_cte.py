@@ -212,6 +212,8 @@ def moe_cte(
 
     Notes:
         - shard_on_block, shard_on_i, shard_on_i_hybrid, shard_on_i_dropping target TRN2
+        - FP8 on TRN2 must use shard_on_i with 256-token blocks. The installed
+          shard_on_block kernel accepts scale tensors but does not load them.
         - shard_on_block_mx, shard_on_i_mx, shard_on_i_mx_hybrid target TRN3
         - MX implementations expect weights already in quantized tiled format (e.g., uint16).
           The kernel reinterprets the dtype (e.g., uint16 -> float4_e2m1fn_x4) but does NOT
@@ -279,6 +281,25 @@ def moe_cte(
     # the weights are uint32-packed FP8 in a kernel-specific layout with
     # per-expert fp32 scalar scales, which ``_torch_moe_impl`` cannot
     # consume — so any condition that disables the kernel is fatal here.
+    quant_scales_provided = (
+        gate_up_proj_scale is not None or down_proj_scale is not None
+    )
+    if quant_scales_provided and (
+        gate_up_proj_scale is None or down_proj_scale is None
+    ):
+        raise ValueError(
+            "gate_up_proj_scale and down_proj_scale must be provided together"
+        )
+    if (
+        implementation == MoECTEImplementation.shard_on_block
+        and quant_scales_provided
+    ):
+        raise RuntimeError(
+            "FP8 shard_on_block is disabled because the installed Trn2 kernel "
+            "does not load its dequantization scales. Use shard_on_i with "
+            "256-token blocks."
+        )
+
     if quantization_type == QuantizationType.STATIC_MX:
         if implementation != MoECTEImplementation.shard_on_block_mx:
             raise RuntimeError(
