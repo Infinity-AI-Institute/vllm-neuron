@@ -47,16 +47,28 @@ def test_indexer_relu_precedes_weighted_head_sum() -> None:
     )
 
 
-def test_index_topk_is_causal_and_clamps_to_context() -> None:
+def test_index_topk_excludes_future_when_k_fits_history() -> None:
     scores = torch.tensor([[[1.0, 4.0, 3.0, 2.0]]])
     position_ids = torch.tensor([[1]])
 
     indices = glm52_index_topk(
         scores,
-        top_k=2_048,
+        top_k=2,
         position_ids=position_ids,
     )
 
     assert indices.dtype is torch.int32
-    assert set(indices[0, 0, :2].tolist()) == {0, 1}
-    assert set(indices[0, 0, 2:].tolist()) == {2, 3}
+    assert set(indices[0, 0].tolist()) == {0, 1}
+
+
+def test_index_topk_clamps_to_context() -> None:
+    scores = torch.tensor([[[1.0, 4.0, 3.0, 2.0]]])
+
+    indices = glm52_index_topk(
+        scores,
+        top_k=2_048,
+        position_ids=torch.tensor([[3]]),
+    )
+
+    assert indices.shape == (1, 1, 4)
+    assert set(indices[0, 0].tolist()) == {0, 1, 2, 3}

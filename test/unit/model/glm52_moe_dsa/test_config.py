@@ -71,3 +71,8 @@ def test_from_frozen_hf_shape(tmp_path) -> None:
 def test_rejects_wrong_router_semantics() -> None:
     with pytest.raises(ValueError, match="sigmoid/noaux_tc"):
         Glm52MoeDsaConfig(scoring_func="softmax")
+
+
+def test_rejects_non_interleaved_rope() -> None:
+    with pytest.raises(ValueError, match="interleaved"):
+        Glm52MoeDsaConfig(indexer_rope_interleave=False)

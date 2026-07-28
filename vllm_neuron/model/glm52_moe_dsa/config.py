@@ -109,6 +109,8 @@ class Glm52MoeDsaConfig:
     neuron_config: NeuronConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be positive")
         if self.qk_head_dim != self.qk_nope_head_dim + self.qk_rope_head_dim:
             raise ValueError(
                 "qk_head_dim must equal qk_nope_head_dim + qk_rope_head_dim"
@@ -125,6 +127,8 @@ class Glm52MoeDsaConfig:
             raise ValueError("GLM-5.2 requires normalized top-k routing weights")
         if self.moe_router_dtype != "float32":
             raise ValueError("GLM-5.2 router scores must be computed in FP32")
+        if not self.rope_interleave or not self.indexer_rope_interleave:
+            raise ValueError("GLM-5.2 requires interleaved main and indexer RoPE")
         if self.n_group != 1 or self.topk_group != 1:
             raise ValueError(
                 "the initial GLM-5.2 port supports the frozen single router group"
