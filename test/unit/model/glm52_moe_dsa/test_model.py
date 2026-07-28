@@ -339,6 +339,41 @@ def test_bounded_prefill_reaches_logits_and_updates_paged_caches() -> None:
     assert torch.count_nonzero(caches["glm52.indexer_cache.0"][0]) > 0
 
 
+def test_single_sequence_logits_preserve_runtime_position() -> None:
+    config = _config()
+    model = Glm52MoeDsaForCausalLM(
+        config,
+        world_size=1,
+        global_rank=0,
+        tp_group=_Group(),
+        expert_tp_group=_Group(),
+        static_fp8=False,
+    )
+
+    class _Backbone(nn.Module):
+        def forward(self, *args, **kwargs):
+            del args, kwargs
+            return torch.tensor(
+                [
+                    [1.0, 2.0, 3.0, 4.0],
+                    [5.0, 6.0, 7.0, 8.0],
+                ]
+            )
+
+    model.model = _Backbone()
+    model.lm_head = nn.Identity()
+    hidden = model(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        attn_metadata={"layers.0.self_attn": {}},
+        # Short prefill requests are right-padded to a compiled bucket. The
+        # requested row therefore cannot be replaced with a static last slice.
+        sampling_positions=torch.tensor([0]),
+    )
+
+    torch.testing.assert_close(hidden, torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
+
+
 def test_prefill_above_index_topk_remains_gated() -> None:
     config = _config()
     model = Glm52MoeDsaForCausalLM(

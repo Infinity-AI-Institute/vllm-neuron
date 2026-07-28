@@ -220,4 +220,8 @@ class Glm52RoutedExperts(nn.Module):
             compute_dtype=nl.bfloat16,
             is_tensor_update_accumulating=True,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            # The blockwise mapper pads unused token slots with -1.  Tell the
+            # Neuron kernel to skip those DMA reads instead of treating -1 as
+            # an address, which otherwise triggers an out-of-bounds gather.
+            skip_token=True,
         )

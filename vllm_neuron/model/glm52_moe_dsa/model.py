@@ -602,6 +602,13 @@ class Glm52MoeDsaForCausalLM(nn.Module):
             is_token_ids=is_token_ids,
         )
         if sampling_positions is not None:
+            # Neuron's vector DGE path reinterprets a one-element int64 index
+            # as two int32 lanes.  The synthetic upper lane then trips the
+            # gather OOB check even when the requested token is valid.  Keep
+            # the runtime index (short prefill requests are right-padded, so a
+            # static last-row slice is incorrect) but lower it as one int32
+            # lane, which is sufficient for every bounded token bucket.
+            sampling_positions = sampling_positions.to(dtype=torch.int32)
             hidden_states = torch.index_select(
                 hidden_states,
                 0,
