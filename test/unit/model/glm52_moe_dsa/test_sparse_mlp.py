@@ -97,3 +97,18 @@ def test_decode_combines_routed_world_once_and_shared_subgroup_once() -> None:
 
     # Routed: 1 * full world 4. Shared: 2 * subgroup 2.
     torch.testing.assert_close(output, torch.full_like(output, 8.0))
+
+
+def test_static_fp8_selects_neuron_router_topk() -> None:
+    config = _config()
+    plan = RoutedExpertPlan(4, 2, 4, 8)
+    module = Glm52SparseMlp(
+        config,
+        plan,
+        global_rank=0,
+        tp_group=FakeGroup(4, 4.0),
+        expert_tp_group=FakeGroup(2, 2.0),
+        static_fp8=True,
+    )
+
+    assert module.gate.topk_backend == "neuron"

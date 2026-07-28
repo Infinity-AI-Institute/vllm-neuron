@@ -43,6 +43,7 @@ class Glm52SparseMlp(nn.Module):
         global_rank: int,
         tp_group=None,
         expert_tp_group=None,
+        static_fp8: bool = False,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
@@ -71,6 +72,7 @@ class Glm52SparseMlp(nn.Module):
             config.n_routed_experts,
             config.num_experts_per_tok,
             config.routed_scaling_factor,
+            topk_backend="neuron" if static_fp8 else "torch",
             device=device,
         )
         self.experts = Glm52RoutedExperts(

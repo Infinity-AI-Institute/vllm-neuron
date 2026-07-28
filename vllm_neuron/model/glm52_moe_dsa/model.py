@@ -289,6 +289,7 @@ class Glm52DecoderLayer(nn.Module):
                 global_rank=global_rank,
                 tp_group=tp_group,
                 expert_tp_group=expert_tp_group,
+                static_fp8=static_fp8,
                 device=device,
             )
         self.key_cache: torch.Tensor | None = None
