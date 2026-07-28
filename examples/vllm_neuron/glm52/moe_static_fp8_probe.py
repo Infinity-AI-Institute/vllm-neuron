@@ -41,25 +41,32 @@ def _shape_for_ep(ep_degree: int) -> tuple[int, int]:
 def _quantize_per_expert_projection(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[E, H, P, I]`` with one scale per expert/projection."""
+    """Quantize ``[E, H, P, I]`` with one scale per expert/projection.
+
+    The Trn2 TKG kernel currently validates the row-scale ABI
+    ``[E, P, I]`` even when a static scale is broadcast across every output
+    row.  Keep the quantization static, but materialize that required ABI.
+    """
     max_abs = weight.abs().amax(dim=(1, 3), keepdim=True)
     scale = (max_abs / _FP8_MAX).clamp_min(torch.finfo(torch.float32).tiny)
     quantized = (weight / scale).clamp(-_FP8_MAX, _FP8_MAX).to(
         torch.float8_e4m3fn
     )
-    return quantized, scale.squeeze(1)
+    row_scale = scale.squeeze(1).expand(-1, -1, weight.shape[-1]).contiguous()
+    return quantized, row_scale
 
 
 def _quantize_per_expert(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[E, I, H]`` with one scale per expert."""
+    """Quantize ``[E, I, H]`` and broadcast its static scale to ``[E, H]``."""
     max_abs = weight.abs().amax(dim=(1, 2), keepdim=True)
     scale = (max_abs / _FP8_MAX).clamp_min(torch.finfo(torch.float32).tiny)
     quantized = (weight / scale).clamp(-_FP8_MAX, _FP8_MAX).to(
         torch.float8_e4m3fn
     )
-    return quantized, scale.squeeze(-1)
+    row_scale = scale.squeeze(1).expand(-1, weight.shape[-1]).contiguous()
+    return quantized, row_scale
 
 
 class LocalMoeProbe(torch.nn.Module):
@@ -215,6 +222,7 @@ def main() -> None:
                 "ep_degree": args.ep_degree,
                 "tokens": args.tokens,
                 "dtype": args.dtype,
+                "fp8_scale_layout": "row-broadcast-static" if use_fp8 else None,
                 "local_experts": local_experts,
                 "intermediate_per_rank": intermediate,
                 "compile_and_first_run_seconds": elapsed,
