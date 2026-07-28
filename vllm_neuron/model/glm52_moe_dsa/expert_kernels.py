@@ -32,7 +32,7 @@ def dense_glm52_affinities(
         raise ValueError("expert indices and routing weights must be rank-2")
     if num_experts <= 0:
         raise ValueError("num_experts must be positive")
-    if expert_indices.numel():
+    if expert_indices.numel() and not torch.compiler.is_compiling():
         minimum = int(expert_indices.min())
         maximum = int(expert_indices.max())
         if minimum < 0 or maximum >= num_experts:

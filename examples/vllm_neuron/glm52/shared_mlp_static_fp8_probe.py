@@ -105,10 +105,19 @@ def _make_probe(
     tp_degree: int,
     tokens: int,
     use_fp8: bool,
+    *,
+    intermediate_size: int = _SHARED_INTERMEDIATE,
+    kernel_local_intermediate: int | None = None,
 ) -> tuple[SharedMlpProbe, torch.Tensor, torch.Tensor]:
-    if _SHARED_INTERMEDIATE % tp_degree:
-        raise ValueError("shared intermediate size must divide by TP degree")
-    local_intermediate = _SHARED_INTERMEDIATE // tp_degree
+    if intermediate_size % tp_degree:
+        raise ValueError("intermediate size must divide by TP degree")
+    local_intermediate = intermediate_size // tp_degree
+    if kernel_local_intermediate is None:
+        kernel_local_intermediate = local_intermediate
+    if kernel_local_intermediate < local_intermediate:
+        raise ValueError(
+            "kernel local intermediate cannot be smaller than the model shard"
+        )
     generator = torch.Generator().manual_seed(5_252 + tp_degree + tokens)
     hidden = torch.randn(
         tokens,
@@ -134,6 +143,11 @@ def _make_probe(
         dtype=torch.bfloat16,
         generator=generator,
     ) * 0.02
+    if kernel_local_intermediate > local_intermediate:
+        padding = kernel_local_intermediate - local_intermediate
+        gate_ref = F.pad(gate_ref, (0, padding))
+        up_ref = F.pad(up_ref, (0, padding))
+        down_ref = F.pad(down_ref, (0, 0, 0, padding))
 
     if not use_fp8:
         expected = (

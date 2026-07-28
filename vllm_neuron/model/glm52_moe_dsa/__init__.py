@@ -23,6 +23,7 @@ from .cache_ops import (
     write_paged_cache,
 )
 from .config import Glm52MoeDsaConfig
+from .dense_mlp import Glm52DenseMlp
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
 from .moe import Glm52ExpertRouter, select_glm52_experts
 from .indexer import (
@@ -51,6 +52,7 @@ __all__ = [
     "Glm52MlaAttention",
     "Glm52MlaProjection",
     "Glm52MoeDsaConfig",
+    "Glm52DenseMlp",
     "Glm52RoutedExperts",
     "Glm52SharedExpert",
     "Glm52SparseMlp",

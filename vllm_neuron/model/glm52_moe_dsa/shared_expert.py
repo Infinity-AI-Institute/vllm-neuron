@@ -12,6 +12,7 @@ from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
     set_weight_loader,
     sharding_weight_loader,
+    sharding_weight_loader_with_padding,
 )
 
 from .checkpoint_mapping import (
@@ -33,13 +34,28 @@ def _static_fp8_sharding_loader(
     shard_dim: int,
     shard_size: int,
     num_shards: int,
+    pad_dim: int | None = None,
+    padded_size: int | None = None,
 ) -> SafetensorsWeightLoader:
-    base = sharding_weight_loader(
-        shard_dim=shard_dim,
-        shard_size=shard_size,
-        num_shards=num_shards,
-        is_storage_transposed=True,
-    )
+    if pad_dim is None:
+        base = sharding_weight_loader(
+            shard_dim=shard_dim,
+            shard_size=shard_size,
+            num_shards=num_shards,
+            is_storage_transposed=True,
+        )
+    else:
+        if padded_size is None or padded_size < shard_size:
+            raise ValueError("padded_size must be at least the shard size")
+        base = sharding_weight_loader_with_padding(
+            shard_dim=shard_dim,
+            shard_size=shard_size,
+            num_shards=num_shards,
+            is_storage_transposed=True,
+            pad_dim=pad_dim,
+            padded_size=padded_size,
+            unpadded_size=shard_size,
+        )
 
     def transform(
         slices: list["PySafeSlice"],

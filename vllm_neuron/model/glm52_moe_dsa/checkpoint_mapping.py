@@ -148,6 +148,21 @@ def build_checkpoint_contract(
             mappings[f"{prefix}.weight_scale"] = f"{prefix}.weight_scale"
             mappings[f"{prefix}.input_scale"] = f"{prefix}.input_scale"
 
+    for layer_idx, layer_type in enumerate(config.mlp_layer_types):
+        if layer_type != "dense":
+            continue
+        dense = f"model.layers.{layer_idx}.mlp"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            weight = f"{dense}.{projection}.weight"
+            mappings[f"{weight}_scale"] = _scale_key(weight)
+        mappings[f"{dense}.gate_up_input_scale"] = [
+            f"{dense}.gate_proj.input_scale",
+            f"{dense}.up_proj.input_scale",
+        ]
+        mappings[f"{dense}.down_input_scale"] = (
+            f"{dense}.down_proj.input_scale"
+        )
+
     local_experts = plan.local_expert_ids(global_rank)
     for layer_idx, layer_type in enumerate(config.mlp_layer_types):
         if layer_type != "sparse":

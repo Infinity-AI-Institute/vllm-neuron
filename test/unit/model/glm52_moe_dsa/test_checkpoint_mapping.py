@@ -120,6 +120,26 @@ def test_contract_maps_attention_static_scales() -> None:
     assert contract.mappings[f"{prefix}.input_scale"] == f"{prefix}.input_scale"
 
 
+def test_contract_maps_dense_static_scales() -> None:
+    contract = build_checkpoint_contract(
+        _small_config(),
+        _small_plan(),
+        global_rank=0,
+    )
+    prefix = "model.layers.0.mlp"
+
+    assert contract.mappings[f"{prefix}.gate_proj.weight_scale"] == (
+        f"{prefix}.gate_proj.weight_scale"
+    )
+    assert contract.mappings[f"{prefix}.gate_up_input_scale"] == [
+        f"{prefix}.gate_proj.input_scale",
+        f"{prefix}.up_proj.input_scale",
+    ]
+    assert contract.mappings[f"{prefix}.down_input_scale"] == (
+        f"{prefix}.down_proj.input_scale"
+    )
+
+
 def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
     plan = _small_plan()
     hidden = 3
