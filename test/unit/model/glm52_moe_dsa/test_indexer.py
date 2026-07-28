@@ -164,3 +164,23 @@ def test_shared_indexer_rejects_missing_previous_topk() -> None:
             previous=None,
             computed_topk=None,
         )
+
+
+def test_full_context_selection_bypasses_topk_and_preserves_all_positions() -> None:
+    config = _tiny_config()
+    config.index_topk = 4
+    indexer = _indexer(config)
+    indexer.topk_backend = "neuron"
+
+    indices = indexer._select_topk(
+        torch.tensor(
+            [
+                [[4.0, 3.0, 2.0, 1.0]],
+                [[-1.0, -2.0, -3.0, -4.0]],
+            ]
+        ),
+        position_ids=torch.tensor([[0], [0]]),
+    )
+
+    expected = torch.arange(4, dtype=torch.int32).reshape(1, 1, 4).expand(2, -1, -1)
+    torch.testing.assert_close(indices, expected)

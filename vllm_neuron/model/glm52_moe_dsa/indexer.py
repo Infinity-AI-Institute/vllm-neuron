@@ -215,12 +215,28 @@ class Glm52FullIndexer(nn.Module):
         position_ids: torch.Tensor | None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        selected = min(self.config.index_topk, scores.shape[-1])
+        if selected == scores.shape[-1]:
+            # At the 2,048-token baseline, GLM's index_topk equals the full
+            # context. Selecting every position does not require ranking them.
+            # Avoid torch.topk(k == context), whose full-sort HLO is unsupported
+            # on Trn2, and preserve the same complete index set in logical order.
+            indices = torch.arange(
+                selected,
+                dtype=torch.int32,
+                device=scores.device,
+            )
+            leading_ones = (1,) * (scores.ndim - 1)
+            return indices.view(*leading_ones, selected).expand(
+                *scores.shape[:-1],
+                selected,
+            )
+
         masked_scores = glm52_mask_index_scores(
             scores,
             position_ids=position_ids,
             attention_mask=attention_mask,
         )
-        selected = min(self.config.index_topk, scores.shape[-1])
         if self.topk_backend == "neuron":
             # Lazy import keeps CPU-only model/unit-test imports independent of
             # NKI while making the compiled path use rotational_topk instead of

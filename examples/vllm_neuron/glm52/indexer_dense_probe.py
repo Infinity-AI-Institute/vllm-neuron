@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument(
         "--context",
         type=int,
-        choices=(4_096, 8_192, 32_768),
+        choices=(2_048, 4_096, 8_192, 32_768),
         default=4_096,
     )
     parser.add_argument(
