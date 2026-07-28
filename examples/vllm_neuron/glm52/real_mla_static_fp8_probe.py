@@ -128,9 +128,10 @@ def static_linear(hidden: torch.Tensor, module) -> torch.Tensor:
 
 
 class ProjectionProbe(torch.nn.Module):
-    def __init__(self, attention: Glm52MlaAttention) -> None:
+    def __init__(self, attention: Glm52MlaAttention, stage: str) -> None:
         super().__init__()
         self.attention = attention
+        self.stage = stage
 
     def forward(
         self,
@@ -138,7 +139,66 @@ class ProjectionProbe(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        if self.stage == "independent_columns":
+            return torch.cat(
+                (
+                    self.attention.q_a_proj(hidden_states),
+                    self.attention.kv_a_proj_with_mqa(hidden_states),
+                ),
+                dim=-1,
+            )
+        if self.stage == "query_chain":
+            q_resid = glm52_rms_norm(
+                self.attention.q_a_proj(hidden_states),
+                self.attention.q_a_layernorm,
+                eps=self.attention.config.rms_norm_eps,
+            )
+            return torch.cat(
+                (q_resid, self.attention.q_b_proj(q_resid)),
+                dim=-1,
+            )
+        if self.stage == "kv_chain":
+            compressed = self.attention.kv_a_proj_with_mqa(hidden_states)
+            kv_pass = compressed[:, : self.attention.config.kv_lora_rank]
+            k_pass = glm52_rms_norm(
+                kv_pass,
+                self.attention.kv_a_layernorm,
+                eps=self.attention.config.rms_norm_eps,
+            )
+            return torch.cat(
+                (compressed, self.attention.kv_b_proj(k_pass)),
+                dim=-1,
+            )
+        if self.stage == "four_raw":
+            q_resid = glm52_rms_norm(
+                self.attention.q_a_proj(hidden_states),
+                self.attention.q_a_layernorm,
+                eps=self.attention.config.rms_norm_eps,
+            )
+            query_raw = self.attention.q_b_proj(q_resid)
+            compressed = self.attention.kv_a_proj_with_mqa(hidden_states)
+            kv_pass = compressed[:, : self.attention.config.kv_lora_rank]
+            k_pass = glm52_rms_norm(
+                kv_pass,
+                self.attention.kv_a_layernorm,
+                eps=self.attention.config.rms_norm_eps,
+            )
+            expanded = self.attention.kv_b_proj(k_pass)
+            return torch.cat(
+                (q_resid, query_raw, compressed, expanded),
+                dim=-1,
+            )
         projected = self.attention.project(hidden_states, cos, sin)
+        if self.stage == "project_only":
+            return torch.cat(
+                (
+                    projected.q_resid.reshape(hidden_states.shape[0], -1),
+                    projected.query.reshape(hidden_states.shape[0], -1),
+                    projected.key.reshape(hidden_states.shape[0], -1),
+                    projected.value.reshape(hidden_states.shape[0], -1),
+                ),
+                dim=-1,
+            )
         output = self.attention.o_proj(projected.value.reshape(hidden_states.shape[0], -1))
         return torch.cat(
             (
@@ -160,6 +220,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--real-tokens", type=int, default=512)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--device", default="neuron:0")
+    parser.add_argument(
+        "--stage",
+        choices=(
+            "independent_columns",
+            "query_chain",
+            "kv_chain",
+            "four_raw",
+            "project_only",
+            "full",
+        ),
+        default="full",
+    )
     parser.add_argument("--save-tensors", type=Path)
     args = parser.parse_args()
     if args.tokens <= 0 or not 0 < args.real_tokens <= args.tokens:
@@ -275,7 +347,8 @@ def main() -> None:
         attention.q_a_layernorm,
         eps=config.rms_norm_eps,
     )
-    query = static_linear(q_resid, attention.q_b_proj).reshape(
+    query_raw = static_linear(q_resid, attention.q_b_proj)
+    query = query_raw.reshape(
         args.tokens,
         1,
         config.qk_head_dim,
@@ -316,19 +389,105 @@ def main() -> None:
     query = torch.cat((q_pass, q_rot), dim=-1)
     key = torch.cat((k_nope, k_rot.expand(-1, 1, -1)), dim=-1)
     output = static_linear(value.reshape(args.tokens, -1), attention.o_proj)
-    expected = torch.cat(
-        (
-            q_resid.reshape(args.tokens, -1),
-            query.reshape(args.tokens, -1),
-            key.reshape(args.tokens, -1),
-            value.reshape(args.tokens, -1),
-            output.reshape(args.tokens, -1),
+    expected_by_stage = {
+        "independent_columns": (
+            torch.cat((q_a, compressed), dim=-1),
+            (
+                ("q_a", config.q_lora_rank),
+                (
+                    "kv_a",
+                    config.kv_lora_rank + config.qk_rope_head_dim,
+                ),
+            ),
         ),
-        dim=-1,
-    )
+        "query_chain": (
+            torch.cat((q_resid, query_raw), dim=-1),
+            (
+                ("q_resid", config.q_lora_rank),
+                ("query_raw", config.qk_head_dim),
+            ),
+        ),
+        "kv_chain": (
+            torch.cat((compressed, expanded.reshape(args.tokens, -1)), dim=-1),
+            (
+                (
+                    "kv_a",
+                    config.kv_lora_rank + config.qk_rope_head_dim,
+                ),
+                (
+                    "kv_b",
+                    config.qk_nope_head_dim + config.v_head_dim,
+                ),
+            ),
+        ),
+        "four_raw": (
+            torch.cat(
+                (
+                    q_resid,
+                    query_raw,
+                    compressed,
+                    expanded.reshape(args.tokens, -1),
+                ),
+                dim=-1,
+            ),
+            (
+                ("q_resid", config.q_lora_rank),
+                ("query_raw", config.qk_head_dim),
+                (
+                    "kv_a",
+                    config.kv_lora_rank + config.qk_rope_head_dim,
+                ),
+                (
+                    "kv_b",
+                    config.qk_nope_head_dim + config.v_head_dim,
+                ),
+            ),
+        ),
+        "project_only": (
+            torch.cat(
+                (
+                    q_resid.reshape(args.tokens, -1),
+                    query.reshape(args.tokens, -1),
+                    key.reshape(args.tokens, -1),
+                    value.reshape(args.tokens, -1),
+                ),
+                dim=-1,
+            ),
+            (
+                ("q_resid", config.q_lora_rank),
+                ("query_nope", config.qk_nope_head_dim),
+                ("query_rope", config.qk_rope_head_dim),
+                ("key_nope", config.qk_nope_head_dim),
+                ("key_rope", config.qk_rope_head_dim),
+                ("value", config.v_head_dim),
+            ),
+        ),
+        "full": (
+            torch.cat(
+                (
+                    q_resid.reshape(args.tokens, -1),
+                    query.reshape(args.tokens, -1),
+                    key.reshape(args.tokens, -1),
+                    value.reshape(args.tokens, -1),
+                    output.reshape(args.tokens, -1),
+                ),
+                dim=-1,
+            ),
+            (
+                ("q_resid", config.q_lora_rank),
+                ("query_nope", config.qk_nope_head_dim),
+                ("query_rope", config.qk_rope_head_dim),
+                ("key_nope", config.qk_nope_head_dim),
+                ("key_rope", config.qk_rope_head_dim),
+                ("value", config.v_head_dim),
+                ("o_proj", config.hidden_size),
+            ),
+        ),
+    }
+    expected, segment_specs = expected_by_stage[args.stage]
 
     device = torch.device(args.device)
-    model = ProjectionProbe(attention).to(device)
+    model = ProjectionProbe(attention, args.stage).to(device)
     started = time.perf_counter()
     compiled = torch.compile(model, backend=get_compile_backend_name())
     actual = compiled(padded.to(device), cos.to(device), sin.to(device)).cpu()
@@ -353,15 +512,7 @@ def main() -> None:
     )
     segments = {}
     offset = 0
-    for name, width in (
-        ("q_resid", config.q_lora_rank),
-        ("query_nope", config.qk_nope_head_dim),
-        ("query_rope", config.qk_rope_head_dim),
-        ("key_nope", config.qk_nope_head_dim),
-        ("key_rope", config.qk_rope_head_dim),
-        ("value", config.v_head_dim),
-        ("o_proj", config.hidden_size),
-    ):
+    for name, width in segment_specs:
         segment_actual = actual[:, offset : offset + width]
         segment_expected = expected[:, offset : offset + width]
         segment_delta = segment_actual - segment_expected
@@ -386,6 +537,7 @@ def main() -> None:
         "status": "measured",
         "backend": get_compile_backend_name(),
         "rank": args.rank,
+        "stage": args.stage,
         "tokens": args.tokens,
         "real_tokens": args.real_tokens,
         "compile_and_first_run_seconds": compile_and_first_run,

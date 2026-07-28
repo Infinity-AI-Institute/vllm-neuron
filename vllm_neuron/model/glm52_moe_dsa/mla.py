@@ -431,37 +431,40 @@ class Glm52MlaAttention(nn.Module):
             self.q_a_layernorm,
             eps=self.config.rms_norm_eps,
         )
-        query = self.q_b_proj(q_resid).reshape(
+        # Keep NKI projection outputs flat while selecting logical fields.
+        # ``torch.split`` views taken after reshaping these custom-kernel
+        # outputs preserve the logical shape but can bind the wrong physical
+        # columns in a combined Neuron graph.
+        query_flat = self.q_b_proj(q_resid)
+        q_pass = query_flat[:, : self.config.qk_nope_head_dim].reshape(
             hidden_states.shape[0],
             self.local_heads,
-            self.config.qk_head_dim,
+            self.config.qk_nope_head_dim,
         )
-        q_pass, q_rot = torch.split(
-            query,
-            [self.config.qk_nope_head_dim, self.config.qk_rope_head_dim],
-            dim=-1,
+        q_rot = query_flat[:, self.config.qk_nope_head_dim :].reshape(
+            hidden_states.shape[0],
+            self.local_heads,
+            self.config.qk_rope_head_dim,
         )
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states.to(self.dtype))
-        kv_pass, k_rot = torch.split(
-            compressed_kv,
-            [self.config.kv_lora_rank, self.config.qk_rope_head_dim],
-            dim=-1,
-        )
+        kv_pass = compressed_kv[:, : self.config.kv_lora_rank]
+        k_rot = compressed_kv[:, self.config.kv_lora_rank :]
         k_pass = glm52_rms_norm(
             kv_pass,
             self.kv_a_layernorm,
             eps=self.config.rms_norm_eps,
         )
-        expanded_kv = self.kv_b_proj(k_pass).reshape(
+        expanded_flat = self.kv_b_proj(k_pass)
+        k_nope = expanded_flat[:, : self.config.qk_nope_head_dim].reshape(
             hidden_states.shape[0],
             self.local_heads,
-            self.config.qk_nope_head_dim + self.config.v_head_dim,
+            self.config.qk_nope_head_dim,
         )
-        k_nope, value = torch.split(
-            expanded_kv,
-            [self.config.qk_nope_head_dim, self.config.v_head_dim],
-            dim=-1,
+        value = expanded_flat[:, self.config.qk_nope_head_dim :].reshape(
+            hidden_states.shape[0],
+            self.local_heads,
+            self.config.v_head_dim,
         )
 
         q_rot, k_rot = apply_glm52_interleaved_rope(
