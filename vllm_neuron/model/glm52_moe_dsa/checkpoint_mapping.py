@@ -158,6 +158,20 @@ def build_checkpoint_contract(
         mappings[f"{prefix}.down_proj"] = down_sources
         mappings[f"{prefix}.down_proj_scale"] = down_scale_sources
 
+        shared = f"model.layers.{layer_idx}.mlp.shared_experts"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            weight = f"{shared}.{projection}.weight"
+            mappings[f"{weight}_scale"] = (
+                weight.removesuffix(".weight") + STATIC_WEIGHT_SCALE_SUFFIX
+            )
+        mappings[f"{shared}.gate_up_input_scale"] = [
+            f"{shared}.gate_proj.input_scale",
+            f"{shared}.up_proj.input_scale",
+        ]
+        mappings[f"{shared}.down_input_scale"] = (
+            f"{shared}.down_proj.input_scale"
+        )
+
     return Glm52CheckpointContract(mappings=mappings)
 
 

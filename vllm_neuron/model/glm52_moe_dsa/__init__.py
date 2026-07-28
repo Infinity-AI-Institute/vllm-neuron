@@ -18,6 +18,7 @@ from .config import Glm52MoeDsaConfig
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
 from .moe import Glm52ExpertRouter, select_glm52_experts
 from .parallelism import RoutedExpertPlan
+from .shared_expert import Glm52SharedExpert
 from .weight_manifest import (
     WeightSpec,
     estimate_local_weight_bytes,
@@ -29,6 +30,7 @@ __all__ = [
     "Glm52CheckpointContract",
     "Glm52MoeDsaConfig",
     "Glm52RoutedExperts",
+    "Glm52SharedExpert",
     "RoutedExpertPlan",
     "WeightSpec",
     "apply_glm52_interleaved_rope",
