@@ -127,6 +127,11 @@ class LocalMoeCteProbe(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.implementation = implementation
+        self.block_size = (
+            256
+            if implementation == MoECTEImplementation.shard_on_i
+            else 128
+        )
         self.register_buffer("gate_up_weight", gate_up_weight)
         self.register_buffer("down_weight", down_weight)
         if gate_up_scale is not None:
@@ -155,7 +160,7 @@ class LocalMoeCteProbe(torch.nn.Module):
             down_proj_weight=self.down_weight,
             token_position_to_id=token_position_to_id,
             block_to_expert=block_to_expert,
-            block_size=128,
+            block_size=self.block_size,
             implementation=self.implementation,
             gate_up_proj_scale=self.gate_up_scale,
             down_proj_scale=self.down_scale,
@@ -237,8 +242,11 @@ def _make_cte_inputs(
     use_fp8: bool,
     implementation: MoECTEImplementation,
 ) -> tuple[LocalMoeCteProbe, tuple[torch.Tensor, ...], torch.Tensor]:
-    if tokens % 128 != 0:
-        raise ValueError("CTE tokens must be divisible by block size 128")
+    block_size = (
+        256 if implementation == MoECTEImplementation.shard_on_i else 128
+    )
+    if tokens % block_size != 0:
+        raise ValueError(f"CTE tokens must be divisible by block size {block_size}")
     local_experts, intermediate = _shape_for_ep(ep_degree)
     generator = torch.Generator().manual_seed(5252 + ep_degree + tokens)
 
@@ -278,9 +286,9 @@ def _make_cte_inputs(
     affinities = torch.zeros(tokens, local_experts, dtype=torch.bfloat16)
     affinities[:, :active_experts] = per_expert_affinity
 
-    blocks_per_expert = tokens // 128
+    blocks_per_expert = tokens // block_size
     token_blocks = torch.arange(tokens, dtype=torch.int32).view(
-        blocks_per_expert, 128
+        blocks_per_expert, block_size
     )
     token_position_to_id = (
         token_blocks.unsqueeze(0)
@@ -369,6 +377,9 @@ def main() -> None:
                 "kernel": args.kernel,
                 "cte_implementation": (
                     args.cte_implementation if args.kernel == "cte" else None
+                ),
+                "block_size": (
+                    model.block_size if args.kernel == "cte" else None
                 ),
                 "ep_degree": args.ep_degree,
                 "tokens": args.tokens,
