@@ -5,6 +5,7 @@ from .attention import (
     apply_glm52_interleaved_rope,
     glm52_index_scores,
     glm52_index_topk,
+    glm52_paged_sparse_attention,
     glm52_sparse_attention,
 )
 from .checkpoint_mapping import (
@@ -16,7 +17,11 @@ from .checkpoint_mapping import (
     routed_gate_up_weight_loader,
 )
 from .cache_layout import Glm52CacheLayout, IndexerCacheBinding
-from .cache_ops import gather_paged_cache, write_paged_cache
+from .cache_ops import (
+    gather_paged_cache,
+    gather_selected_paged_cache,
+    write_paged_cache,
+)
 from .config import Glm52MoeDsaConfig
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
 from .moe import Glm52ExpertRouter, select_glm52_experts
@@ -26,6 +31,7 @@ from .indexer import (
     Glm52IndexShareState,
     advance_index_share_state,
 )
+from .mla import Glm52MlaAttention, Glm52MlaProjection
 from .parallelism import RoutedExpertPlan
 from .shared_expert import Glm52SharedExpert
 from .sparse_mlp import Glm52SparseMlp, glm52_rms_norm
@@ -42,6 +48,8 @@ __all__ = [
     "Glm52CacheLayout",
     "Glm52IndexerProjection",
     "Glm52IndexShareState",
+    "Glm52MlaAttention",
+    "Glm52MlaProjection",
     "Glm52MoeDsaConfig",
     "Glm52RoutedExperts",
     "Glm52SharedExpert",
@@ -55,10 +63,12 @@ __all__ = [
     "dense_glm52_affinities",
     "glm52_index_scores",
     "glm52_index_topk",
+    "glm52_paged_sparse_attention",
     "glm52_sparse_attention",
     "glm52_rms_norm",
     "estimate_local_weight_bytes",
     "gather_paged_cache",
+    "gather_selected_paged_cache",
     "iter_backbone_weight_specs",
     "routed_down_scale_loader",
     "routed_down_weight_loader",

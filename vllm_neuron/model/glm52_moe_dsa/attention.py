@@ -4,6 +4,8 @@
 import torch
 import torch.nn.functional as F
 
+from .cache_ops import gather_selected_paged_cache
+
 
 def apply_glm52_interleaved_rope(
     query: torch.Tensor,
@@ -156,7 +158,7 @@ def glm52_sparse_attention(
         raise ValueError("query and key head dimensions differ")
 
     selected = topk_indices.to(torch.long)
-    if selected.numel() and (
+    if not torch.compiler.is_compiling() and selected.numel() and (
         selected.min().item() < 0 or selected.max().item() >= key_cache.shape[1]
     ):
         raise ValueError("top-k index is outside the key cache")
@@ -167,17 +169,84 @@ def glm52_sparse_attention(
     )[:, None, None]
     selected_keys = key_cache[batch_indices, selected]
     selected_values = value_cache[batch_indices, selected]
+    return _glm52_selected_attention(
+        query,
+        selected_keys,
+        selected_values,
+        selected,
+        position_ids=position_ids,
+        scaling=scaling,
+        key_lengths=key_lengths,
+    )
+
+
+def glm52_paged_sparse_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    block_size: int,
+    position_ids: torch.Tensor,
+    scaling: float,
+    key_lengths: torch.Tensor | None = None,
+    key_quant_multiplier: torch.Tensor | None = None,
+    value_quant_multiplier: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run DSA attention with direct top-k gathers from paged K/V caches."""
+    selected = topk_indices.to(torch.long)
+    selected_keys = gather_selected_paged_cache(
+        key_cache,
+        block_table,
+        selected,
+        block_size=block_size,
+        output_dtype=query.dtype,
+        quant_multiplier=key_quant_multiplier,
+    )
+    selected_values = gather_selected_paged_cache(
+        value_cache,
+        block_table,
+        selected,
+        block_size=block_size,
+        output_dtype=query.dtype,
+        quant_multiplier=value_quant_multiplier,
+    )
+    return _glm52_selected_attention(
+        query,
+        selected_keys,
+        selected_values,
+        selected,
+        position_ids=position_ids,
+        scaling=scaling,
+        key_lengths=key_lengths,
+    )
+
+
+def _glm52_selected_attention(
+    query: torch.Tensor,
+    selected_keys: torch.Tensor,
+    selected_values: torch.Tensor,
+    selected_positions: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    scaling: float,
+    key_lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute attention over pre-gathered ``[B,Q,K,H,D]`` tensors."""
     scores = (
         query.to(torch.float32).unsqueeze(2)
         * selected_keys.to(torch.float32)
     ).sum(dim=-1)
     scores = scores * scaling
 
-    invalid = selected > position_ids[:, :, None]
+    invalid = selected_positions > position_ids[:, :, None]
     if key_lengths is not None:
         if key_lengths.shape != (query.shape[0],):
             raise ValueError("key_lengths must contain one value per request")
-        invalid = invalid | (selected >= key_lengths[:, None, None])
+        invalid = invalid | (
+            selected_positions >= key_lengths[:, None, None]
+        )
     scores = scores.masked_fill(invalid.unsqueeze(-1), float("-inf"))
     probabilities = torch.softmax(scores, dim=2)
     probabilities = torch.nan_to_num(probabilities)

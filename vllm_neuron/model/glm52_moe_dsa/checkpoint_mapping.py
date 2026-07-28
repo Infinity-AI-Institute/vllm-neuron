@@ -135,6 +135,19 @@ def build_checkpoint_contract(
             continue
         mappings[spec.name] = spec.name
 
+    for layer_idx in range(config.num_hidden_layers):
+        attention = f"model.layers.{layer_idx}.self_attn"
+        for projection in (
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+            "o_proj",
+        ):
+            prefix = f"{attention}.{projection}"
+            mappings[f"{prefix}.weight_scale"] = f"{prefix}.weight_scale"
+            mappings[f"{prefix}.input_scale"] = f"{prefix}.input_scale"
+
     local_experts = plan.local_expert_ids(global_rank)
     for layer_idx, layer_type in enumerate(config.mlp_layer_types):
         if layer_type != "sparse":

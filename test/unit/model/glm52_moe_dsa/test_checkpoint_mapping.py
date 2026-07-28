@@ -106,6 +106,20 @@ def test_contract_rejects_missing_required_tensor_and_tracks_mtp() -> None:
     assert contract.ignored_source_keys(source_keys) == {mtp_key}
 
 
+def test_contract_maps_attention_static_scales() -> None:
+    contract = build_checkpoint_contract(
+        _small_config(),
+        _small_plan(),
+        global_rank=0,
+    )
+    prefix = "model.layers.0.self_attn.q_a_proj"
+
+    assert contract.mappings[f"{prefix}.weight_scale"] == (
+        f"{prefix}.weight_scale"
+    )
+    assert contract.mappings[f"{prefix}.input_scale"] == f"{prefix}.input_scale"
+
+
 def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
     plan = _small_plan()
     hidden = 3
