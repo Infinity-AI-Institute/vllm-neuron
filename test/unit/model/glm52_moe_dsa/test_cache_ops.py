@@ -131,3 +131,29 @@ def test_selected_paged_gather_resolves_logical_to_physical_blocks() -> None:
         dtype=torch.bfloat16,
     )
     torch.testing.assert_close(gathered, expected)
+
+
+def test_fp8_selected_gather_uses_explicit_quantization_multiplier() -> None:
+    cache = torch.tensor(
+        [
+            [[[-16.0, 32.0], [48.0, -64.0]]],
+            [[[80.0, 96.0], [-112.0, 128.0]]],
+        ],
+        dtype=torch.float8_e4m3fn,
+    )
+    multiplier = torch.tensor([16.0])
+
+    gathered = gather_selected_paged_cache(
+        cache,
+        torch.tensor([[1, 0]], dtype=torch.int32),
+        torch.tensor([[[0, 3]]], dtype=torch.int32),
+        block_size=2,
+        output_dtype=torch.bfloat16,
+        quant_multiplier=multiplier,
+    )
+
+    expected = torch.tensor(
+        [[[[[5.0, 6.0]], [[3.0, -4.0]]]]],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(gathered, expected)

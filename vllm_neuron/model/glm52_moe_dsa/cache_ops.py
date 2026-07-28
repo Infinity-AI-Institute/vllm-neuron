@@ -10,6 +10,19 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _TRN2_E4M3_MAX = 240.0
 
 
+def _indexable_cache(cache: torch.Tensor) -> torch.Tensor:
+    """Return a CPU-indexable view without changing the Neuron graph path.
+
+    PyTorch CPU does not implement advanced indexing or index_select for FP8
+    tensors. CPU is only the numerical reference/test path, so cast there
+    before selecting rows. XLA/Neuron keeps indexing the original FP8 cache.
+    """
+
+    if cache.device.type == "cpu" and cache.dtype in _FP8_DTYPES:
+        return cache.to(torch.float32)
+    return cache
+
+
 def _validate_cache_shape(cache: torch.Tensor, block_size: int) -> None:
     if cache.ndim != 4:
         raise ValueError(
@@ -147,7 +160,7 @@ def gather_paged_cache(
         raise ValueError("block_table must have shape [batch, max_blocks]")
 
     safe_blocks = block_table.to(torch.long).clamp(0, cache.shape[0] - 1)
-    gathered = cache[safe_blocks]
+    gathered = _indexable_cache(cache)[safe_blocks]
     gathered = gathered.permute(0, 1, 3, 2, 4).contiguous()
     gathered = gathered.reshape(
         block_table.shape[0],
@@ -215,7 +228,7 @@ def gather_selected_paged_cache(
     physical_blocks = physical_blocks.clamp(0, cache.shape[0] - 1)
     physical_slots = physical_blocks * block_size + block_offsets
 
-    flat_cache = cache.permute(0, 2, 1, 3).reshape(
+    flat_cache = _indexable_cache(cache).permute(0, 2, 1, 3).reshape(
         cache.shape[0] * block_size,
         cache.shape[1],
         cache.shape[3],
