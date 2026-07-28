@@ -14,18 +14,23 @@ from safetensors.torch import save_file
 
 from vllm_neuron.model.glm52_moe_dsa.checkpoint_converter import (
     ARTIFACT_VERSION,
+    COMPILE_CONSTANTS_FILENAME,
+    COMPILE_STUB_MANIFEST_FILENAME,
     INDEX_FILENAME,
     MANIFEST_FILENAME,
     convert_checkpoint,
     quantize_bf16_per_tensor_ocp,
     required_activation_scale_keys,
     required_cache_quant_multiplier_keys,
+    required_loader_source_keys,
     validate_bf16_index_closure,
+    write_compile_stub,
 )
 from vllm_neuron.model.glm52_moe_dsa.checkpoint_mapping import (
     build_checkpoint_contract,
 )
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
+from vllm_neuron.model.glm52_moe_dsa.model import _Glm52CompileStubCheckpoint
 from vllm_neuron.model.glm52_moe_dsa.parallelism import RoutedExpertPlan
 
 
@@ -104,6 +109,45 @@ def _load_output_tensors(output: Path) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _write_full_contract_metadata(root: Path) -> Path:
+    root.mkdir()
+    config = asdict(Glm52MoeDsaConfig())
+    config.pop("neuron_config")
+    config.update(
+        architectures=["GlmMoeDsaForCausalLM"],
+        dtype="bfloat16",
+        torch_dtype="bfloat16",
+    )
+    loader_keys = required_loader_source_keys(config)
+    raw_keys = tuple(
+        key
+        for key in loader_keys
+        if not key.endswith((".weight_scale", ".input_scale"))
+    )
+    (root / "config.json").write_text(
+        json.dumps(config, sort_keys=True),
+        encoding="utf-8",
+    )
+    (root / "tokenizer_config.json").write_text(
+        '{"model_max_length": 2048}\n',
+        encoding="utf-8",
+    )
+    (root / INDEX_FILENAME).write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 1_506_659_919_872},
+                "weight_map": {
+                    key: "unmaterialized-bf16-source.safetensors"
+                    for key in raw_keys
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
 def _convert(source: Path, output: Path, **kwargs):
     return convert_checkpoint(
         source,
@@ -114,6 +158,47 @@ def _convert(source: Path, output: Path, **kwargs):
         quantization_chunk_elements=2,
         **kwargs,
     )
+
+
+def test_compile_stub_is_metadata_only_and_never_loader_ready(
+    tmp_path: Path,
+) -> None:
+    source = _write_full_contract_metadata(tmp_path / "metadata")
+    output = tmp_path / "compile-stub"
+
+    manifest = write_compile_stub(
+        source,
+        output,
+        source_revision="b4734de4facf877f85769a911abafc5283eab3d9",
+    )
+
+    output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    output_index = json.loads(
+        (output / INDEX_FILENAME).read_text(encoding="utf-8")
+    )
+    cache_keys = required_cache_quant_multiplier_keys(output_config)
+    assert manifest["compile_stub"] is True
+    assert manifest["serving_weights_materialized"] is False
+    assert manifest["loader_ready"] is False
+    assert output_config["glm52_artifact"]["compile_stub"] is True
+    assert output_config["glm52_artifact"]["loader_ready"] is False
+    assert (output / COMPILE_STUB_MANIFEST_FILENAME).is_file()
+    assert {path.name for path in output.glob("*.safetensors")} == {
+        COMPILE_CONSTANTS_FILENAME
+    }
+    assert set(cache_keys).issubset(output_index["weight_map"])
+    with safe_open(
+        output / COMPILE_CONSTANTS_FILENAME,
+        framework="pt",
+        device="cpu",
+    ) as constants:
+        assert set(constants.keys()) == set(cache_keys)
+        assert all(constants.get_tensor(key).item() == 1 for key in cache_keys)
+    checkpoint = _Glm52CompileStubCheckpoint(str(output))
+    assert set(output_index["weight_map"]) == checkpoint.get_tensor_names()
+    cache_slice = checkpoint._get_slice(cache_keys[0])
+    assert tuple(cache_slice.get_shape()) == ()
+    assert cache_slice[()].item() == 1
 
 
 def test_zero_tensor_has_canonical_scalar_scale() -> None:

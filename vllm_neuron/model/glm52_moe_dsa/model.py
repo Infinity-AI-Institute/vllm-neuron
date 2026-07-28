@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -27,6 +30,62 @@ from .indexer import Glm52IndexShareState
 from .mla import Glm52MlaAttention
 from .parallelism import RoutedExpertPlan
 from .sparse_mlp import Glm52SparseMlp, glm52_rms_norm
+
+
+def _is_compile_stub_directory(checkpoint_path: str) -> bool:
+    config_path = Path(checkpoint_path) / "config.json"
+    if not config_path.is_file():
+        return False
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    artifact = config.get("glm52_artifact")
+    return isinstance(artifact, dict) and artifact.get("compile_stub") is True
+
+
+class _Glm52CompileStubCheckpoint:
+    """Index-backed constants reader used only for CPU graph compilation."""
+
+    def __init__(self, checkpoint_path: str) -> None:
+        self.root = Path(checkpoint_path)
+        config = json.loads(
+            (self.root / "config.json").read_text(encoding="utf-8")
+        )
+        artifact = config.get("glm52_artifact")
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("compile_stub") is not True
+            or artifact.get("loader_ready") is not False
+        ):
+            raise ValueError("invalid non-serving GLM-5.2 compile stub marker")
+        index = json.loads(
+            (self.root / "model.safetensors.index.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("GLM-5.2 compile stub has no indexed tensor names")
+        self.weight_map = {
+            str(key): str(file_name) for key, file_name in weight_map.items()
+        }
+        self._open_files = {}
+
+    def get_tensor_names(self) -> set[str]:
+        return set(self.weight_map)
+
+    def _get_slice(self, key: str):
+        file_name = self.weight_map[key]
+        path = self.root / file_name
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"compile-time constant {key!r} is not materialized in {path}"
+            )
+        if path not in self._open_files:
+            self._open_files[path] = safe_open(
+                path,
+                framework="pt",
+                device="cpu",
+            )
+        return self._open_files[path].get_slice(key)
 
 
 class Glm52RotaryEmbedding(nn.Module):
@@ -589,6 +648,11 @@ class Glm52MoeDsaForCausalLM(nn.Module):
         device: torch.device,
         cache_dir: str | None,
     ) -> None:
+        if _is_compile_stub_directory(checkpoint_path):
+            raise RuntimeError(
+                "a GLM-5.2 compile stub contains no serving weights and "
+                "cannot be loaded for execution"
+            )
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         contract = build_checkpoint_contract(
             self.config,
@@ -613,7 +677,10 @@ class Glm52MoeDsaForCausalLM(nn.Module):
         cache_dir: str | None,
     ) -> None:
         del device
-        checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+        if _is_compile_stub_directory(checkpoint_path):
+            checkpoint = _Glm52CompileStubCheckpoint(checkpoint_path)
+        else:
+            checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         contract = build_checkpoint_contract(
             self.config,
             self.model.plan,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from fnmatch import fnmatch
 
 import torch.nn as nn
@@ -132,7 +133,20 @@ class GlmMoeDsaForCausalLM(nn.Module):
             raise ValueError(
                 f"GLM-5.2 artifact_version must be {GLM52_ARTIFACT_VERSION!r}"
             )
-        if artifact.get("loader_ready") is not True:
+        compile_stub = artifact.get("compile_stub") is True
+        cpu_compile = os.environ.get("VLLM_NEURON_CPU_COMPILE", "").lower() in (
+            "1",
+            "true",
+        )
+        if compile_stub:
+            if not cpu_compile:
+                raise ValueError(
+                    "GLM-5.2 compile stubs are accepted only with "
+                    "VLLM_NEURON_CPU_COMPILE=1"
+                )
+            if artifact.get("loader_ready") is not False:
+                raise ValueError("a GLM-5.2 compile stub must not be loader_ready")
+        elif artifact.get("loader_ready") is not True:
             raise ValueError("GLM-5.2 artifact is not loader_ready")
         if artifact.get("mtp_enabled") is not False:
             raise ValueError("GLM-5.2 serving requires MTP disabled")

@@ -85,6 +85,27 @@ def test_factory_rejects_artifact_without_loader_closure(monkeypatch) -> None:
         raise AssertionError("incomplete converted artifact was accepted")
 
 
+def test_factory_accepts_non_serving_compile_stub_only_in_cpu_compile(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    monkeypatch.setattr(
+        "vllm_neuron.model.glm52_moe_dsa.factory._get_tp_world_size",
+        lambda: 64,
+    )
+    config = _hf_config()
+    config.glm52_artifact.update(
+        loader_ready=False,
+        compile_stub=True,
+    )
+
+    with pytest.raises(ValueError, match="CPU_COMPILE"):
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+    monkeypatch.setenv("VLLM_NEURON_CPU_COMPILE", "1")
+    GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (

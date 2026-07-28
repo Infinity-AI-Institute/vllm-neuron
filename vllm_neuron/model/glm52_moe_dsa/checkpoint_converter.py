@@ -54,6 +54,9 @@ ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_VERSION = "glm52-trn2-static-fp8-v1"
 CONVERTER_VERSION = "1.0.0"
 MANIFEST_FILENAME = "glm52-static-fp8-manifest.json"
+COMPILE_STUB_MANIFEST_FILENAME = "glm52-compile-stub-manifest.json"
+COMPILE_CONSTANTS_FILENAME = "glm52-compile-constants.safetensors"
+UNMATERIALIZED_SCALES_FILENAME = "glm52-unmaterialized-scales.safetensors"
 INDEX_FILENAME = "model.safetensors.index.json"
 DEFAULT_MAX_SHARD_BYTES = 2 * 1024**3
 DEFAULT_QUANTIZATION_CHUNK_ELEMENTS = 4 * 1024**2
@@ -732,6 +735,208 @@ def _write_output_config(
     }
 
 
+def required_loader_source_keys(
+    config_dict: Mapping[str, Any],
+    *,
+    world_size: int = 64,
+    ep_degree: int = 16,
+) -> tuple[str, ...]:
+    """Return the union of every source key consumed by all TP ranks."""
+
+    config = Glm52MoeDsaConfig.from_configs(dict(config_dict), None)
+    plan = RoutedExpertPlan(
+        world_size=world_size,
+        ep_degree=ep_degree,
+        num_experts=config.n_routed_experts,
+        expert_intermediate_size=config.moe_intermediate_size,
+    )
+    keys: set[str] = set()
+    for rank in range(world_size):
+        keys.update(
+            build_checkpoint_contract(
+                config,
+                plan,
+                global_rank=rank,
+            ).required_source_keys
+        )
+    return tuple(sorted(keys))
+
+
+def write_compile_stub(
+    source_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    source_revision: str,
+    source_model_id: str = "zai-org/GLM-5.2",
+    world_size: int = 64,
+    ep_degree: int = 16,
+) -> dict[str, Any]:
+    """Write a metadata-only, non-serving artifact for CPU graph compilation."""
+
+    source_dir = Path(source_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    if not source_revision.strip():
+        raise ValueError("source_revision is required for provenance")
+    if not source_model_id.strip():
+        raise ValueError("source_model_id is required for provenance")
+    if not source_dir.is_dir():
+        raise FileNotFoundError(source_dir)
+    if source_dir == output_dir:
+        raise ValueError("source and output directories must differ")
+    if output_dir.exists():
+        raise FileExistsError(
+            f"refusing to overwrite existing output directory {output_dir}"
+        )
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    config, config_sha256 = _validate_source_config(source_dir)
+    source = _discover_source_checkpoint(source_dir)
+    source_keys = tuple(sorted(source.weight_map))
+    index_closure = validate_bf16_index_closure(
+        config,
+        source_keys,
+        world_size=world_size,
+        ep_degree=ep_degree,
+    )
+    loader_keys = required_loader_source_keys(
+        config,
+        world_size=world_size,
+        ep_degree=ep_degree,
+    )
+    cache_keys = required_cache_quant_multiplier_keys(config)
+    source_key_set = set(source_keys)
+    generated_loader_keys = set(loader_keys) - source_key_set
+    expected_generated = {
+        _weight_scale_key(key)
+        for key in source_keys
+        if not key.startswith(MTP_IGNORED_PREFIX) and is_static_fp8_weight(key)
+    } | set(required_activation_scale_keys(source_keys))
+    if generated_loader_keys != expected_generated:
+        raise ValueError(
+            "compile-stub loader contract contains unexpected generated keys"
+        )
+
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_dir.name}.staging-",
+            dir=output_dir.parent,
+        )
+    )
+    try:
+        constants = {
+            key: torch.tensor(1.0, dtype=torch.float32) for key in cache_keys
+        }
+        save_file(constants, staging_dir / COMPILE_CONSTANTS_FILENAME)
+
+        weight_map = {
+            key: (
+                source.weight_map[key]
+                if key in source.weight_map
+                else UNMATERIALIZED_SCALES_FILENAME
+            )
+            for key in loader_keys
+        }
+        weight_map.update(
+            {key: COMPILE_CONSTANTS_FILENAME for key in cache_keys}
+        )
+        output_index = {
+            "metadata": {
+                "artifact_version": ARTIFACT_VERSION,
+                "compile_stub": True,
+                "materialized_tensor_bytes": 4 * len(cache_keys),
+                "total_size": 4 * len(cache_keys),
+            },
+            "weight_map": dict(sorted(weight_map.items())),
+        }
+        index_bytes = _json_bytes(output_index)
+        (staging_dir / INDEX_FILENAME).write_bytes(index_bytes)
+
+        output_config = dict(config)
+        output_config["dtype"] = "bfloat16"
+        output_config["torch_dtype"] = "bfloat16"
+        output_config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "artifact_version": ARTIFACT_VERSION,
+            "quantization": {
+                "quant_algo": "FP8",
+                "kv_cache_quant_algo": "FP8",
+                "weight_scale_granularity": "per_tensor",
+                "activation_scheme": "static",
+                "exclude_modules": list(_BF16_EXCLUDE_MODULES),
+            },
+        }
+        output_config["glm52_artifact"] = {
+            "artifact_version": ARTIFACT_VERSION,
+            "manifest_file": COMPILE_STUB_MANIFEST_FILENAME,
+            "compile_stub": True,
+            "loader_ready": False,
+            "mtp_enabled": False,
+            "index_closure_status": "passed",
+            "calibration_status": "not_run_compile_stub",
+        }
+        config_bytes = _json_bytes(output_config)
+        (staging_dir / "config.json").write_bytes(config_bytes)
+        auxiliary_files = _copy_auxiliary_files(source_dir, staging_dir)
+
+        identity = {
+            "artifact_version": ARTIFACT_VERSION,
+            "compile_stub": True,
+            "source_model_id": source_model_id,
+            "source_revision": source_revision,
+            "source_index_sha256": source.index_sha256,
+            "output_index_sha256": _sha256_bytes(index_bytes),
+        }
+        manifest = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "artifact_version": ARTIFACT_VERSION,
+            "artifact_id": _sha256_bytes(
+                json.dumps(identity, sort_keys=True).encode()
+            ),
+            "compile_stub": True,
+            "serving_weights_materialized": False,
+            "loader_ready": False,
+            "warning": (
+                "CPU graph compilation only. This artifact contains no "
+                "projection or expert weights and must never be served."
+            ),
+            "source": {
+                "model_id": source_model_id,
+                "revision": source_revision,
+                "config_sha256": config_sha256,
+                "index_sha256": source.index_sha256,
+                "declared_total_tensor_bytes": source.declared_total_size,
+                "index_closure": index_closure,
+            },
+            "contract": {
+                "world_size": world_size,
+                "ep_degree": ep_degree,
+                "indexed_loader_key_count": len(loader_keys),
+                "indexed_loader_keys_sha256": _key_digest(loader_keys),
+                "unmaterialized_scale_count": len(generated_loader_keys),
+                "cache_constant_count": len(cache_keys),
+                "cache_constant_keys_sha256": _key_digest(cache_keys),
+            },
+            "output": {
+                "index_file": INDEX_FILENAME,
+                "index_sha256": _sha256_bytes(index_bytes),
+                "config_sha256": _sha256_bytes(config_bytes),
+                "constants_file": COMPILE_CONSTANTS_FILENAME,
+                "constants_sha256": _sha256_file(
+                    staging_dir / COMPILE_CONSTANTS_FILENAME
+                ),
+                "auxiliary_files": auxiliary_files,
+            },
+        }
+        (staging_dir / COMPILE_STUB_MANIFEST_FILENAME).write_bytes(
+            _json_bytes(manifest)
+        )
+        staging_dir.replace(output_dir)
+        return manifest
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
 def convert_checkpoint(
     source_dir: str | Path,
     output_dir: str | Path,
@@ -1122,6 +1327,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--source-model-id", default="zai-org/GLM-5.2")
     parser.add_argument(
+        "--compile-stub",
+        action="store_true",
+        help=(
+            "write a non-serving metadata/constants artifact for "
+            "VLLM_NEURON_CPU_COMPILE instead of converting weights"
+        ),
+    )
+    parser.add_argument(
         "--calibration",
         "--activation-scales",
         dest="activation_scales",
@@ -1154,26 +1367,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_QUANTIZATION_CHUNK_ELEMENTS,
     )
     args = parser.parse_args(argv)
-    manifest = convert_checkpoint(
-        args.source_dir,
-        args.output_dir,
-        source_revision=args.source_revision,
-        source_model_id=args.source_model_id,
-        activation_scales_path=args.activation_scales,
-        max_shard_bytes=args.max_shard_bytes,
-        quantization_chunk_elements=args.quantization_chunk_elements,
-        hf_streaming=args.hf_streaming,
-        download_staging_dir=args.download_staging_dir,
-        strict_index_closure=not args.skip_index_closure,
-        world_size=args.world_size,
-        ep_degree=args.ep_degree,
-    )
+    if args.compile_stub:
+        if (
+            args.activation_scales is not None
+            or args.hf_streaming
+            or args.download_staging_dir is not None
+            or args.skip_index_closure
+        ):
+            parser.error(
+                "--compile-stub cannot be combined with calibration, HF "
+                "streaming, download staging, or skipped closure"
+            )
+        manifest = write_compile_stub(
+            args.source_dir,
+            args.output_dir,
+            source_revision=args.source_revision,
+            source_model_id=args.source_model_id,
+            world_size=args.world_size,
+            ep_degree=args.ep_degree,
+        )
+    else:
+        manifest = convert_checkpoint(
+            args.source_dir,
+            args.output_dir,
+            source_revision=args.source_revision,
+            source_model_id=args.source_model_id,
+            activation_scales_path=args.activation_scales,
+            max_shard_bytes=args.max_shard_bytes,
+            quantization_chunk_elements=args.quantization_chunk_elements,
+            hf_streaming=args.hf_streaming,
+            download_staging_dir=args.download_staging_dir,
+            strict_index_closure=not args.skip_index_closure,
+            world_size=args.world_size,
+            ep_degree=args.ep_degree,
+        )
     print(
         json.dumps(
             {
                 "artifact_id": manifest["artifact_id"],
-                "loader_ready": manifest["loader_validation"]["loader_ready"],
-                "manifest": str(args.output_dir / MANIFEST_FILENAME),
+                "loader_ready": (
+                    manifest["loader_validation"]["loader_ready"]
+                    if "loader_validation" in manifest
+                    else manifest["loader_ready"]
+                ),
+                "manifest": str(
+                    args.output_dir
+                    / (
+                        COMPILE_STUB_MANIFEST_FILENAME
+                        if args.compile_stub
+                        else MANIFEST_FILENAME
+                    )
+                ),
             },
             sort_keys=True,
         )
