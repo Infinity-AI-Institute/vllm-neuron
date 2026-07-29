@@ -26,6 +26,19 @@ def glm52_rms_norm(
     return (normalized * weight.to(torch.float32)).to(input_dtype)
 
 
+def _prefill_padding_mask(
+    slot_mapping: torch.Tensor,
+    *,
+    num_tokens: int,
+) -> torch.Tensor:
+    local_slot_mapping = slot_mapping.reshape(-1)
+    if local_slot_mapping.numel() != num_tokens:
+        raise ValueError(
+            "slot_mapping must contain one entry per rank-local prefill token"
+        )
+    return local_slot_mapping >= 0
+
+
 class Glm52SparseMlp(nn.Module):
     """External router plus qualified routed/shared expert paths.
 
@@ -118,7 +131,7 @@ class Glm52SparseMlp(nn.Module):
         hidden_states: torch.Tensor,
         *,
         norm_weight: torch.Tensor,
-        positions: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
     ) -> torch.Tensor:
         """Route full-sequence tokens and return the local SP output."""
 
@@ -138,22 +151,21 @@ class Glm52SparseMlp(nn.Module):
             num_experts=self.config.n_routed_experts,
         ).to(normalized_local.dtype)
 
-        padding_mask = None
-        if positions is not None:
-            last_real_idx = torch.argmax(positions)
-            token_indices = torch.arange(
-                positions.shape[0],
-                device=positions.device,
-            )
-            padding_mask = token_indices <= last_real_idx
+        # The scheduler marks every padded token with PAD_SLOT_ID (-1).
+        # Position IDs are not authoritative here: prefill padding repeats the
+        # final real position, so a fully padded SP rank can contain only that
+        # repeated value and cannot infer that all of its tokens are invalid.
+        padding_mask = _prefill_padding_mask(
+            slot_mapping,
+            num_tokens=hidden_states.shape[0],
+        )
 
         normalized = normalized_local
         affinities = affinities_local
         if self.tp_group.world_size > 1:
             normalized = self.tp_group.all_gather(normalized, dim=0)
             affinities = self.tp_group.all_gather(affinities, dim=0)
-            if padding_mask is not None:
-                padding_mask = self.tp_group.all_gather(padding_mask, dim=0)
+            padding_mask = self.tp_group.all_gather(padding_mask, dim=0)
 
         first_expert = self.ep_rank * self.plan.experts_per_rank
         local_affinities = affinities[

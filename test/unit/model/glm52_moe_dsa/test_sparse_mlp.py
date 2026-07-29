@@ -8,6 +8,7 @@ from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
 from vllm_neuron.model.glm52_moe_dsa.parallelism import RoutedExpertPlan
 from vllm_neuron.model.glm52_moe_dsa.sparse_mlp import (
     Glm52SparseMlp,
+    _prefill_padding_mask,
     glm52_rms_norm,
 )
 
@@ -112,3 +113,29 @@ def test_static_fp8_selects_neuron_router_topk() -> None:
     )
 
     assert module.gate.topk_backend == "neuron"
+
+
+def test_prefill_padding_mask_uses_slot_mapping_sentinels() -> None:
+    active = _prefill_padding_mask(
+        torch.arange(288, 320),
+        num_tokens=32,
+    )
+    fully_padded = _prefill_padding_mask(
+        torch.full((32,), -1),
+        num_tokens=32,
+    )
+
+    torch.testing.assert_close(active, torch.ones(32, dtype=torch.bool))
+    torch.testing.assert_close(fully_padded, torch.zeros(32, dtype=torch.bool))
+
+
+def test_prefill_rejects_slot_mapping_with_wrong_local_token_count() -> None:
+    try:
+        _prefill_padding_mask(
+            torch.tensor([0]),
+            num_tokens=2,
+        )
+    except ValueError as error:
+        assert "rank-local prefill token" in str(error)
+    else:
+        raise AssertionError("mismatched slot_mapping length was accepted")

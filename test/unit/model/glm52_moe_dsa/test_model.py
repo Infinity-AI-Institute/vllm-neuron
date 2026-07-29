@@ -15,7 +15,10 @@ from vllm_neuron.model.glm52_moe_dsa.model import (
     Glm52RotaryEmbedding,
 )
 from vllm_neuron.model.glm52_moe_dsa.parallelism import RoutedExpertPlan
-from vllm_neuron.model.glm52_moe_dsa.sparse_mlp import glm52_rms_norm
+from vllm_neuron.model.glm52_moe_dsa.sparse_mlp import (
+    Glm52SparseMlp,
+    glm52_rms_norm,
+)
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
@@ -552,3 +555,114 @@ def test_prefill_preserves_sequence_parallel_shape_transitions() -> None:
     assert logits.shape == (1, config.vocab_size)
     assert ((4, config.hidden_size), 0) in group.scatters
     assert ((2, config.hidden_size), 0) in group.gathers
+
+
+class _RankedTp64Group:
+    world_size = 64
+
+    def __init__(self, rank: int) -> None:
+        self.rank_in_group = rank
+
+
+class _PrefillAttention(nn.Module):
+    cache_name = "layers.0.self_attn"
+    indexer = None
+    world_size = 64
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        self.tp_group = _RankedTp64Group(rank)
+
+    def forward_paged_prefill(
+        self,
+        hidden_states,
+        position_embeddings,
+        positions,
+        attn_metadata,
+        **kwargs,
+    ):
+        del position_embeddings, positions, attn_metadata, kwargs
+        state = Glm52IndexShareState(
+            topk_indices=torch.zeros(
+                hidden_states.shape[0],
+                1,
+                dtype=torch.int32,
+            ),
+            source_layer_idx=0,
+        )
+        return torch.zeros_like(hidden_states), state
+
+
+class _RecordingSparseMlp(Glm52SparseMlp):
+    def __init__(self) -> None:
+        nn.Module.__init__(self)
+        self.seen_slot_mapping: torch.Tensor | None = None
+
+    def forward_prefill(self, hidden_states, *, norm_weight, slot_mapping):
+        del norm_weight
+        self.seen_slot_mapping = slot_mapping.clone()
+        return torch.zeros_like(hidden_states)
+
+
+def test_tp64_prefill_slices_production_2k_padding_slots_per_rank() -> None:
+    """A 320-token request in the production 2K bucket leaves ranks 10-63 empty."""
+
+    config = _config()
+    config.num_attention_heads = 64
+    config.num_key_value_heads = 64
+    positions = torch.cat(
+        (
+            torch.arange(320, dtype=torch.int32),
+            torch.full((1_728,), 319, dtype=torch.int32),
+        )
+    )
+    slot_mapping = torch.cat(
+        (
+            torch.arange(320, dtype=torch.int64),
+            torch.full((1_728,), -1, dtype=torch.int64),
+        )
+    )
+    metadata = {
+        "layers.0.self_attn": {
+            "slot_mapping": slot_mapping,
+            "max_query_len": 2_048,
+            "decode_token_threshold": 1,
+        }
+    }
+
+    for rank, expected in (
+        (9, torch.arange(288, 320, dtype=torch.int64)),
+        (10, torch.full((32,), -1, dtype=torch.int64)),
+        (63, torch.full((32,), -1, dtype=torch.int64)),
+    ):
+        mlp = _RecordingSparseMlp()
+        layer = Glm52DecoderLayer(
+            config,
+            layer_idx=0,
+            cache_layout=Glm52CacheLayout.build(
+                config,
+                world_size=64,
+                cache_dtype=torch.bfloat16,
+            ),
+            plan=RoutedExpertPlan(64, 16, 16, 64),
+            world_size=64,
+            global_rank=rank,
+            tp_group=_RankedTp64Group(rank),
+            expert_tp_group=_Group(),
+            static_fp8=False,
+            attention_module=_PrefillAttention(rank),
+            mlp_module=mlp,
+        )
+        layer.key_cache = torch.empty(1)
+        layer.value_cache = torch.empty(1)
+
+        layer(
+            torch.zeros(32, config.hidden_size),
+            positions,
+            (torch.ones(2_048, 2), torch.zeros(2_048, 2)),
+            metadata,
+            None,
+        )
+
+        assert mlp.seen_slot_mapping is not None
+        torch.testing.assert_close(mlp.seen_slot_mapping, expected)

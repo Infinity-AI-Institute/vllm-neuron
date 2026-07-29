@@ -352,15 +352,27 @@ class Glm52DecoderLayer(nn.Module):
                 norm_weight=self.post_attention_layernorm.weight,
             )
         elif isinstance(self.mlp, Glm52SparseMlp):
-            local_positions = positions
+            metadata = attn_metadata[self.self_attn.cache_name]
+            slot_mapping = metadata.get("slot_mapping")
+            if not isinstance(slot_mapping, torch.Tensor):
+                raise TypeError("slot_mapping metadata must be a tensor")
+            local_slot_mapping = slot_mapping
             if self.self_attn.world_size > 1:
+                # GLM prefill DCP is rejected by the factory. Embedding and
+                # attention both sequence-parallelize with reduce_scatter on
+                # dim 0, so each TP rank owns one contiguous token chunk.
                 local_tokens = hidden_states.shape[0]
                 start = (self.self_attn.tp_group.rank_in_group) * local_tokens
-                local_positions = positions[start : start + local_tokens]
+                local_slot_mapping = slot_mapping[start : start + local_tokens]
+            if local_slot_mapping.numel() != hidden_states.shape[0]:
+                raise ValueError(
+                    "sequence-parallel slot_mapping slice must match the "
+                    "rank-local hidden-state token count"
+                )
             mlp_output = self.mlp.forward_prefill(
                 hidden_states,
                 norm_weight=self.post_attention_layernorm.weight,
-                positions=local_positions,
+                slot_mapping=local_slot_mapping,
             )
         else:
             mlp_output = self.mlp.forward_prefill(
