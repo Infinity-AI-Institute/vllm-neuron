@@ -39,6 +39,21 @@ def _prefill_padding_mask(
     return local_slot_mapping >= 0
 
 
+def _mask_padded_affinities(
+    expert_affinities: torch.Tensor,
+    padding_mask: torch.Tensor,
+) -> torch.Tensor:
+    if expert_affinities.ndim != 2:
+        raise ValueError("expert affinities must be a two-dimensional tensor")
+    flat_padding_mask = padding_mask.reshape(-1)
+    if flat_padding_mask.numel() != expert_affinities.shape[0]:
+        raise ValueError("padding mask must contain one entry per routed token")
+    return expert_affinities.masked_fill(
+        ~flat_padding_mask.to(torch.bool).unsqueeze(1),
+        0,
+    )
+
+
 class Glm52SparseMlp(nn.Module):
     """External router plus qualified routed/shared expert paths.
 
@@ -172,6 +187,13 @@ class Glm52SparseMlp(nn.Module):
             :,
             first_expert : first_expert + self.plan.experts_per_rank,
         ]
+        # build_blockwise_mapping derives its token/expert membership from the
+        # affinities it receives before applying its optional padding mask.
+        # Zero invalid rows here so padded token IDs never enter that mapping.
+        local_affinities = _mask_padded_affinities(
+            local_affinities,
+            padding_mask,
+        )
         (
             expert_affinities_masked,
             token_position_to_id,
