@@ -97,6 +97,41 @@ class Gemma4PagedKVCache:
         return self.key.index_select(0, slots), self.value.index_select(0, slots)
 
 
+class Gemma4ReferenceAttention(nn.Module):
+    """Small CPU oracle for validating native attention/cache seams.
+
+    This is not the serving kernel. It intentionally uses ordinary PyTorch
+    operations so discrepancies can be localized before replacing it with a
+    Neuron paged-attention implementation.
+    """
+
+    def __init__(self, head_dim: int, num_query_heads: int, num_kv_heads: int):
+        super().__init__()
+        if num_query_heads % num_kv_heads:
+            raise ValueError("query heads must be divisible by KV heads")
+        self.head_dim = head_dim
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.scale = head_dim ** -0.5
+
+    def forward(self, query, key, value, cache=None, slot_mapping=None):
+        # Inputs are [tokens, heads, head_dim]. Cache writes preserve the
+        # native per-layer head width and are performed before reading history.
+        if cache is not None:
+            if slot_mapping is None:
+                raise ValueError("slot_mapping is required when using a KV cache")
+            cache.write(slot_mapping, key, value)
+            key, value = cache.read(slot_mapping)
+        repeat = self.num_query_heads // self.num_kv_heads
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
+        scores = torch.einsum("thd,shd->hts", query, key) * self.scale
+        causal = torch.triu(torch.ones_like(scores, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+        return torch.einsum("hts,shd->thd", probs, value)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()

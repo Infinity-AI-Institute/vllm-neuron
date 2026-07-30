@@ -6,6 +6,7 @@ from vllm_neuron.model.gemma4.config import Gemma4Config
 from vllm_neuron.model.gemma4.model import (
     Gemma4RMSNorm,
     Gemma4PagedKVCache,
+    Gemma4ReferenceAttention,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -86,3 +87,14 @@ def test_paged_cache_rejects_wrong_layer_shape():
     except ValueError:
         return
     raise AssertionError("cache accepted a layer with the wrong KV-head shape")
+
+
+def test_reference_attention_supports_gqa_and_cache_contract():
+    torch = __import__("torch")
+    attention = Gemma4ReferenceAttention(head_dim=4, num_query_heads=4, num_kv_heads=2)
+    query = torch.randn(3, 4, 4)
+    key = torch.randn(3, 2, 4)
+    value = torch.randn(3, 2, 4)
+    cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.float32)
+    result = attention(query, key, value, cache, torch.tensor([0, 1, 2]))
+    assert result.shape == query.shape
