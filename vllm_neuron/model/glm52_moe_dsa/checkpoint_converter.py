@@ -52,6 +52,7 @@ from .parallelism import RoutedExpertPlan
 
 ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_VERSION = "glm52-trn2-static-fp8-v1"
+BF16_SHARED_ARTIFACT_VERSION = "glm52-trn2-static-fp8-bf16-shared-v1"
 CONVERTER_VERSION = "1.0.0"
 MANIFEST_FILENAME = "glm52-static-fp8-manifest.json"
 COMPILE_STUB_MANIFEST_FILENAME = "glm52-compile-stub-manifest.json"
@@ -127,6 +128,27 @@ _BF16_EXCLUDE_MODULES = (
     "model.layers.*.self_attn.indexer.*",
     "model.layers.*.mlp.gate",
 )
+_BF16_SHARED_EXCLUDE_MODULE = "model.layers.*.mlp.shared_experts.*"
+
+
+def _validate_shared_expert_dtype(shared_expert_dtype: str) -> str:
+    if shared_expert_dtype not in ("fp8", "bfloat16"):
+        raise ValueError("shared_expert_dtype must be either 'fp8' or 'bfloat16'")
+    return shared_expert_dtype
+
+
+def _artifact_version(shared_expert_dtype: str) -> str:
+    return (
+        BF16_SHARED_ARTIFACT_VERSION
+        if _validate_shared_expert_dtype(shared_expert_dtype) == "bfloat16"
+        else ARTIFACT_VERSION
+    )
+
+
+def _bf16_exclude_modules(shared_expert_dtype: str) -> tuple[str, ...]:
+    if _validate_shared_expert_dtype(shared_expert_dtype) == "bfloat16":
+        return (*_BF16_EXCLUDE_MODULES, _BF16_SHARED_EXCLUDE_MODULE)
+    return _BF16_EXCLUDE_MODULES
 
 
 @dataclass(frozen=True)
@@ -355,9 +377,18 @@ def validate_bf16_index_closure(
     }
 
 
-def is_static_fp8_weight(key: str) -> bool:
+def is_static_fp8_weight(
+    key: str,
+    *,
+    shared_expert_dtype: str = "fp8",
+) -> bool:
     """Return whether ``key`` is consumed by a static-FP8 GLM projection."""
 
+    if (
+        _validate_shared_expert_dtype(shared_expert_dtype) == "bfloat16"
+        and ".mlp.shared_experts." in key
+    ):
+        return False
     return any(pattern.fullmatch(key) for pattern in _STATIC_WEIGHT_PATTERNS)
 
 
@@ -371,7 +402,11 @@ def _input_scale_key(weight_key: str) -> str | None:
     return weight_key.removesuffix(".weight") + ".input_scale"
 
 
-def required_activation_scale_keys(source_keys: Sequence[str]) -> tuple[str, ...]:
+def required_activation_scale_keys(
+    source_keys: Sequence[str],
+    *,
+    shared_expert_dtype: str = "fp8",
+) -> tuple[str, ...]:
     """Return deterministic scalar activation-scale names for this artifact."""
 
     return tuple(
@@ -379,7 +414,10 @@ def required_activation_scale_keys(source_keys: Sequence[str]) -> tuple[str, ...
             input_scale
             for key in source_keys
             if not key.startswith(MTP_IGNORED_PREFIX)
-            and is_static_fp8_weight(key)
+            and is_static_fp8_weight(
+                key,
+                shared_expert_dtype=shared_expert_dtype,
+            )
             and (input_scale := _input_scale_key(key)) is not None
         )
     )
@@ -691,26 +729,30 @@ def _write_output_config(
     source_config: Mapping[str, Any],
     staging_dir: Path,
     *,
+    shared_expert_dtype: str,
     calibration_manifest: Mapping[str, Any],
     cache_quant_multipliers: Mapping[str, float],
     index_closure: Mapping[str, Any],
 ) -> dict[str, Any]:
+    artifact_version = _artifact_version(shared_expert_dtype)
     output_config = dict(source_config)
     output_config["dtype"] = "bfloat16"
     output_config["torch_dtype"] = "bfloat16"
+    output_config["shared_expert_dtype"] = shared_expert_dtype
     output_config["quantization_config"] = {
         "quant_method": "modelopt",
-        "artifact_version": ARTIFACT_VERSION,
+        "artifact_version": artifact_version,
         "quantization": {
             "quant_algo": "FP8",
             "kv_cache_quant_algo": "FP8",
             "weight_scale_granularity": "per_tensor",
             "activation_scheme": "static",
-            "exclude_modules": list(_BF16_EXCLUDE_MODULES),
+            "exclude_modules": list(_bf16_exclude_modules(shared_expert_dtype)),
         },
     }
     output_config["glm52_artifact"] = {
-        "artifact_version": ARTIFACT_VERSION,
+        "artifact_version": artifact_version,
+        "shared_expert_dtype": shared_expert_dtype,
         "manifest_file": MANIFEST_FILENAME,
         "mtp_enabled": False,
         "loader_ready": bool(calibration_manifest["loader_ready"])
@@ -770,6 +812,7 @@ def write_compile_stub(
     source_model_id: str = "zai-org/GLM-5.2",
     world_size: int = 64,
     ep_degree: int = 16,
+    shared_expert_dtype: str = "fp8",
 ) -> dict[str, Any]:
     """Write a metadata-only, non-serving artifact for CPU graph compilation."""
 
@@ -789,7 +832,11 @@ def write_compile_stub(
         )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
+    shared_expert_dtype = _validate_shared_expert_dtype(shared_expert_dtype)
+    artifact_version = _artifact_version(shared_expert_dtype)
     config, config_sha256 = _validate_source_config(source_dir)
+    config = dict(config)
+    config["shared_expert_dtype"] = shared_expert_dtype
     source = _discover_source_checkpoint(source_dir)
     source_keys = tuple(sorted(source.weight_map))
     index_closure = validate_bf16_index_closure(
@@ -809,8 +856,17 @@ def write_compile_stub(
     expected_generated = {
         _weight_scale_key(key)
         for key in source_keys
-        if not key.startswith(MTP_IGNORED_PREFIX) and is_static_fp8_weight(key)
-    } | set(required_activation_scale_keys(source_keys))
+        if not key.startswith(MTP_IGNORED_PREFIX)
+        and is_static_fp8_weight(
+            key,
+            shared_expert_dtype=shared_expert_dtype,
+        )
+    } | set(
+        required_activation_scale_keys(
+            source_keys,
+            shared_expert_dtype=shared_expert_dtype,
+        )
+    )
     if generated_loader_keys != expected_generated:
         raise ValueError(
             "compile-stub loader contract contains unexpected generated keys"
@@ -823,9 +879,7 @@ def write_compile_stub(
         )
     )
     try:
-        constants = {
-            key: torch.tensor(1.0, dtype=torch.float32) for key in cache_keys
-        }
+        constants = {key: torch.tensor(1.0, dtype=torch.float32) for key in cache_keys}
         save_file(constants, staging_dir / COMPILE_CONSTANTS_FILENAME)
 
         weight_map = {
@@ -836,12 +890,10 @@ def write_compile_stub(
             )
             for key in loader_keys
         }
-        weight_map.update(
-            {key: COMPILE_CONSTANTS_FILENAME for key in cache_keys}
-        )
+        weight_map.update({key: COMPILE_CONSTANTS_FILENAME for key in cache_keys})
         output_index = {
             "metadata": {
-                "artifact_version": ARTIFACT_VERSION,
+                "artifact_version": artifact_version,
                 "compile_stub": True,
                 "materialized_tensor_bytes": 4 * len(cache_keys),
                 "total_size": 4 * len(cache_keys),
@@ -854,19 +906,21 @@ def write_compile_stub(
         output_config = dict(config)
         output_config["dtype"] = "bfloat16"
         output_config["torch_dtype"] = "bfloat16"
+        output_config["shared_expert_dtype"] = shared_expert_dtype
         output_config["quantization_config"] = {
             "quant_method": "modelopt",
-            "artifact_version": ARTIFACT_VERSION,
+            "artifact_version": artifact_version,
             "quantization": {
                 "quant_algo": "FP8",
                 "kv_cache_quant_algo": "FP8",
                 "weight_scale_granularity": "per_tensor",
                 "activation_scheme": "static",
-                "exclude_modules": list(_BF16_EXCLUDE_MODULES),
+                "exclude_modules": list(_bf16_exclude_modules(shared_expert_dtype)),
             },
         }
         output_config["glm52_artifact"] = {
-            "artifact_version": ARTIFACT_VERSION,
+            "artifact_version": artifact_version,
+            "shared_expert_dtype": shared_expert_dtype,
             "manifest_file": COMPILE_STUB_MANIFEST_FILENAME,
             "compile_stub": True,
             "loader_ready": False,
@@ -879,7 +933,8 @@ def write_compile_stub(
         auxiliary_files = _copy_auxiliary_files(source_dir, staging_dir)
 
         identity = {
-            "artifact_version": ARTIFACT_VERSION,
+            "artifact_version": artifact_version,
+            "shared_expert_dtype": shared_expert_dtype,
             "compile_stub": True,
             "source_model_id": source_model_id,
             "source_revision": source_revision,
@@ -888,10 +943,9 @@ def write_compile_stub(
         }
         manifest = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
-            "artifact_version": ARTIFACT_VERSION,
-            "artifact_id": _sha256_bytes(
-                json.dumps(identity, sort_keys=True).encode()
-            ),
+            "artifact_version": artifact_version,
+            "shared_expert_dtype": shared_expert_dtype,
+            "artifact_id": _sha256_bytes(json.dumps(identity, sort_keys=True).encode()),
             "compile_stub": True,
             "serving_weights_materialized": False,
             "loader_ready": False,
@@ -951,6 +1005,7 @@ def convert_checkpoint(
     strict_index_closure: bool = True,
     world_size: int = 64,
     ep_degree: int = 16,
+    shared_expert_dtype: str = "fp8",
 ) -> dict[str, Any]:
     """Convert a local BF16 checkpoint without loading more than one tensor."""
 
@@ -970,7 +1025,11 @@ def convert_checkpoint(
         )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
+    shared_expert_dtype = _validate_shared_expert_dtype(shared_expert_dtype)
+    artifact_version = _artifact_version(shared_expert_dtype)
     config, config_sha256 = _validate_source_config(source_dir)
+    config = dict(config)
+    config["shared_expert_dtype"] = shared_expert_dtype
     source = _discover_source_checkpoint(source_dir)
     source_keys = tuple(sorted(source.weight_map))
     if strict_index_closure:
@@ -997,13 +1056,20 @@ def convert_checkpoint(
     target_keys = tuple(
         key
         for key in source_keys
-        if not key.startswith(MTP_IGNORED_PREFIX) and is_static_fp8_weight(key)
+        if not key.startswith(MTP_IGNORED_PREFIX)
+        and is_static_fp8_weight(
+            key,
+            shared_expert_dtype=shared_expert_dtype,
+        )
     )
     if not target_keys:
         raise ValueError("source checkpoint contains no GLM static-FP8 weights")
 
     generated_weight_scales = {_weight_scale_key(key) for key in target_keys}
-    required_input_scales = required_activation_scale_keys(source_keys)
+    required_input_scales = required_activation_scale_keys(
+        source_keys,
+        shared_expert_dtype=shared_expert_dtype,
+    )
     required_cache_scales = required_cache_quant_multiplier_keys(config)
     generated_input_scales = set(required_input_scales)
     generated_cache_scales = set(required_cache_scales)
@@ -1096,7 +1162,10 @@ def convert_checkpoint(
                             del slice_obj
                             continue
 
-                        if is_static_fp8_weight(key):
+                        if is_static_fp8_weight(
+                            key,
+                            shared_expert_dtype=shared_expert_dtype,
+                        ):
                             output_group_bytes = prod(slice_obj.get_shape()) + 4
                             input_scale_key = _input_scale_key(key)
                             if input_scale_key in activation_scales:
@@ -1106,7 +1175,10 @@ def convert_checkpoint(
                         writer.prepare(output_group_bytes)
 
                         tensor = shard.get_tensor(key)
-                        if is_static_fp8_weight(key):
+                        if is_static_fp8_weight(
+                            key,
+                            shared_expert_dtype=shared_expert_dtype,
+                        ):
                             quantized, weight_scale = quantize_bf16_per_tensor_ocp(
                                 tensor,
                                 chunk_elements=(quantization_chunk_elements),
@@ -1181,7 +1253,8 @@ def convert_checkpoint(
         weight_map, output_shards = writer.finalize()
         index = {
             "metadata": {
-                "artifact_version": ARTIFACT_VERSION,
+                "artifact_version": artifact_version,
+                "shared_expert_dtype": shared_expert_dtype,
                 "total_size": stats.output_total_tensor_bytes,
                 "weight_scale_shape": "scalar",
             },
@@ -1192,6 +1265,7 @@ def convert_checkpoint(
         output_config_file = _write_output_config(
             config,
             staging_dir,
+            shared_expert_dtype=shared_expert_dtype,
             calibration_manifest=calibration_manifest,
             cache_quant_multipliers=cache_quant_multipliers,
             index_closure=index_closure,
@@ -1205,7 +1279,8 @@ def convert_checkpoint(
         )
 
         identity = {
-            "artifact_version": ARTIFACT_VERSION,
+            "artifact_version": artifact_version,
+            "shared_expert_dtype": shared_expert_dtype,
             "source_model_id": source_model_id,
             "source_revision": source_revision,
             "source_index_sha256": source.index_sha256,
@@ -1217,7 +1292,8 @@ def convert_checkpoint(
         }
         manifest = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
-            "artifact_version": ARTIFACT_VERSION,
+            "artifact_version": artifact_version,
+            "shared_expert_dtype": shared_expert_dtype,
             "artifact_id": _sha256_bytes(json.dumps(identity, sort_keys=True).encode()),
             "converter": {
                 "name": ("vllm_neuron.model.glm52_moe_dsa.checkpoint_converter"),
@@ -1292,7 +1368,7 @@ def convert_checkpoint(
             },
             "loader_validation": {
                 "loader_ready": loader_ready,
-                "required_artifact_version": ARTIFACT_VERSION,
+                "required_artifact_version": artifact_version,
                 "required_weight_scale_suffix": (STATIC_WEIGHT_SCALE_SUFFIX),
                 "required_weight_scale_shape": [],
                 "required_projection_input_scale_keys_sha256": (
@@ -1352,6 +1428,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--world-size", type=_positive_int, default=64)
     parser.add_argument("--ep-degree", type=_positive_int, default=16)
     parser.add_argument(
+        "--shared-expert-dtype",
+        choices=("fp8", "bfloat16"),
+        default="fp8",
+        help=(
+            "store and execute shared-expert projections in this dtype; "
+            "bfloat16 creates the separately versioned hybrid artifact"
+        ),
+    )
+    parser.add_argument(
         "--skip-index-closure",
         action="store_true",
         help="development-only: do not prove exact loader/index key closure",
@@ -1385,6 +1470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_model_id=args.source_model_id,
             world_size=args.world_size,
             ep_degree=args.ep_degree,
+            shared_expert_dtype=args.shared_expert_dtype,
         )
     else:
         manifest = convert_checkpoint(
@@ -1400,6 +1486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             strict_index_closure=not args.skip_index_closure,
             world_size=args.world_size,
             ep_degree=args.ep_degree,
+            shared_expert_dtype=args.shared_expert_dtype,
         )
     print(
         json.dumps(

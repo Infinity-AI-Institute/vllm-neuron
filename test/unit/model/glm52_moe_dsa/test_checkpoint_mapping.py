@@ -79,8 +79,7 @@ def test_contract_filters_experts_before_tp_sharding() -> None:
         "model.layers.1.mlp.experts.3.down_proj.weight_scale",
     ]
     assert all(
-        not key.startswith("model.layers.78.")
-        for key in contract.required_source_keys
+        not key.startswith("model.layers.78.") for key in contract.required_source_keys
     )
 
 
@@ -114,9 +113,7 @@ def test_contract_maps_attention_static_scales() -> None:
     )
     prefix = "model.layers.0.self_attn.q_a_proj"
 
-    assert contract.mappings[f"{prefix}.weight_scale"] == (
-        f"{prefix}.weight_scale"
-    )
+    assert contract.mappings[f"{prefix}.weight_scale"] == (f"{prefix}.weight_scale")
     assert contract.mappings[f"{prefix}.input_scale"] == f"{prefix}.input_scale"
 
 
@@ -140,6 +137,24 @@ def test_contract_maps_dense_static_scales() -> None:
     )
 
 
+def test_hybrid_contract_maps_bf16_shared_weights_without_scales() -> None:
+    config = _small_config()
+    config.shared_expert_dtype = "bfloat16"
+    contract = build_checkpoint_contract(
+        config,
+        _small_plan(),
+        global_rank=0,
+    )
+    shared = "model.layers.1.mlp.shared_experts"
+
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        weight = f"{shared}.{projection}.weight"
+        assert contract.mappings[weight] == weight
+        assert f"{weight}_scale" not in contract.mappings
+    assert f"{shared}.gate_up_input_scale" not in contract.mappings
+    assert f"{shared}.down_input_scale" not in contract.mappings
+
+
 def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
     plan = _small_plan()
     hidden = 3
@@ -160,15 +175,15 @@ def test_routed_weight_loaders_match_tkg_and_cte_layouts() -> None:
     assert gate_up.dtype == torch.float8_e4m3fn
     assert down.dtype == torch.float8_e4m3fn
     scale = 240.0 / 448.0
-    expected_gate = (
-        gate_up_slices[0].tensor[4:8, :].T.float() * scale
-    ).to(torch.float8_e4m3fn)
-    expected_up = (
-        gate_up_slices[1].tensor[4:8, :].T.float() * scale
-    ).to(torch.float8_e4m3fn)
-    expected_down = (
-        down_slices[1].tensor[:, 4:8].T.float() * scale
-    ).to(torch.float8_e4m3fn)
+    expected_gate = (gate_up_slices[0].tensor[4:8, :].T.float() * scale).to(
+        torch.float8_e4m3fn
+    )
+    expected_up = (gate_up_slices[1].tensor[4:8, :].T.float() * scale).to(
+        torch.float8_e4m3fn
+    )
+    expected_down = (down_slices[1].tensor[:, 4:8].T.float() * scale).to(
+        torch.float8_e4m3fn
+    )
     torch.testing.assert_close(gate_up[0, :, 0, :], expected_gate)
     torch.testing.assert_close(gate_up[0, :, 1, :], expected_up)
     torch.testing.assert_close(down[1], expected_down)

@@ -14,6 +14,7 @@ from safetensors.torch import save_file
 
 from vllm_neuron.model.glm52_moe_dsa.checkpoint_converter import (
     ARTIFACT_VERSION,
+    BF16_SHARED_ARTIFACT_VERSION,
     COMPILE_CONSTANTS_FILENAME,
     COMPILE_STUB_MANIFEST_FILENAME,
     INDEX_FILENAME,
@@ -38,6 +39,8 @@ TARGET = "model.layers.0.self_attn.q_a_proj.weight"
 ZERO_TARGET = "model.layers.0.mlp.gate_proj.weight"
 UP_TARGET = "model.layers.0.mlp.up_proj.weight"
 PRESERVED = "model.layers.0.input_layernorm.weight"
+SHARED_TARGET = "model.layers.3.mlp.shared_experts.gate_proj.weight"
+SHARED_UP_TARGET = "model.layers.3.mlp.shared_experts.up_proj.weight"
 MTP_TARGET = "model.layers.78.self_attn.q_a_proj.weight"
 
 
@@ -68,6 +71,8 @@ def _write_source(root: Path) -> Path:
     second = {
         ZERO_TARGET: torch.zeros(2, 3, dtype=torch.bfloat16),
         UP_TARGET: torch.ones(2, 3, dtype=torch.bfloat16),
+        SHARED_TARGET: torch.full((2, 3), 0.5, dtype=torch.bfloat16),
+        SHARED_UP_TARGET: torch.full((2, 3), 0.75, dtype=torch.bfloat16),
         MTP_TARGET: torch.full((2, 3), 7.0, dtype=torch.bfloat16),
     }
     names = (
@@ -137,8 +142,7 @@ def _write_full_contract_metadata(root: Path) -> Path:
             {
                 "metadata": {"total_size": 1_506_659_919_872},
                 "weight_map": {
-                    key: "unmaterialized-bf16-source.safetensors"
-                    for key in raw_keys
+                    key: "unmaterialized-bf16-source.safetensors" for key in raw_keys
                 },
             },
             sort_keys=True,
@@ -173,9 +177,7 @@ def test_compile_stub_is_metadata_only_and_never_loader_ready(
     )
 
     output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
-    output_index = json.loads(
-        (output / INDEX_FILENAME).read_text(encoding="utf-8")
-    )
+    output_index = json.loads((output / INDEX_FILENAME).read_text(encoding="utf-8"))
     cache_keys = required_cache_quant_multiplier_keys(output_config)
     assert manifest["compile_stub"] is True
     assert manifest["serving_weights_materialized"] is False
@@ -199,6 +201,35 @@ def test_compile_stub_is_metadata_only_and_never_loader_ready(
     cache_slice = checkpoint._get_slice(cache_keys[0])
     assert tuple(cache_slice.get_shape()) == ()
     assert cache_slice[()].item() == 1
+
+
+def test_hybrid_compile_stub_has_strict_bf16_shared_contract(
+    tmp_path: Path,
+) -> None:
+    source = _write_full_contract_metadata(tmp_path / "metadata")
+    output = tmp_path / "compile-stub"
+
+    manifest = write_compile_stub(
+        source,
+        output,
+        source_revision="b4734de4facf877f85769a911abafc5283eab3d9",
+        shared_expert_dtype="bfloat16",
+    )
+
+    output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    output_index = json.loads((output / INDEX_FILENAME).read_text(encoding="utf-8"))
+    shared = "model.layers.3.mlp.shared_experts"
+    assert manifest["artifact_version"] == BF16_SHARED_ARTIFACT_VERSION
+    assert manifest["shared_expert_dtype"] == "bfloat16"
+    assert output_config["shared_expert_dtype"] == "bfloat16"
+    assert output_config["glm52_artifact"]["shared_expert_dtype"] == "bfloat16"
+    assert (
+        output_config["glm52_artifact"]["artifact_version"]
+        == BF16_SHARED_ARTIFACT_VERSION
+    )
+    assert f"{shared}.gate_proj.weight" in output_index["weight_map"]
+    assert f"{shared}.gate_proj.weight_scale" not in output_index["weight_map"]
+    assert f"{shared}.gate_up_input_scale" not in output_index["weight_map"]
 
 
 def test_zero_tensor_has_canonical_scalar_scale() -> None:
@@ -270,7 +301,7 @@ def test_conversion_excludes_mtp_and_emits_scalar_scales_and_provenance(
     }
     assert manifest["calibration"]["status"] == "missing"
     assert not manifest["loader_validation"]["loader_ready"]
-    assert manifest["source"]["declared_total_tensor_bytes"] == 54
+    assert manifest["source"]["declared_total_tensor_bytes"] == 78
     assert (output / MANIFEST_FILENAME).is_file()
 
     quantization = output_config["quantization_config"]
@@ -280,6 +311,41 @@ def test_conversion_excludes_mtp_and_emits_scalar_scales_and_provenance(
     assert "lm_head" in quantization["quantization"]["exclude_modules"]
     assert not output_config["glm52_artifact"]["loader_ready"]
     assert output_config["dtype"] == "bfloat16"
+
+
+def test_hybrid_conversion_preserves_shared_expert_in_bf16(
+    tmp_path: Path,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    output = tmp_path / "output"
+
+    manifest = _convert(
+        source,
+        output,
+        shared_expert_dtype="bfloat16",
+    )
+    tensors = _load_output_tensors(output)
+    output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+
+    assert manifest["artifact_version"] == BF16_SHARED_ARTIFACT_VERSION
+    assert manifest["shared_expert_dtype"] == "bfloat16"
+    assert tensors[SHARED_TARGET].dtype == torch.bfloat16
+    assert tensors[SHARED_UP_TARGET].dtype == torch.bfloat16
+    assert f"{SHARED_TARGET}_scale" not in tensors
+    assert f"{SHARED_UP_TARGET}_scale" not in tensors
+    assert output_config["shared_expert_dtype"] == "bfloat16"
+    assert output_config["glm52_artifact"] == {
+        **output_config["glm52_artifact"],
+        "artifact_version": BF16_SHARED_ARTIFACT_VERSION,
+        "shared_expert_dtype": "bfloat16",
+    }
+    excluded = output_config["quantization_config"]["quantization"]["exclude_modules"]
+    assert "model.layers.*.mlp.shared_experts.*" in excluded
+    required = required_activation_scale_keys(
+        (TARGET, SHARED_TARGET),
+        shared_expert_dtype="bfloat16",
+    )
+    assert "model.layers.3.mlp.shared_experts.gate_proj.input_scale" not in required
 
 
 def test_conversion_is_byte_deterministic_and_has_bounded_output_buffer(

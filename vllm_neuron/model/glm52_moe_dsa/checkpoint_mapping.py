@@ -89,10 +89,7 @@ def _expert_weight_key(
     expert_idx: int,
     projection: str,
 ) -> str:
-    return (
-        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}."
-        f"{projection}.weight"
-    )
+    return f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{projection}.weight"
 
 
 def _scale_key(weight_key: str) -> str:
@@ -159,9 +156,7 @@ def build_checkpoint_contract(
             f"{dense}.gate_proj.input_scale",
             f"{dense}.up_proj.input_scale",
         ]
-        mappings[f"{dense}.down_input_scale"] = (
-            f"{dense}.down_proj.input_scale"
-        )
+        mappings[f"{dense}.down_input_scale"] = f"{dense}.down_proj.input_scale"
 
     local_experts = plan.local_expert_ids(global_rank)
     for layer_idx, layer_type in enumerate(config.mlp_layer_types):
@@ -187,18 +182,17 @@ def build_checkpoint_contract(
         mappings[f"{prefix}.down_proj_scale"] = down_scale_sources
 
         shared = f"model.layers.{layer_idx}.mlp.shared_experts"
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            weight = f"{shared}.{projection}.weight"
-            mappings[f"{weight}_scale"] = (
-                weight.removesuffix(".weight") + STATIC_WEIGHT_SCALE_SUFFIX
-            )
-        mappings[f"{shared}.gate_up_input_scale"] = [
-            f"{shared}.gate_proj.input_scale",
-            f"{shared}.up_proj.input_scale",
-        ]
-        mappings[f"{shared}.down_input_scale"] = (
-            f"{shared}.down_proj.input_scale"
-        )
+        if config.shared_expert_dtype == "fp8":
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                weight = f"{shared}.{projection}.weight"
+                mappings[f"{weight}_scale"] = (
+                    weight.removesuffix(".weight") + STATIC_WEIGHT_SCALE_SUFFIX
+                )
+            mappings[f"{shared}.gate_up_input_scale"] = [
+                f"{shared}.gate_proj.input_scale",
+                f"{shared}.up_proj.input_scale",
+            ]
+            mappings[f"{shared}.down_input_scale"] = f"{shared}.down_proj.input_scale"
 
     return Glm52CheckpointContract(mappings=mappings)
 
@@ -308,9 +302,7 @@ def routed_gate_up_scale_loader(
                 )
                 * _SCALE_COMPENSATION
             )
-            per_expert.append(
-                pair[:, None].expand(2, plan.intermediate_per_rank)
-            )
+            per_expert.append(pair[:, None].expand(2, plan.intermediate_per_rank))
         return torch.stack(per_expert, dim=0).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
@@ -333,8 +325,7 @@ def routed_down_scale_loader(
         del rank
         if len(slices) != plan.experts_per_rank:
             raise ValueError(
-                f"expected {plan.experts_per_rank} local down scales, "
-                f"got {len(slices)}"
+                f"expected {plan.experts_per_rank} local down scales, got {len(slices)}"
             )
         scalars = (
             torch.stack([_read_scalar(slice_obj) for slice_obj in slices])

@@ -333,25 +333,29 @@ def iter_backbone_weight_specs(
         )
 
         shared_intermediate = config.moe_intermediate_size * config.n_shared_experts
+        shared_dtype: StorageDtype = (
+            "bf16" if config.shared_expert_dtype == "bfloat16" else "fp8"
+        )
         for projection in ("gate_proj", "up_proj"):
             yield WeightSpec(
                 f"{mlp}.shared_experts.{projection}.weight",
                 (shared_intermediate, hidden),
                 "expert_tp_sharded",
-                "fp8",
+                shared_dtype,
                 shard_dim=0,
             )
         yield WeightSpec(
             f"{mlp}.shared_experts.down_proj.weight",
             (hidden, shared_intermediate),
             "expert_tp_sharded",
-            "fp8",
+            shared_dtype,
             shard_dim=1,
         )
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            yield _scale_spec(f"{mlp}.shared_experts.{projection}.weight_scale")
-        yield _scale_spec(f"{mlp}.shared_experts.gate_up_input_scale")
-        yield _scale_spec(f"{mlp}.shared_experts.down_input_scale")
+        if config.shared_expert_dtype == "fp8":
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                yield _scale_spec(f"{mlp}.shared_experts.{projection}.weight_scale")
+            yield _scale_spec(f"{mlp}.shared_experts.gate_up_input_scale")
+            yield _scale_spec(f"{mlp}.shared_experts.down_input_scale")
 
 
 def estimate_local_weight_bytes(

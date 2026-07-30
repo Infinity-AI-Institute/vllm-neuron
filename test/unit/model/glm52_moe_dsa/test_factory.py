@@ -56,6 +56,51 @@ def test_factory_accepts_only_frozen_tp64_trn2_static_fp8(
     GlmMoeDsaForCausalLM._validate_config(_hf_config(), _neuron_config())
 
 
+def test_factory_accepts_explicit_bf16_shared_hybrid(monkeypatch) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    monkeypatch.setattr(
+        "vllm_neuron.model.glm52_moe_dsa.factory._get_tp_world_size",
+        lambda: 64,
+    )
+    config = _hf_config()
+    config.shared_expert_dtype = "bfloat16"
+    config.glm52_artifact.update(
+        artifact_version="glm52-trn2-static-fp8-bf16-shared-v1",
+        shared_expert_dtype="bfloat16",
+    )
+    config.quantization_config["quantization"]["exclude_modules"].append(
+        "model.layers.*.mlp.shared_experts.*"
+    )
+
+    GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
+def test_factory_rejects_hybrid_marker_without_bf16_exclusion(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.shared_expert_dtype = "bfloat16"
+    config.glm52_artifact.update(
+        artifact_version="glm52-trn2-static-fp8-bf16-shared-v1",
+        shared_expert_dtype="bfloat16",
+    )
+
+    with pytest.raises(ValueError, match="exclude shared experts"):
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
+def test_factory_rejects_hybrid_config_with_static_artifact(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.shared_expert_dtype = "bfloat16"
+
+    with pytest.raises(ValueError, match="artifact_version"):
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
 def test_factory_rejects_native_block_fp8(monkeypatch) -> None:
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     config = _hf_config()

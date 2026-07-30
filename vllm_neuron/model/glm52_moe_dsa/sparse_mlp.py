@@ -222,5 +222,8 @@ class Glm52SparseMlp(nn.Module):
             norm_weight=norm_weight,
             eps=self.config.rms_norm_eps,
             tp_group=self.expert_tp_group,
+            hidden_states_normalized=(
+                normalized_local if not self.shared_experts.static_fp8 else None
+            ),
         )
         return routed + shared

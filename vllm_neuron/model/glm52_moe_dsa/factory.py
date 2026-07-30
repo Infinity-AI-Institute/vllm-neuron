@@ -15,6 +15,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from .config import Glm52MoeDsaConfig
 
 GLM52_ARTIFACT_VERSION = "glm52-trn2-static-fp8-v1"
+GLM52_BF16_SHARED_ARTIFACT_VERSION = "glm52-trn2-static-fp8-bf16-shared-v1"
 
 
 def _get_tp_world_size() -> int:
@@ -129,9 +130,23 @@ class GlmMoeDsaForCausalLM(nn.Module):
         artifact = config_dict.get("glm52_artifact")
         if not isinstance(artifact, dict):
             raise ValueError("GLM-5.2 requires a converted glm52_artifact marker")
-        if artifact.get("artifact_version") != GLM52_ARTIFACT_VERSION:
+        expected_artifact_version = (
+            GLM52_BF16_SHARED_ARTIFACT_VERSION
+            if config.shared_expert_dtype == "bfloat16"
+            else GLM52_ARTIFACT_VERSION
+        )
+        if artifact.get("artifact_version") != expected_artifact_version:
             raise ValueError(
-                f"GLM-5.2 artifact_version must be {GLM52_ARTIFACT_VERSION!r}"
+                "GLM-5.2 artifact_version must match shared_expert_dtype: "
+                f"expected {expected_artifact_version!r}"
+            )
+        artifact_shared_dtype = artifact.get(
+            "shared_expert_dtype",
+            "fp8",
+        )
+        if artifact_shared_dtype != config.shared_expert_dtype:
+            raise ValueError(
+                "GLM-5.2 artifact shared_expert_dtype does not match config"
             )
         compile_stub = artifact.get("compile_stub") is True
         cpu_compile = os.environ.get("VLLM_NEURON_CPU_COMPILE", "").lower() in (
@@ -156,7 +171,10 @@ class GlmMoeDsaForCausalLM(nn.Module):
         quantization = getattr(hf_config, "quantization_config", None)
         if quantization is None:
             quantization = config_dict.get("quantization_config")
-        cls._validate_static_fp8_artifact(quantization)
+        cls._validate_static_fp8_artifact(
+            quantization,
+            shared_expert_dtype=config.shared_expert_dtype,
+        )
 
         if neuron_config.quantization is not None:
             raise ValueError(
@@ -187,7 +205,11 @@ class GlmMoeDsaForCausalLM(nn.Module):
             raise ValueError("GLM-5.2 expanded MLA requires tensor parallelism 64")
 
     @staticmethod
-    def _validate_static_fp8_artifact(quantization: object) -> None:
+    def _validate_static_fp8_artifact(
+        quantization: object,
+        *,
+        shared_expert_dtype: str = "fp8",
+    ) -> None:
         if not isinstance(quantization, dict):
             raise ValueError(
                 "GLM-5.2 requires the converted ModelOpt static-FP8 artifact"
@@ -213,4 +235,14 @@ class GlmMoeDsaForCausalLM(nn.Module):
         ):
             raise ValueError(
                 "converted GLM-5.2 artifact must exclude the BF16 lm_head from FP8"
+            )
+        if shared_expert_dtype == "bfloat16" and not any(
+            fnmatch(
+                "model.layers.3.mlp.shared_experts.gate_proj",
+                str(pattern),
+            )
+            for pattern in excluded
+        ):
+            raise ValueError(
+                "hybrid GLM-5.2 artifact must exclude shared experts from FP8"
             )

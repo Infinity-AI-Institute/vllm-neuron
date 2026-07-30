@@ -168,6 +168,7 @@ class LocalMoeCteProbe(torch.nn.Module):
             compute_dtype=nl.bfloat16,
             is_tensor_update_accumulating=True,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            skip_token=True,
         )
 
 

@@ -104,6 +104,31 @@ def test_shared_expert_is_sharded_only_over_expert_tp_subgroup(
     assert shared_gate.local_numel(64, ep_degree) == shared_weight_local_numel
 
 
+def test_hybrid_manifest_uses_bf16_shared_weights_and_no_shared_scales() -> None:
+    config = Glm52MoeDsaConfig(shared_expert_dtype="bfloat16")
+    specs = {spec.name: spec for spec in iter_backbone_weight_specs(config)}
+    shared = "model.layers.3.mlp.shared_experts"
+
+    assert specs[f"{shared}.gate_proj.weight"].dtype == "bf16"
+    assert specs[f"{shared}.up_proj.weight"].dtype == "bf16"
+    assert specs[f"{shared}.down_proj.weight"].dtype == "bf16"
+    assert f"{shared}.gate_proj.weight_scale" not in specs
+    assert f"{shared}.gate_up_input_scale" not in specs
+
+    static_bytes = estimate_local_weight_bytes(
+        Glm52MoeDsaConfig(),
+        world_size=64,
+        ep_degree=16,
+    )
+    hybrid_bytes = estimate_local_weight_bytes(
+        config,
+        world_size=64,
+        ep_degree=16,
+    )
+    assert hybrid_bytes == 15_164_077_056
+    assert hybrid_bytes - static_bytes == 707_596_800
+
+
 @pytest.mark.parametrize(
     ("ep_degree", "expected_bytes"),
     [

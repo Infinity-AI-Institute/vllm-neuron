@@ -79,6 +79,7 @@ class Glm52MoeDsaConfig:
 
     n_routed_experts: int = 256
     n_shared_experts: int = 1
+    shared_expert_dtype: str = "fp8"
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 2_048
     n_group: int = 1
@@ -116,11 +117,17 @@ class Glm52MoeDsaConfig:
                 "qk_head_dim must equal qk_nope_head_dim + qk_rope_head_dim"
             )
         if self.num_attention_heads != self.num_key_value_heads:
-            raise ValueError("GLM-5.2 currently requires equal query and KV head counts")
+            raise ValueError(
+                "GLM-5.2 currently requires equal query and KV head counts"
+            )
         if self.n_routed_experts % self.num_experts_per_tok:
             raise ValueError("routed experts must be divisible by experts per token")
         if self.n_shared_experts != 1:
-            raise ValueError("the initial GLM-5.2 port requires exactly one shared expert")
+            raise ValueError(
+                "the initial GLM-5.2 port requires exactly one shared expert"
+            )
+        if self.shared_expert_dtype not in ("fp8", "bfloat16"):
+            raise ValueError("shared_expert_dtype must be either 'fp8' or 'bfloat16'")
         if self.scoring_func != "sigmoid" or self.topk_method != "noaux_tc":
             raise ValueError("GLM-5.2 requires sigmoid/noaux_tc expert routing")
         if not self.norm_topk_prob:
@@ -157,7 +164,9 @@ class Glm52MoeDsaConfig:
         else:
             self.mlp_layer_types = tuple(self.mlp_layer_types)
         if len(self.mlp_layer_types) != self.num_hidden_layers:
-            raise ValueError("mlp_layer_types must contain one entry per backbone layer")
+            raise ValueError(
+                "mlp_layer_types must contain one entry per backbone layer"
+            )
         expected_mlp_types = _mlp_schedule(
             self.num_hidden_layers,
             self.first_k_dense_replace,
