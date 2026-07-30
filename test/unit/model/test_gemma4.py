@@ -12,6 +12,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4Linear,
     Gemma4ReferenceAttentionBlock,
     Gemma4ReferenceDecoderLayer,
+    Gemma4ReferenceTextModel,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -166,3 +167,15 @@ def test_reference_decoder_layer_composes_attention_and_moe():
     cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.bfloat16)
     output = layer(hidden, cache, torch.tensor([0, 1, 2]))
     assert output.shape == hidden.shape
+
+
+def test_reference_text_model_runs_tiny_stack():
+    torch = __import__("torch")
+    config = Gemma4Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                          num_hidden_layers=2, num_attention_heads=4,
+                          num_key_value_heads=2, head_dim=4,
+                          layer_types=["local"], global_head_dim=4,
+                          num_global_key_value_heads=2)
+    model = Gemma4ReferenceTextModel(config, num_experts=2, top_k=1)
+    output = model(torch.tensor([[1, 2, 3]]))
+    assert output.shape == (1, 3, 16)

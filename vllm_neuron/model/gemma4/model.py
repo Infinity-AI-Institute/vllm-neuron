@@ -312,6 +312,30 @@ class Gemma4ReferenceDecoderLayer(nn.Module):
         return residual + self.moe(hidden_states)
 
 
+class Gemma4ReferenceTextModel(nn.Module):
+    """Tiny-configurable full text stack used for native seam validation."""
+
+    def __init__(self, config: Gemma4Config, num_experts: int = 4, top_k: int = 2):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            Gemma4ReferenceDecoderLayer(config, idx, num_experts, top_k)
+            for idx in range(config.num_hidden_layers)
+        )
+        self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def forward(self, input_ids, cache_layers=None, slot_mapping=None):
+        hidden_states = self.embed_tokens(input_ids).to(self.layers[0].input_layernorm.weight.dtype)
+        if cache_layers is None:
+            cache_layers = [None] * len(self.layers)
+        if len(cache_layers) != len(self.layers):
+            raise ValueError("cache_layers must contain one cache per decoder layer")
+        for layer, cache in zip(self.layers, cache_layers):
+            hidden_states = layer(hidden_states, cache, slot_mapping)
+        return self.norm(hidden_states)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
