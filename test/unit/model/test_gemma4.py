@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 from vllm_neuron.model.gemma4.config import Gemma4Config
-from vllm_neuron.model.gemma4.model import (
+from vllm_neuron.model.gemma4.reference import (
     Gemma4RMSNorm,
     Gemma4PagedKVCache,
     Gemma4ReferenceAttention,
@@ -213,5 +213,36 @@ def test_registered_factory_smoke_with_reference_mode(monkeypatch):
                           layer_types=["local"], global_head_dim=4,
                           num_global_key_value_heads=1)
     model = Gemma4MoeForCausalLM(config)
-    output = model(torch.tensor([[1, 2]]), sampling_positions=torch.tensor([1]))
+    output = model(
+        torch.tensor([[1, 2]]),
+        positions=torch.tensor([0, 1]),
+        sampling_positions=torch.tensor([1]),
+    )
     assert output.shape == (1, 16)
+    kv_spec = model.model.get_kv_spec()
+    assert len(kv_spec.layers) == 1
+    assert kv_spec.layers[0].name == "layers.0.self_attn"
+    assert kv_spec.layers[0].head_size == 4
+
+
+def test_native_model_requires_complete_kv_bindings(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GEMMA4_REFERENCE", "1")
+    config = Gemma4Config(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        layer_types=["local", "global"],
+        global_head_dim=4,
+        num_global_key_value_heads=1,
+    )
+    model = Gemma4MoeForCausalLM(config)
+    try:
+        model.model.bind_kv_cache({"layers.0.self_attn": []})
+    except ValueError as error:
+        assert "layers.1.self_attn" in str(error)
+    else:
+        raise AssertionError("incomplete KV binding was accepted")
