@@ -8,6 +8,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4PagedKVCache,
     Gemma4ReferenceAttention,
     Gemma4ReferenceMoE,
+    Gemma4WeightMapper,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -113,3 +114,11 @@ def test_reference_moe_dispatches_and_combines_top_k():
     logits = moe.router(hidden).float()
     top, _ = torch.topk(logits, 2, dim=-1)
     assert torch.allclose(torch.softmax(top, -1).sum(-1), torch.ones(5))
+
+
+def test_weight_mapper_preserves_expert_indices():
+    name = "model.layers.7.block_sparse_moe.experts.12.down_proj.weight"
+    mapped = Gemma4WeightMapper.map_name(name)
+    assert mapped == "layers.7.moe.experts.12.down_proj.weight"
+    assert Gemma4WeightMapper.is_expert_weight(name)
+    assert not Gemma4WeightMapper.is_expert_weight("model.layers.7.self_attn.q_proj.weight")

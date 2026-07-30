@@ -169,6 +169,38 @@ class Gemma4ReferenceMoE(nn.Module):
         return output.reshape(original_shape)
 
 
+class Gemma4WeightMapper:
+    """Normalize Hugging Face Gemma 4 names to native module names."""
+
+    _DIRECT = {
+        "q_proj": "q_proj",
+        "k_proj": "k_proj",
+        "v_proj": "v_proj",
+        "o_proj": "o_proj",
+        "input_layernorm": "input_layernorm",
+        "post_attention_layernorm": "post_attention_layernorm",
+        "post_feedforward_layernorm": "post_feedforward_layernorm",
+    }
+
+    @classmethod
+    def map_name(cls, name: str) -> str:
+        """Return a stable native name while preserving expert indices."""
+        name = name.removeprefix("model.")
+        name = name.replace("layers.", "layers.")
+        for source, target in cls._DIRECT.items():
+            name = name.replace(f".{source}.", f".{target}.")
+        name = name.replace(".block_sparse_moe.router.", ".moe.router.")
+        name = name.replace(".block_sparse_moe.experts.", ".moe.experts.")
+        name = name.replace(".gate_proj.", ".gate_proj.")
+        name = name.replace(".up_proj.", ".up_proj.")
+        name = name.replace(".down_proj.", ".down_proj.")
+        return name
+
+    @classmethod
+    def is_expert_weight(cls, name: str) -> bool:
+        return ".moe.experts." in cls.map_name(name)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
