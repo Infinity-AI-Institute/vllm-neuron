@@ -19,6 +19,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4ValueNorm,
 )
 from vllm_neuron.model.registry import get_models
+from vllm_neuron.model.gemma4.factory import Gemma4MoeForCausalLM
 
 
 def test_gemma4_is_registered():
@@ -201,3 +202,16 @@ def test_reference_causal_lm_returns_selected_logits():
     model = Gemma4ReferenceCausalLM(config, num_experts=2, top_k=1)
     logits = model(torch.tensor([[1, 2, 3]]), torch.tensor([2]))
     assert logits.shape == (1, 32)
+
+
+def test_registered_factory_smoke_with_reference_mode(monkeypatch):
+    torch = __import__("torch")
+    monkeypatch.setenv("VLLM_NEURON_GEMMA4_REFERENCE", "1")
+    config = Gemma4Config(vocab_size=16, hidden_size=8, intermediate_size=16,
+                          num_hidden_layers=1, num_attention_heads=2,
+                          num_key_value_heads=1, head_dim=4,
+                          layer_types=["local"], global_head_dim=4,
+                          num_global_key_value_heads=1)
+    model = Gemma4MoeForCausalLM(config)
+    output = model(torch.tensor([[1, 2]]), sampling_positions=torch.tensor([1]))
+    assert output.shape == (1, 16)

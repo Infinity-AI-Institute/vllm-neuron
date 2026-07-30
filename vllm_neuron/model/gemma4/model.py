@@ -381,7 +381,7 @@ class Gemma4MoeModel(nn.Module):
         super().__init__()
         self.config = config
         if os.environ.get("VLLM_NEURON_GEMMA4_REFERENCE") == "1":
-            self._reference = Gemma4ReferenceTextModel(config)
+            self._reference = Gemma4ReferenceCausalLM(config)
         else:
             raise NotImplementedError(
                 "Gemma4 Neuron kernels are not implemented yet; enable "

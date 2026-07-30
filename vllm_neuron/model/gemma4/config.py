@@ -47,6 +47,9 @@ class Gemma4Config:
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config=None):
+        if isinstance(hf_config, cls):
+            hf_config.neuron_config = neuron_config
+            return hf_config
         raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
         # Gemma 4 stores text parameters below text_config.
         raw = raw.get("text_config", raw)
