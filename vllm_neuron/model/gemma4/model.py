@@ -11,6 +11,8 @@ import os
 import torch
 import torch.nn as nn
 
+from .config import Gemma4Config
+
 
 class Gemma4RMSNorm(nn.Module):
     """Gemma RMSNorm with the checkpoint's +1 weight convention."""
@@ -155,8 +157,9 @@ class Gemma4ReferenceMoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        output_dtype = hidden_states.dtype
         original_shape = hidden_states.shape
-        flat = hidden_states.reshape(-1, self.hidden_size)
+        flat = hidden_states.reshape(-1, self.hidden_size).to(self.router.weight.dtype)
         router_logits = self.router(flat).float()
         weights, indices = torch.topk(router_logits, self.top_k, dim=-1)
         weights = torch.softmax(weights, dim=-1).to(flat.dtype)
@@ -167,7 +170,7 @@ class Gemma4ReferenceMoE(nn.Module):
                 continue
             expert_output = expert(flat.index_select(0, token_rows))
             output.index_add_(0, token_rows, expert_output * weights[token_rows, choices].unsqueeze(-1))
-        return output.reshape(original_shape)
+        return output.reshape(original_shape).to(output_dtype)
 
 
 class Gemma4WeightMapper:
@@ -254,9 +257,10 @@ class Gemma4Linear(nn.Module):
         )
         setattr(self.weight, "weight_loader", set_loader)
         nn.init.normal_(self.weight, std=input_size**-0.5)
+        self.weight.data = self.weight.data.to(torch.bfloat16)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(hidden_states, self.weight)
+        return torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight)
 
 
 class Gemma4ReferenceAttentionBlock(nn.Module):
