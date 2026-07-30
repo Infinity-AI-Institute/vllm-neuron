@@ -18,6 +18,13 @@ class Gemma4Config:
     num_attention_heads: int = 32
     num_key_value_heads: int = 2
     head_dim: int = 256
+    global_head_dim: int = 512
+    num_global_key_value_heads: int = 1
+    query_pre_attn_scalar: float = 256.0
+    attention_k_eq_v: bool = False
+    layer_types: list[str] = field(default_factory=list)
+    sliding_window: int | None = None
+    num_kv_shared_layers: int = 0
     max_position_embeddings: int = 131072
     rms_norm_eps: float = 1e-6
     rope_parameters: dict = field(default_factory=dict)
