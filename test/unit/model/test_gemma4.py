@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from vllm_neuron.model.gemma4.config import Gemma4Config
 from vllm_neuron.model.gemma4.model import (
     Gemma4RMSNorm,
+    Gemma4PagedKVCache,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -59,3 +60,29 @@ def test_value_norm_preserves_shape():
     torch = __import__("torch")
     values = torch.randn(2, 3, 64)
     assert Gemma4ValueNorm(64, dtype=torch.float32)(values).shape == values.shape
+
+
+def test_paged_cache_writes_and_reads_slots():
+    torch = __import__("torch")
+    cache = Gemma4PagedKVCache(8, 2, 4, dtype=torch.float32)
+    slots = torch.tensor([3, 6])
+    key = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+    value = key + 100
+    cache.write(slots, key, value)
+    got_key, got_value = cache.read(slots)
+    assert torch.equal(got_key, key)
+    assert torch.equal(got_value, value)
+    assert torch.count_nonzero(cache.key[0]) == 0
+
+
+def test_paged_cache_rejects_wrong_layer_shape():
+    torch = __import__("torch")
+    cache = Gemma4PagedKVCache(4, 1, 4, dtype=torch.float32)
+    try:
+        cache.write(torch.tensor([0]), torch.zeros(1, 2, 4), torch.zeros(1, 2, 4))
+    except RuntimeError:
+        # index_copy_ reports the head-dimension mismatch on current PyTorch.
+        return
+    except ValueError:
+        return
+    raise AssertionError("cache accepted a layer with the wrong KV-head shape")
