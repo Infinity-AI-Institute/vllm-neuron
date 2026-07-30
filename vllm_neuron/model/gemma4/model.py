@@ -231,6 +231,33 @@ class Gemma4WeightMapper:
         return SafetensorsWeightLoader()
 
 
+class Gemma4Linear(nn.Module):
+    """Linear layer carrying its native vLLM-Neuron weight-loader policy."""
+
+    def __init__(self, input_size: int, output_size: int, name: str, tp_size: int = 1):
+        super().__init__()
+        role = Gemma4WeightMapper.loader_kind(name)
+        if role == "column":
+            local_output = (output_size + tp_size - 1) // tp_size
+            shape = (local_output, input_size)
+        elif role == "row":
+            local_input = (input_size + tp_size - 1) // tp_size
+            shape = (output_size, local_input)
+        else:
+            shape = (output_size, input_size)
+        self.weight = nn.Parameter(torch.empty(*shape))
+        set_loader = Gemma4WeightMapper.make_loader(
+            name,
+            shard_size=shape[0] if role == "column" else shape[1] if role == "row" else 0,
+            tp_size=tp_size,
+        )
+        setattr(self.weight, "weight_loader", set_loader)
+        nn.init.normal_(self.weight, std=input_size**-0.5)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(hidden_states, self.weight)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()

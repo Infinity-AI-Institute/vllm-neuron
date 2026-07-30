@@ -9,6 +9,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4ReferenceAttention,
     Gemma4ReferenceMoE,
     Gemma4WeightMapper,
+    Gemma4Linear,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -128,3 +129,9 @@ def test_weight_mapper_preserves_expert_indices():
     assert Gemma4WeightMapper.loader_kind("model.layers.7.input_layernorm.weight") == "replicated"
     assert Gemma4WeightMapper.make_loader("q_proj.weight", 8, 4).__class__.__name__ == "SafetensorsWeightLoader"
     assert Gemma4WeightMapper.make_loader("o_proj.weight", 8, 4).__class__.__name__ == "SafetensorsWeightLoader"
+
+
+def test_linear_attaches_loader_and_uses_local_tp_shape():
+    layer = Gemma4Linear(16, 32, "q_proj.weight", tp_size=4)
+    assert tuple(layer.weight.shape) == (8, 16)
+    assert hasattr(layer.weight, "weight_loader")
