@@ -13,6 +13,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4ReferenceAttentionBlock,
     Gemma4ReferenceDecoderLayer,
     Gemma4ReferenceTextModel,
+    Gemma4ReferenceLMHead,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -179,3 +180,11 @@ def test_reference_text_model_runs_tiny_stack():
     model = Gemma4ReferenceTextModel(config, num_experts=2, top_k=1)
     output = model(torch.tensor([[1, 2, 3]]))
     assert output.shape == (1, 3, 16)
+
+
+def test_lm_head_selects_sampling_positions():
+    torch = __import__("torch")
+    head = Gemma4ReferenceLMHead(8, 32)
+    hidden = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    logits = head(hidden, torch.tensor([1, 6]))
+    assert logits.shape == (2, 32)

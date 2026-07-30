@@ -336,6 +336,30 @@ class Gemma4ReferenceTextModel(nn.Module):
         return self.norm(hidden_states)
 
 
+class Gemma4ReferenceLMHead(nn.Module):
+    """LM head honoring vLLM's `sampling_positions` output contract."""
+
+    def __init__(self, hidden_size: int, vocab_size: int, embedding: nn.Embedding | None = None):
+        super().__init__()
+        if embedding is None:
+            self.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
+            nn.init.normal_(self.weight, std=hidden_size**-0.5)
+            self._embedding = None
+        else:
+            self.register_parameter("weight", None)
+            self._embedding = embedding
+
+    def forward(self, hidden_states: torch.Tensor, sampling_positions=None):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if sampling_positions is not None:
+            positions = sampling_positions.to(device=flat.device, dtype=torch.long).flatten()
+            if positions.numel() and (positions.min() < 0 or positions.max() >= flat.shape[0]):
+                raise IndexError("sampling_positions exceeds hidden-state sequence")
+            flat = flat.index_select(0, positions)
+        weight = self._embedding.weight if self._embedding is not None else self.weight
+        return torch.matmul(flat.float(), weight.float().transpose(0, 1)).to(hidden_states.dtype)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
