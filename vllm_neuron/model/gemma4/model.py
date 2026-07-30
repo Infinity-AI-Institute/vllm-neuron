@@ -283,6 +283,34 @@ class Gemma4ReferenceAttentionBlock(nn.Module):
         return self.o_proj(attended.reshape(-1, self.num_query_heads * self.head_dim)).reshape_as(hidden_states)
 
 
+class Gemma4ReferenceDecoderLayer(nn.Module):
+    """Reference decoder composition used to validate native layer seams."""
+
+    def __init__(self, config: Gemma4Config, layer_idx: int, num_experts: int = 4, top_k: int = 2):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.attention = Gemma4ReferenceAttentionBlock(
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            f"layers.{layer_idx}.self_attn",
+        )
+        self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.moe = Gemma4ReferenceMoE(
+            config.hidden_size, config.intermediate_size, num_experts, top_k
+        )
+
+    def forward(self, hidden_states, cache=None, slot_mapping=None):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = residual + self.attention(hidden_states, cache, slot_mapping)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        return residual + self.moe(hidden_states)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
