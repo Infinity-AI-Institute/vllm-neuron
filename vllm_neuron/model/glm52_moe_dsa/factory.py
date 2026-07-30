@@ -13,9 +13,37 @@ from vllm_neuron.compile.platform import get_platform_target
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 from .config import Glm52MoeDsaConfig
+from .static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+    OCP_E4M3FN_QMAX448,
+    normalize_static_fp8_weight_format,
+)
 
 GLM52_ARTIFACT_VERSION = "glm52-trn2-static-fp8-v1"
 GLM52_BF16_SHARED_ARTIFACT_VERSION = "glm52-trn2-static-fp8-bf16-shared-v1"
+GLM52_DIRECT_LEGACY_ARTIFACT_VERSION = (
+    "glm52-trn2-static-fp8-direct-legacy-v1"
+)
+GLM52_DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION = (
+    "glm52-trn2-static-fp8-direct-legacy-bf16-shared-v1"
+)
+
+
+def _expected_artifact_version(
+    shared_expert_dtype: str,
+    weight_format: str,
+) -> str:
+    if weight_format == NEURON_LEGACY_E4M3FN_QMAX240:
+        return (
+            GLM52_DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION
+            if shared_expert_dtype == "bfloat16"
+            else GLM52_DIRECT_LEGACY_ARTIFACT_VERSION
+        )
+    return (
+        GLM52_BF16_SHARED_ARTIFACT_VERSION
+        if shared_expert_dtype == "bfloat16"
+        else GLM52_ARTIFACT_VERSION
+    )
 
 
 def _get_tp_world_size() -> int:
@@ -130,10 +158,48 @@ class GlmMoeDsaForCausalLM(nn.Module):
         artifact = config_dict.get("glm52_artifact")
         if not isinstance(artifact, dict):
             raise ValueError("GLM-5.2 requires a converted glm52_artifact marker")
-        expected_artifact_version = (
-            GLM52_BF16_SHARED_ARTIFACT_VERSION
-            if config.shared_expert_dtype == "bfloat16"
-            else GLM52_ARTIFACT_VERSION
+        quantization = getattr(hf_config, "quantization_config", None)
+        if quantization is None:
+            quantization = config_dict.get("quantization_config")
+        inner = (
+            quantization.get("quantization")
+            if isinstance(quantization, dict)
+            else None
+        )
+        details = inner if isinstance(inner, dict) else quantization
+        top_marker = config_dict.get("static_fp8_weight_format")
+        artifact_marker = artifact.get("static_fp8_weight_format")
+        quantization_marker = (
+            details.get("weight_format")
+            if isinstance(details, dict)
+            else None
+        )
+        declared_markers = (
+            top_marker,
+            artifact_marker,
+            quantization_marker,
+        )
+        if any(marker is not None for marker in declared_markers):
+            if any(marker is None for marker in declared_markers):
+                raise ValueError(
+                    "GLM-5.2 static-FP8 weight format must be declared "
+                    "consistently in config, artifact, and quantization metadata"
+                )
+            weight_format = normalize_static_fp8_weight_format(top_marker)
+            if any(marker != weight_format for marker in declared_markers):
+                raise ValueError(
+                    "GLM-5.2 has mixed static-FP8 weight-format declarations"
+                )
+        else:
+            # Backward compatibility for the qualified pre-marker OCP artifact.
+            weight_format = OCP_E4M3FN_QMAX448
+        if config.static_fp8_weight_format != weight_format:
+            raise ValueError(
+                "GLM-5.2 runtime static-FP8 weight format does not match artifact"
+            )
+        expected_artifact_version = _expected_artifact_version(
+            config.shared_expert_dtype,
+            weight_format,
         )
         if artifact.get("artifact_version") != expected_artifact_version:
             raise ValueError(
@@ -168,12 +234,10 @@ class GlmMoeDsaForCausalLM(nn.Module):
         if artifact.get("index_closure_status") != "passed":
             raise ValueError("GLM-5.2 artifact index closure has not passed")
 
-        quantization = getattr(hf_config, "quantization_config", None)
-        if quantization is None:
-            quantization = config_dict.get("quantization_config")
         cls._validate_static_fp8_artifact(
             quantization,
             shared_expert_dtype=config.shared_expert_dtype,
+            static_fp8_weight_format=weight_format,
         )
 
         if neuron_config.quantization is not None:
@@ -209,6 +273,7 @@ class GlmMoeDsaForCausalLM(nn.Module):
         quantization: object,
         *,
         shared_expert_dtype: str = "fp8",
+        static_fp8_weight_format: str = OCP_E4M3FN_QMAX448,
     ) -> None:
         if not isinstance(quantization, dict):
             raise ValueError(
@@ -221,6 +286,25 @@ class GlmMoeDsaForCausalLM(nn.Module):
             )
         inner = quantization.get("quantization")
         details = inner if isinstance(inner, dict) else quantization
+        weight_format = normalize_static_fp8_weight_format(
+            static_fp8_weight_format
+        )
+        declared_weight_format = details.get("weight_format")
+        if (
+            declared_weight_format is not None
+            and declared_weight_format != weight_format
+        ):
+            raise ValueError(
+                "converted GLM-5.2 artifact has mixed static-FP8 weight formats"
+            )
+        if (
+            weight_format == NEURON_LEGACY_E4M3FN_QMAX240
+            and declared_weight_format != weight_format
+        ):
+            raise ValueError(
+                "direct Neuron-legacy GLM-5.2 artifact must explicitly declare "
+                "its qmax-240 weight format"
+            )
         if str(details.get("quant_algo", "")).upper() != "FP8":
             raise ValueError("converted GLM-5.2 artifact must declare quant_algo='FP8'")
         if details.get("weight_block_size") is not None:

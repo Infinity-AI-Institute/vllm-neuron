@@ -16,12 +16,15 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .checkpoint_mapping import (
-    _SCALE_COMPENSATION,
     _read_scalar,
     _to_neuron_legacy_fp8,
 )
 from .config import Glm52MoeDsaConfig
 from .parallelism import RoutedExpertPlan
+from .static_fp8 import (
+    OCP_E4M3FN_QMAX448,
+    static_fp8_scale_multiplier,
+)
 
 if TYPE_CHECKING:
     from safetensors import PySafeSlice
@@ -36,6 +39,7 @@ def _static_fp8_sharding_loader(
     num_shards: int,
     pad_dim: int | None = None,
     padded_size: int | None = None,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     if pad_dim is None:
         base = sharding_weight_loader(
@@ -61,7 +65,10 @@ def _static_fp8_sharding_loader(
         slices: list["PySafeSlice"],
         rank: int,
     ) -> torch.Tensor:
-        return _to_neuron_legacy_fp8(base.load(slices, rank))
+        return _to_neuron_legacy_fp8(
+            base.load(slices, rank),
+            weight_format,
+        )
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -69,6 +76,7 @@ def _static_fp8_sharding_loader(
 def _scalar_scale_loader(
     *,
     compensate_weight_range: bool,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     def transform(
         slices: list["PySafeSlice"],
@@ -79,7 +87,7 @@ def _scalar_scale_loader(
             raise ValueError(f"expected one scalar scale, got {len(slices)}")
         scalar = _read_scalar(slices[0])
         if compensate_weight_range:
-            scalar = scalar * _SCALE_COMPENSATION
+            scalar = scalar * static_fp8_scale_multiplier(weight_format)
         return scalar.reshape(1, 1).expand(_SCALE_ROWS, 1).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
@@ -111,6 +119,7 @@ class _StaticFp8Projection(nn.Module):
         shape: tuple[int, int],
         *,
         weight_loader: SafetensorsWeightLoader,
+        weight_format: str,
         device: torch.device | str | None,
     ) -> None:
         super().__init__()
@@ -134,7 +143,10 @@ class _StaticFp8Projection(nn.Module):
         set_weight_loader(self.weight, weight_loader)
         set_weight_loader(
             self.weight_scale,
-            _scalar_scale_loader(compensate_weight_range=True),
+            _scalar_scale_loader(
+                compensate_weight_range=True,
+                weight_format=weight_format,
+            ),
         )
 
 
@@ -193,14 +205,18 @@ class Glm52SharedExpert(nn.Module):
                 shard_dim=1,
                 shard_size=local_intermediate,
                 num_shards=self.shared_tp_degree,
+                weight_format=config.static_fp8_weight_format,
             )
             down_loader = _static_fp8_sharding_loader(
                 shard_dim=0,
                 shard_size=local_intermediate,
                 num_shards=self.shared_tp_degree,
+                weight_format=config.static_fp8_weight_format,
             )
             projection_type = _StaticFp8Projection
-            projection_kwargs = {}
+            projection_kwargs = {
+                "weight_format": config.static_fp8_weight_format,
+            }
         else:
             gate_up_loader = sharding_weight_loader(
                 shard_dim=1,

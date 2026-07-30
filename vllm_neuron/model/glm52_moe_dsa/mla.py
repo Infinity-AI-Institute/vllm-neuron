@@ -22,7 +22,6 @@ from .attention import (
 from .cache_layout import Glm52CacheLayout
 from .cache_ops import write_paged_cache
 from .checkpoint_mapping import (
-    _SCALE_COMPENSATION,
     _read_scalar,
     _to_neuron_legacy_fp8,
 )
@@ -33,6 +32,10 @@ from .indexer import (
     advance_index_share_state,
 )
 from .sparse_mlp import glm52_rms_norm
+from .static_fp8 import (
+    OCP_E4M3FN_QMAX448,
+    static_fp8_scale_multiplier,
+)
 
 if TYPE_CHECKING:
     from safetensors import PySafeSlice
@@ -46,6 +49,7 @@ def _projection_weight_loader(
     shard_size: int,
     num_shards: int,
     static_fp8: bool,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     """Load checkpoint ``[out,in]`` storage into kernel ``[in,out]``."""
     base = sharding_weight_loader(
@@ -61,7 +65,10 @@ def _projection_weight_loader(
         slices: list["PySafeSlice"],
         rank: int,
     ) -> torch.Tensor:
-        return _to_neuron_legacy_fp8(base.load(slices, rank))
+        return _to_neuron_legacy_fp8(
+            base.load(slices, rank),
+            weight_format,
+        )
 
     return SafetensorsWeightLoader(transform=transform)
 
@@ -70,6 +77,7 @@ def _scalar_scale_loader(
     *,
     compensate_weight_range: bool,
     columns: int = 1,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     if columns <= 0:
         raise ValueError("scale columns must be positive")
@@ -83,7 +91,7 @@ def _scalar_scale_loader(
             raise ValueError(f"expected one scalar scale, got {len(slices)}")
         scalar = _read_scalar(slices[0])
         if compensate_weight_range:
-            scalar = scalar * _SCALE_COMPENSATION
+            scalar = scalar * static_fp8_scale_multiplier(weight_format)
         return scalar.reshape(1, 1).expand(_SCALE_ROWS, columns).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)
@@ -100,6 +108,7 @@ class _ColumnProjection(nn.Module):
         shard_output: bool,
         world_size: int,
         static_fp8: bool,
+        weight_format: str = OCP_E4M3FN_QMAX448,
         dtype: torch.dtype,
         device: torch.device | str | None,
     ) -> None:
@@ -140,6 +149,7 @@ class _ColumnProjection(nn.Module):
                 shard_size=output_size,
                 num_shards=world_size if shard_output else 1,
                 static_fp8=static_fp8,
+                weight_format=weight_format,
             ),
         )
         if static_fp8:
@@ -166,6 +176,7 @@ class _ColumnProjection(nn.Module):
                 _scalar_scale_loader(
                     compensate_weight_range=True,
                     columns=3,
+                    weight_format=weight_format,
                 ),
             )
             set_weight_loader(
@@ -208,6 +219,7 @@ class _OutputProjection(nn.Module):
         *,
         world_size: int,
         static_fp8: bool,
+        weight_format: str = OCP_E4M3FN_QMAX448,
         dtype: torch.dtype,
         device: torch.device | str | None,
     ) -> None:
@@ -230,6 +242,7 @@ class _OutputProjection(nn.Module):
                 shard_size=input_size,
                 num_shards=world_size,
                 static_fp8=static_fp8,
+                weight_format=weight_format,
             ),
         )
         if static_fp8:
@@ -253,7 +266,10 @@ class _OutputProjection(nn.Module):
             )
             set_weight_loader(
                 self.weight_scale,
-                _scalar_scale_loader(compensate_weight_range=True),
+                _scalar_scale_loader(
+                    compensate_weight_range=True,
+                    weight_format=weight_format,
+                ),
             )
             set_weight_loader(
                 self.input_scale,
@@ -334,6 +350,7 @@ class Glm52MlaAttention(nn.Module):
             shard_output=False,
             world_size=world_size,
             static_fp8=static_fp8,
+            weight_format=config.static_fp8_weight_format,
             dtype=self.dtype,
             device=device,
         )
@@ -347,6 +364,7 @@ class Glm52MlaAttention(nn.Module):
             shard_output=True,
             world_size=world_size,
             static_fp8=static_fp8,
+            weight_format=config.static_fp8_weight_format,
             dtype=self.dtype,
             device=device,
         )
@@ -356,6 +374,7 @@ class Glm52MlaAttention(nn.Module):
             shard_output=False,
             world_size=world_size,
             static_fp8=static_fp8,
+            weight_format=config.static_fp8_weight_format,
             dtype=self.dtype,
             device=device,
         )
@@ -369,6 +388,7 @@ class Glm52MlaAttention(nn.Module):
             shard_output=True,
             world_size=world_size,
             static_fp8=static_fp8,
+            weight_format=config.static_fp8_weight_format,
             dtype=self.dtype,
             device=device,
         )
@@ -377,6 +397,7 @@ class Glm52MlaAttention(nn.Module):
             config.hidden_size,
             world_size=world_size,
             static_fp8=static_fp8,
+            weight_format=config.static_fp8_weight_format,
             dtype=self.dtype,
             device=device,
         )

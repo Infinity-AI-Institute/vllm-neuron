@@ -5,7 +5,14 @@ import torch
 from vllm_neuron.model.glm52_moe_dsa.cache_layout import Glm52CacheLayout
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
 from vllm_neuron.model.glm52_moe_dsa.indexer import Glm52IndexShareState
-from vllm_neuron.model.glm52_moe_dsa.mla import Glm52MlaAttention
+from vllm_neuron.model.glm52_moe_dsa.mla import (
+    Glm52MlaAttention,
+    _projection_weight_loader,
+    _scalar_scale_loader,
+)
+from vllm_neuron.model.glm52_moe_dsa.static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+)
 
 
 def _reduced_config() -> Glm52MoeDsaConfig:
@@ -26,6 +33,46 @@ def _reduced_config() -> Glm52MoeDsaConfig:
         index_topk=2,
         first_k_dense_replace=3,
     )
+
+
+class _TensorSlice:
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+
+    def get_shape(self) -> tuple[int, ...]:
+        return tuple(self.tensor.shape)
+
+    def __getitem__(self, item) -> torch.Tensor:
+        return self.tensor[item]
+
+
+def test_mla_direct_legacy_projection_preserves_bytes_and_scale() -> None:
+    checkpoint = torch.tensor(
+        [
+            [-240.0, -128.0, -1.0, 0.0],
+            [1.0, 16.0, 128.0, 240.0],
+        ],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    loader = _projection_weight_loader(
+        shard_dim=1,
+        shard_size=2,
+        num_shards=1,
+        static_fp8=True,
+        weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+
+    loaded = loader.load([_TensorSlice(checkpoint)], 0)
+    scale = _scalar_scale_loader(
+        compensate_weight_range=True,
+        weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    ).load([_TensorSlice(torch.tensor(0.125, dtype=torch.float32))], 0)
+
+    assert torch.equal(
+        loaded.contiguous().view(torch.uint8),
+        checkpoint.T.contiguous().view(torch.uint8),
+    )
+    torch.testing.assert_close(scale, torch.full((128, 1), 0.125))
 
 
 def test_mla_projection_matches_frozen_low_rank_equations() -> None:

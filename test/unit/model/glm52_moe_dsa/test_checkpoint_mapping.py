@@ -4,6 +4,7 @@ import torch
 
 from vllm_neuron.model.glm52_moe_dsa.checkpoint_mapping import (
     MTP_IGNORED_PREFIX,
+    _to_neuron_legacy_fp8,
     build_checkpoint_contract,
     routed_down_scale_loader,
     routed_down_weight_loader,
@@ -12,6 +13,9 @@ from vllm_neuron.model.glm52_moe_dsa.checkpoint_mapping import (
 )
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
 from vllm_neuron.model.glm52_moe_dsa.parallelism import RoutedExpertPlan
+from vllm_neuron.model.glm52_moe_dsa.static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+)
 
 
 class FakeSlice:
@@ -220,6 +224,84 @@ def test_routed_scalar_scales_broadcast_without_semantic_change() -> None:
     torch.testing.assert_close(
         down[1],
         torch.full((3,), 6.0 * compensation),
+    )
+
+
+def test_absent_format_preserves_exact_ocp448_loader_behavior() -> None:
+    source = torch.tensor(
+        [-448.0, -256.0, -1.0, 0.0, 1.0, 256.0, 448.0],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    expected = (
+        (source.to(torch.float32) * (240.0 / 448.0))
+        .clamp(-240.0, 240.0)
+        .to(torch.float8_e4m3fn)
+    )
+
+    actual = _to_neuron_legacy_fp8(source)
+
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_direct_legacy_loader_preserves_fp8_bytes_and_scales() -> None:
+    source = torch.tensor(
+        [-240.0, -128.0, -1.0, 0.0, 1.0, 128.0, 240.0],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+
+    prepared = _to_neuron_legacy_fp8(
+        source,
+        NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+
+    assert prepared.data_ptr() == source.data_ptr()
+    assert torch.equal(prepared.view(torch.uint8), source.view(torch.uint8))
+
+    plan = _small_plan()
+    scale_slices = [
+        FakeSlice(torch.tensor(value, dtype=torch.float32))
+        for value in (1.0, 2.0, 3.0, 4.0)
+    ]
+    scales = routed_gate_up_scale_loader(
+        plan,
+        weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    ).load(scale_slices, rank=0)
+    torch.testing.assert_close(scales[0, 0], torch.ones(4))
+    torch.testing.assert_close(scales[0, 1], torch.full((4,), 2.0))
+
+
+def test_direct_legacy_loader_rejects_out_of_contract_value() -> None:
+    source = torch.tensor([256.0], dtype=torch.float32).to(torch.float8_e4m3fn)
+
+    try:
+        _to_neuron_legacy_fp8(source, NEURON_LEGACY_E4M3FN_QMAX240)
+    except ValueError as error:
+        assert "outside the declared qmax-240 range" in str(error)
+    else:
+        raise AssertionError("out-of-contract direct FP8 value was accepted")
+
+
+def test_direct_legacy_loader_preserves_noncontiguous_bytes_contiguously() -> None:
+    base = torch.tensor(
+        [
+            [-240.0, -128.0, -1.0],
+            [0.0, 1.0, 128.0],
+            [240.0, 16.0, -16.0],
+        ],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    source = base.T
+    assert not source.is_contiguous()
+
+    prepared = _to_neuron_legacy_fp8(
+        source,
+        NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+
+    assert prepared.is_contiguous()
+    assert torch.equal(
+        prepared.view(torch.uint8),
+        source.contiguous().view(torch.uint8),
     )
 
 

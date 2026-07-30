@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stream a BF16 GLM-5.2 checkpoint into the Trn2 static-FP8 contract.
 
-The converted weights use OCP E4M3FN values with one scalar dequantization
-scale per projection.  They intentionally retain the OCP ``[-448, 448]``
-range on disk.  :mod:`checkpoint_mapping` applies the paired ``240/448``
-weight downscale and ``448/240`` scale compensation when loading on Trn2.
+The default artifact retains OCP E4M3FN ``[-448, 448]`` values on disk and
+applies the qualified paired ``240/448`` weight downscale and ``448/240``
+scale compensation when loading.  An explicitly versioned direct-legacy
+artifact instead quantizes BF16 straight to qmax 240 and loads those FP8 bytes
+without a second rounding or scale compensation.
 
 Activation scales are calibration data, not weight statistics.  The
 converter therefore never invents them.  An optional calibration manifest
@@ -22,13 +23,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import tempfile
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from math import prod
 from pathlib import Path
 from typing import Any
@@ -42,18 +44,26 @@ from .checkpoint_mapping import (
     MTP_IGNORED_PREFIX,
     STATIC_WEIGHT_SCALE_SUFFIX,
     _NEURON_LEGACY_E4M3_MAX,
-    _OCP_E4M3_MAX,
-    _SCALE_COMPENSATION,
-    _WEIGHT_DOWNSCALE,
     build_checkpoint_contract,
 )
 from .config import Glm52MoeDsaConfig
 from .parallelism import RoutedExpertPlan
+from .static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+    OCP_E4M3FN_QMAX448,
+    normalize_static_fp8_weight_format,
+    static_fp8_manifest_contract,
+    static_fp8_qmax,
+)
 
 ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_VERSION = "glm52-trn2-static-fp8-v1"
 BF16_SHARED_ARTIFACT_VERSION = "glm52-trn2-static-fp8-bf16-shared-v1"
-CONVERTER_VERSION = "1.0.0"
+DIRECT_LEGACY_ARTIFACT_VERSION = "glm52-trn2-static-fp8-direct-legacy-v1"
+DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION = (
+    "glm52-trn2-static-fp8-direct-legacy-bf16-shared-v1"
+)
+CONVERTER_VERSION = "1.2.0"
 MANIFEST_FILENAME = "glm52-static-fp8-manifest.json"
 COMPILE_STUB_MANIFEST_FILENAME = "glm52-compile-stub-manifest.json"
 COMPILE_CONSTANTS_FILENAME = "glm52-compile-constants.safetensors"
@@ -62,6 +72,10 @@ INDEX_FILENAME = "model.safetensors.index.json"
 DEFAULT_MAX_SHARD_BYTES = 2 * 1024**3
 DEFAULT_QUANTIZATION_CHUNK_ELEMENTS = 4 * 1024**2
 ZERO_TENSOR_SCALE = 1.0
+RESUME_SCHEMA_VERSION = 1
+RESUME_IDENTITY_FILENAME = "identity.json"
+RESUME_RECEIPTS_DIRNAME = "receipts"
+RESUME_ARTIFACT_DIRNAME = "artifact"
 
 _STATIC_WEIGHT_PATTERNS = (
     re.compile(
@@ -137,10 +151,21 @@ def _validate_shared_expert_dtype(shared_expert_dtype: str) -> str:
     return shared_expert_dtype
 
 
-def _artifact_version(shared_expert_dtype: str) -> str:
+def _artifact_version(
+    shared_expert_dtype: str,
+    static_fp8_weight_format: str = OCP_E4M3FN_QMAX448,
+) -> str:
+    shared_expert_dtype = _validate_shared_expert_dtype(shared_expert_dtype)
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    if weight_format == NEURON_LEGACY_E4M3FN_QMAX240:
+        return (
+            DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION
+            if shared_expert_dtype == "bfloat16"
+            else DIRECT_LEGACY_ARTIFACT_VERSION
+        )
     return (
         BF16_SHARED_ARTIFACT_VERSION
-        if _validate_shared_expert_dtype(shared_expert_dtype) == "bfloat16"
+        if shared_expert_dtype == "bfloat16"
         else ARTIFACT_VERSION
     )
 
@@ -191,6 +216,25 @@ def _sha256_file(path: Path, *, chunk_bytes: int = 8 * 1024**2) -> str:
         while chunk := source.read(chunk_bytes):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _atomic_write_json(path: Path, value: Any) -> bytes:
+    """Write one control record without ever exposing a partial JSON file."""
+
+    encoded = _json_bytes(value)
+    temporary = path.with_name(f".{path.name}.tmp")
+    if temporary.exists():
+        raise ValueError(f"orphaned resume control file: {temporary}")
+    with temporary.open("xb") as destination:
+        destination.write(encoded)
+        destination.flush()
+        os.fsync(destination.fileno())
+    temporary.replace(path)
+    return encoded
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
 
 
 @contextmanager
@@ -565,18 +609,20 @@ def _load_calibration(
     )
 
 
-def quantize_bf16_per_tensor_ocp(
+def quantize_bf16_per_tensor(
     weight: torch.Tensor,
     *,
+    static_fp8_weight_format: str,
     chunk_elements: int = DEFAULT_QUANTIZATION_CHUNK_ELEMENTS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize one contiguous BF16 tensor to deterministic OCP E4M3FN.
+    """Quantize one BF16 tensor to the declared deterministic FP8 contract.
 
-    The scale is ``max(abs(weight)) / 448``.  An all-zero tensor uses a
-    canonical scale of ``1.0`` so no divide-by-zero or non-finite metadata is
-    emitted.
+    The scale is ``max(abs(weight)) / qmax``, where qmax is 448 for the
+    original OCP artifact and 240 for the direct Neuron-legacy artifact.
     """
 
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    qmax = static_fp8_qmax(weight_format)
     if weight.dtype != torch.bfloat16:
         raise TypeError(f"expected BF16 source weight, got {weight.dtype}")
     if weight.ndim != 2:
@@ -596,7 +642,7 @@ def quantize_bf16_per_tensor_ocp(
             chunk_maximum = float(chunk.abs().max())
             maximum = max(maximum, chunk_maximum)
 
-    scale_value = maximum / _OCP_E4M3_MAX if maximum else ZERO_TENSOR_SCALE
+    scale_value = maximum / qmax if maximum else ZERO_TENSOR_SCALE
     scale = torch.tensor(scale_value, dtype=torch.float32)
     output = torch.empty(weight.shape, dtype=torch.float8_e4m3fn)
     flat_output = output.view(-1)
@@ -604,11 +650,39 @@ def quantize_bf16_per_tensor_ocp(
         source_chunk = flat[start : start + chunk_elements]
         quantized = (
             (source_chunk.to(torch.float32) / scale)
-            .clamp(-_OCP_E4M3_MAX, _OCP_E4M3_MAX)
+            .clamp(-qmax, qmax)
             .to(torch.float8_e4m3fn)
         )
         flat_output[start : start + source_chunk.numel()].copy_(quantized)
     return output, scale
+
+
+def quantize_bf16_per_tensor_ocp(
+    weight: torch.Tensor,
+    *,
+    chunk_elements: int = DEFAULT_QUANTIZATION_CHUNK_ELEMENTS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible OCP448 converter entry point."""
+
+    return quantize_bf16_per_tensor(
+        weight,
+        static_fp8_weight_format=OCP_E4M3FN_QMAX448,
+        chunk_elements=chunk_elements,
+    )
+
+
+def quantize_bf16_per_tensor_direct_legacy(
+    weight: torch.Tensor,
+    *,
+    chunk_elements: int = DEFAULT_QUANTIZATION_CHUNK_ELEMENTS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16 directly to the Neuron kernel's qmax-240 E4M3 range."""
+
+    return quantize_bf16_per_tensor(
+        weight,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        chunk_elements=chunk_elements,
+    )
 
 
 def _tensor_bytes(tensor: torch.Tensor) -> int:
@@ -625,7 +699,13 @@ def _slice_bytes(slice_obj: Any) -> int:
 
 
 class _StreamingShardWriter:
-    def __init__(self, staging_dir: Path, max_shard_bytes: int) -> None:
+    def __init__(
+        self,
+        staging_dir: Path,
+        max_shard_bytes: int,
+        *,
+        state: Mapping[str, Any] | None = None,
+    ) -> None:
         if max_shard_bytes <= 0:
             raise ValueError("max_shard_bytes must be positive")
         self.staging_dir = staging_dir
@@ -633,7 +713,102 @@ class _StreamingShardWriter:
         self.buffer: dict[str, torch.Tensor] = {}
         self.buffered_bytes = 0
         self.maximum_buffered_bytes = 0
-        self.parts: list[tuple[Path, tuple[str, ...], int]] = []
+        self.parts: list[dict[str, Any]] = []
+        if state is not None:
+            self._restore(state)
+
+    def _restore(self, state: Mapping[str, Any]) -> None:
+        expected = {"maximum_buffered_bytes", "parts", "weight_map"}
+        if set(state) != expected:
+            raise ValueError("resume writer state has an unexpected schema")
+        maximum = state["maximum_buffered_bytes"]
+        parts = state["parts"]
+        weight_map = state["weight_map"]
+        if not isinstance(maximum, int) or maximum < 0:
+            raise ValueError("invalid maximum_buffered_bytes in resume state")
+        if not isinstance(parts, list) or not isinstance(weight_map, dict):
+            raise ValueError("invalid parts/weight_map in resume state")
+
+        restored_map: dict[str, str] = {}
+        restored_parts: list[dict[str, Any]] = []
+        for number, raw in enumerate(parts, start=1):
+            if not isinstance(raw, dict) or set(raw) != {
+                "file",
+                "file_bytes",
+                "keys",
+                "sha256",
+                "tensor_bytes",
+            }:
+                raise ValueError("resume output-part record has an unexpected schema")
+            expected_name = f".part-{number:05d}.safetensors"
+            if raw["file"] != expected_name:
+                raise ValueError(f"non-contiguous resume output part: {raw['file']!r}")
+            keys = raw["keys"]
+            if (
+                not isinstance(keys, list)
+                or not keys
+                or keys != sorted(keys)
+                or len(keys) != len(set(keys))
+            ):
+                raise ValueError(f"invalid keys for resume part {expected_name}")
+            for key in keys:
+                if key in restored_map:
+                    raise ValueError(f"duplicate resumed output tensor {key!r}")
+                restored_map[key] = expected_name
+            restored_parts.append(dict(raw))
+        if restored_map != weight_map:
+            raise ValueError("resume weight_map disagrees with output parts")
+
+        self.parts = restored_parts
+        self.maximum_buffered_bytes = maximum
+        self.verify_parts()
+
+    def state(self, *, part_offset: int = 0) -> dict[str, Any]:
+        if self.buffer:
+            raise AssertionError("cannot serialize a non-flushed writer")
+        if not 0 <= part_offset <= len(self.parts):
+            raise ValueError("invalid writer part offset")
+        parts = self.parts[part_offset:]
+        weight_map = {key: part["file"] for part in parts for key in part["keys"]}
+        return {
+            "maximum_buffered_bytes": self.maximum_buffered_bytes,
+            "parts": parts,
+            "weight_map": dict(sorted(weight_map.items())),
+        }
+
+    def verify_parts(self) -> None:
+        expected_files = {part["file"] for part in self.parts}
+        actual_files = {
+            path.name for path in self.staging_dir.iterdir() if path.is_file()
+        }
+        missing = expected_files - actual_files
+        extras = actual_files - expected_files
+        if missing:
+            raise ValueError(
+                f"resume artifact is missing committed files: {sorted(missing)!r}"
+            )
+        expected_tail = {
+            f".part-{number:05d}.safetensors"
+            for number in range(
+                len(self.parts) + 1,
+                len(self.parts) + len(extras) + 1,
+            )
+        }
+        if extras != expected_tail:
+            raise ValueError(
+                f"resume artifact contains orphan files: {sorted(extras)!r}"
+            )
+        # Contiguous tail parts are an incomplete, unreceipted source-shard
+        # transaction. They cannot contain committed tensors, so rolling them
+        # back to the last receipt is deterministic and fail-closed.
+        for name in sorted(extras):
+            (self.staging_dir / name).unlink()
+        for part in self.parts:
+            path = self.staging_dir / part["file"]
+            if path.stat().st_size != part["file_bytes"]:
+                raise ValueError(f"resumed output part size changed: {path}")
+            if _sha256_file(path) != part["sha256"]:
+                raise ValueError(f"resumed output part checksum changed: {path}")
 
     def prepare(self, output_group_bytes: int) -> None:
         if self.buffer and self.buffered_bytes + output_group_bytes > (
@@ -666,42 +841,260 @@ class _StreamingShardWriter:
         save_file(
             ordered,
             part_path,
-            # Multiple metadata entries are serialized through a Rust
-            # HashMap and can change byte order between identical runs.
-            # Keep the shard metadata single-key; artifact versioning lives
-            # in the deterministic index/config/provenance manifests.
             metadata={"format": "pt"},
         )
-        keys = tuple(ordered)
-        self.parts.append((part_path, keys, self.buffered_bytes))
+        self.parts.append(
+            {
+                "file": part_path.name,
+                "file_bytes": part_path.stat().st_size,
+                "keys": list(ordered),
+                "sha256": _sha256_file(part_path),
+                "tensor_bytes": self.buffered_bytes,
+            }
+        )
         self.buffer.clear()
         self.buffered_bytes = 0
 
-    def finalize(self) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    def finalize(
+        self,
+        publication_dir: Path,
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
         self.flush()
         if not self.parts:
             raise ValueError("conversion produced no output tensors")
         count = len(self.parts)
         weight_map: dict[str, str] = {}
         shards: list[dict[str, Any]] = []
-        for number, (part_path, keys, tensor_bytes) in enumerate(
-            self.parts,
-            start=1,
-        ):
+        for number, part in enumerate(self.parts, start=1):
+            part_path = self.staging_dir / part["file"]
+            keys = part["keys"]
             final_name = f"model-{number:05d}-of-{count:05d}.safetensors"
-            final_path = self.staging_dir / final_name
-            part_path.replace(final_path)
+            final_path = publication_dir / final_name
+            os.link(part_path, final_path)
             for key in keys:
                 weight_map[key] = final_name
             shards.append(
                 {
                     "file": final_name,
-                    "file_bytes": final_path.stat().st_size,
-                    "tensor_bytes": tensor_bytes,
-                    "sha256": _sha256_file(final_path),
+                    "file_bytes": part["file_bytes"],
+                    "tensor_bytes": part["tensor_bytes"],
+                    "sha256": part["sha256"],
                 }
             )
         return weight_map, shards
+
+
+def _resume_identity(
+    *,
+    source: SourceCheckpoint,
+    source_model_id: str,
+    source_revision: str,
+    config_sha256: str,
+    calibration_manifest: Mapping[str, Any],
+    max_shard_bytes: int,
+    quantization_chunk_elements: int,
+    hf_streaming: bool,
+    download_staging_dir: str,
+    strict_index_closure: bool,
+    world_size: int,
+    ep_degree: int,
+    shared_expert_dtype: str,
+    static_fp8_weight_format: str,
+    artifact_version: str,
+) -> dict[str, Any]:
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    return {
+        "schema_version": RESUME_SCHEMA_VERSION,
+        "converter_version": CONVERTER_VERSION,
+        "torch_version": torch.__version__,
+        "safetensors_version": safetensors.__version__,
+        "artifact_version": artifact_version,
+        "static_fp8_contract": static_fp8_manifest_contract(weight_format),
+        "source": {
+            "model_id": source_model_id,
+            "revision": source_revision,
+            "config_sha256": config_sha256,
+            "index_sha256": source.index_sha256,
+            "weight_map_sha256": _sha256_bytes(
+                _json_bytes(dict(sorted(source.weight_map.items())))
+            ),
+            "shard_names": list(source.shard_names),
+            "declared_total_size": source.declared_total_size,
+        },
+        "calibration_source_sha256": calibration_manifest.get("source_sha256"),
+        "options": {
+            "max_shard_bytes": max_shard_bytes,
+            "quantization_chunk_elements": quantization_chunk_elements,
+            "hf_streaming": hf_streaming,
+            "download_staging_dir": download_staging_dir,
+            "strict_index_closure": strict_index_closure,
+            "world_size": world_size,
+            "ep_degree": ep_degree,
+            "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
+        },
+    }
+
+
+def _load_resume_receipts(
+    receipts_dir: Path,
+    source_shard_names: Sequence[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    unexpected = [
+        path.name
+        for path in receipts_dir.iterdir()
+        if not path.is_file() or not re.fullmatch(r"source-\d{5}\.json", path.name)
+    ]
+    if unexpected:
+        raise ValueError(f"orphaned resume receipt state: {sorted(unexpected)!r}")
+    receipt_paths = sorted(receipts_dir.glob("source-*.json"))
+    previous_sha256: str | None = None
+    completed_source_shards: list[dict[str, Any]] = []
+    excluded_keys: list[str] = []
+    writer_parts: list[dict[str, Any]] = []
+    writer_weight_map: dict[str, str] = {}
+    maximum_buffered_bytes = 0
+    latest_stats: dict[str, Any] | None = None
+    for ordinal, path in enumerate(receipt_paths, start=1):
+        expected_name = f"source-{ordinal:05d}.json"
+        if path.name != expected_name or ordinal > len(source_shard_names):
+            raise ValueError(f"non-contiguous resume receipt: {path.name}")
+        encoded = path.read_bytes()
+        try:
+            receipt = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"corrupted resume receipt: {path}") from error
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "ordinal",
+            "previous_receipt_sha256",
+            "receipt_sha256",
+            "schema_version",
+            "source_shard",
+            "state",
+        }:
+            raise ValueError(f"invalid resume receipt schema: {path}")
+        claimed_receipt_sha256 = receipt.pop("receipt_sha256")
+        if (
+            not isinstance(claimed_receipt_sha256, str)
+            or _sha256_bytes(_json_bytes(receipt)) != claimed_receipt_sha256
+        ):
+            raise ValueError(f"corrupted resume receipt checksum: {path}")
+        if (
+            receipt["schema_version"] != RESUME_SCHEMA_VERSION
+            or receipt["ordinal"] != ordinal
+            or receipt["source_shard"] != source_shard_names[ordinal - 1]
+            or receipt["previous_receipt_sha256"] != previous_sha256
+        ):
+            raise ValueError(f"inconsistent resume receipt chain: {path}")
+        state = receipt["state"]
+        if not isinstance(state, dict) or set(state) != {
+            "source_shard_identity",
+            "excluded_keys_added",
+            "stats",
+            "writer",
+        }:
+            raise ValueError(f"invalid resume state schema: {path}")
+        source_identity = state["source_shard_identity"]
+        if (
+            not isinstance(source_identity, dict)
+            or source_identity.get("file") != source_shard_names[ordinal - 1]
+        ):
+            raise ValueError(f"resume source-shard prefix disagrees: {path}")
+        if not isinstance(state["stats"], dict) or set(state["stats"]) != set(
+            asdict(ConversionStats())
+        ):
+            raise ValueError(f"invalid resume statistics schema: {path}")
+        if not isinstance(state["excluded_keys_added"], list):
+            raise ValueError(f"invalid excluded-key state: {path}")
+        writer_delta = state["writer"]
+        if not isinstance(writer_delta, dict) or set(writer_delta) != {
+            "maximum_buffered_bytes",
+            "parts",
+            "weight_map",
+        }:
+            raise ValueError(f"invalid resume writer delta: {path}")
+        if not isinstance(writer_delta["parts"], list) or not isinstance(
+            writer_delta["weight_map"], dict
+        ):
+            raise ValueError(f"invalid resume writer delta: {path}")
+        delta_maximum = writer_delta["maximum_buffered_bytes"]
+        if not isinstance(delta_maximum, int) or delta_maximum < maximum_buffered_bytes:
+            raise ValueError(f"invalid resume writer maximum: {path}")
+        duplicate_keys = set(writer_weight_map).intersection(writer_delta["weight_map"])
+        if duplicate_keys:
+            raise ValueError(
+                "duplicate output keys in resume receipts: "
+                f"{sorted(duplicate_keys)[:4]!r}"
+            )
+        completed_source_shards.append(source_identity)
+        excluded_keys.extend(state["excluded_keys_added"])
+        writer_parts.extend(writer_delta["parts"])
+        writer_weight_map.update(writer_delta["weight_map"])
+        maximum_buffered_bytes = delta_maximum
+        latest_stats = state["stats"]
+        previous_sha256 = _sha256_bytes(encoded)
+    if latest_stats is None:
+        return None, previous_sha256
+    return (
+        {
+            "completed_source_shards": completed_source_shards,
+            "excluded_keys": excluded_keys,
+            "stats": latest_stats,
+            "writer": {
+                "maximum_buffered_bytes": maximum_buffered_bytes,
+                "parts": writer_parts,
+                "weight_map": dict(sorted(writer_weight_map.items())),
+            },
+        },
+        previous_sha256,
+    )
+
+
+def _write_resume_receipt(
+    receipts_dir: Path,
+    *,
+    previous_receipt_sha256: str | None,
+    source_shard: str,
+    state: Mapping[str, Any],
+    ordinal: int,
+) -> str:
+    receipt = {
+        "schema_version": RESUME_SCHEMA_VERSION,
+        "ordinal": ordinal,
+        "source_shard": source_shard,
+        "previous_receipt_sha256": previous_receipt_sha256,
+        "state": state,
+    }
+    receipt["receipt_sha256"] = _sha256_bytes(_json_bytes(receipt))
+    encoded = _atomic_write_json(
+        receipts_dir / f"source-{ordinal:05d}.json",
+        receipt,
+    )
+    return _sha256_bytes(encoded)
+
+
+def _verify_completed_source_shard(
+    source_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    hf_streaming: bool,
+) -> None:
+    if not isinstance(record, dict) or set(record) != {
+        "file",
+        "file_bytes",
+        "sha256",
+        "transient_download",
+    }:
+        raise ValueError("invalid completed source-shard identity")
+    source_path = source_dir / record["file"]
+    if source_path.is_file():
+        if source_path.stat().st_size != record["file_bytes"]:
+            raise ValueError(f"completed source shard size changed: {source_path}")
+        if _sha256_file(source_path) != record["sha256"]:
+            raise ValueError(f"completed source shard checksum changed: {source_path}")
+        return
+    if not hf_streaming or not record["transient_download"]:
+        raise FileNotFoundError(f"cannot verify completed source shard {source_path}")
 
 
 def _copy_auxiliary_files(
@@ -730,15 +1123,18 @@ def _write_output_config(
     staging_dir: Path,
     *,
     shared_expert_dtype: str,
+    static_fp8_weight_format: str,
     calibration_manifest: Mapping[str, Any],
     cache_quant_multipliers: Mapping[str, float],
     index_closure: Mapping[str, Any],
 ) -> dict[str, Any]:
-    artifact_version = _artifact_version(shared_expert_dtype)
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    artifact_version = _artifact_version(shared_expert_dtype, weight_format)
     output_config = dict(source_config)
     output_config["dtype"] = "bfloat16"
     output_config["torch_dtype"] = "bfloat16"
     output_config["shared_expert_dtype"] = shared_expert_dtype
+    output_config["static_fp8_weight_format"] = weight_format
     output_config["quantization_config"] = {
         "quant_method": "modelopt",
         "artifact_version": artifact_version,
@@ -746,6 +1142,7 @@ def _write_output_config(
             "quant_algo": "FP8",
             "kv_cache_quant_algo": "FP8",
             "weight_scale_granularity": "per_tensor",
+            "weight_format": weight_format,
             "activation_scheme": "static",
             "exclude_modules": list(_bf16_exclude_modules(shared_expert_dtype)),
         },
@@ -753,6 +1150,7 @@ def _write_output_config(
     output_config["glm52_artifact"] = {
         "artifact_version": artifact_version,
         "shared_expert_dtype": shared_expert_dtype,
+        "static_fp8_weight_format": weight_format,
         "manifest_file": MANIFEST_FILENAME,
         "mtp_enabled": False,
         "loader_ready": bool(calibration_manifest["loader_ready"])
@@ -775,6 +1173,56 @@ def _write_output_config(
         "bytes": len(config_bytes),
         "sha256": _sha256_bytes(config_bytes),
     }
+
+
+def validate_static_fp8_artifact_metadata(
+    manifest: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> str:
+    """Fail closed when artifact/config FP8 storage declarations disagree."""
+
+    quantization = manifest.get("quantization")
+    artifact = config.get("glm52_artifact")
+    config_quantization = config.get("quantization_config")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (quantization, artifact, config_quantization)
+    ):
+        raise ValueError("static-FP8 artifact metadata is incomplete")
+    inner = config_quantization.get("quantization")
+    if not isinstance(inner, Mapping):
+        raise ValueError("static-FP8 quantization metadata is incomplete")
+    markers = (
+        manifest.get("static_fp8_weight_format"),
+        quantization.get("storage_format"),
+        config.get("static_fp8_weight_format"),
+        artifact.get("static_fp8_weight_format"),
+        inner.get("weight_format"),
+    )
+    if any(marker is None for marker in markers):
+        raise ValueError("static-FP8 artifact has an undeclared weight format")
+    weight_format = normalize_static_fp8_weight_format(markers[0])
+    if any(marker != weight_format for marker in markers):
+        raise ValueError("static-FP8 artifact has mixed weight formats")
+    shared_expert_dtype = _validate_shared_expert_dtype(
+        str(manifest.get("shared_expert_dtype"))
+    )
+    expected_version = _artifact_version(
+        shared_expert_dtype,
+        weight_format,
+    )
+    versions = (
+        manifest.get("artifact_version"),
+        artifact.get("artifact_version"),
+        config_quantization.get("artifact_version"),
+    )
+    if any(version != expected_version for version in versions):
+        raise ValueError("static-FP8 artifact version does not match weight format")
+    contract = static_fp8_manifest_contract(weight_format)
+    for key in ("format", "qmax", "loader_compensation"):
+        if quantization.get(key) != contract[key]:
+            raise ValueError(f"static-FP8 manifest {key} does not match weight format")
+    return weight_format
 
 
 def required_loader_source_keys(
@@ -813,6 +1261,7 @@ def write_compile_stub(
     world_size: int = 64,
     ep_degree: int = 16,
     shared_expert_dtype: str = "fp8",
+    static_fp8_weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> dict[str, Any]:
     """Write a metadata-only, non-serving artifact for CPU graph compilation."""
 
@@ -833,10 +1282,12 @@ def write_compile_stub(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     shared_expert_dtype = _validate_shared_expert_dtype(shared_expert_dtype)
-    artifact_version = _artifact_version(shared_expert_dtype)
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    artifact_version = _artifact_version(shared_expert_dtype, weight_format)
     config, config_sha256 = _validate_source_config(source_dir)
     config = dict(config)
     config["shared_expert_dtype"] = shared_expert_dtype
+    config["static_fp8_weight_format"] = weight_format
     source = _discover_source_checkpoint(source_dir)
     source_keys = tuple(sorted(source.weight_map))
     index_closure = validate_bf16_index_closure(
@@ -894,6 +1345,7 @@ def write_compile_stub(
         output_index = {
             "metadata": {
                 "artifact_version": artifact_version,
+                "static_fp8_weight_format": weight_format,
                 "compile_stub": True,
                 "materialized_tensor_bytes": 4 * len(cache_keys),
                 "total_size": 4 * len(cache_keys),
@@ -907,6 +1359,7 @@ def write_compile_stub(
         output_config["dtype"] = "bfloat16"
         output_config["torch_dtype"] = "bfloat16"
         output_config["shared_expert_dtype"] = shared_expert_dtype
+        output_config["static_fp8_weight_format"] = weight_format
         output_config["quantization_config"] = {
             "quant_method": "modelopt",
             "artifact_version": artifact_version,
@@ -914,6 +1367,7 @@ def write_compile_stub(
                 "quant_algo": "FP8",
                 "kv_cache_quant_algo": "FP8",
                 "weight_scale_granularity": "per_tensor",
+                "weight_format": weight_format,
                 "activation_scheme": "static",
                 "exclude_modules": list(_bf16_exclude_modules(shared_expert_dtype)),
             },
@@ -921,6 +1375,7 @@ def write_compile_stub(
         output_config["glm52_artifact"] = {
             "artifact_version": artifact_version,
             "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
             "manifest_file": COMPILE_STUB_MANIFEST_FILENAME,
             "compile_stub": True,
             "loader_ready": False,
@@ -935,6 +1390,7 @@ def write_compile_stub(
         identity = {
             "artifact_version": artifact_version,
             "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
             "compile_stub": True,
             "source_model_id": source_model_id,
             "source_revision": source_revision,
@@ -945,6 +1401,7 @@ def write_compile_stub(
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "artifact_version": artifact_version,
             "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
             "artifact_id": _sha256_bytes(json.dumps(identity, sort_keys=True).encode()),
             "compile_stub": True,
             "serving_weights_materialized": False,
@@ -1006,6 +1463,9 @@ def convert_checkpoint(
     world_size: int = 64,
     ep_degree: int = 16,
     shared_expert_dtype: str = "fp8",
+    static_fp8_weight_format: str = OCP_E4M3FN_QMAX448,
+    work_dir: str | Path | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Convert a local BF16 checkpoint without loading more than one tensor."""
 
@@ -1024,12 +1484,34 @@ def convert_checkpoint(
             f"refusing to overwrite existing output directory {output_dir}"
         )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if resume and work_dir is None:
+        raise ValueError("resume requires an explicit work_dir")
+    explicit_work_dir = work_dir is not None
+    resolved_work_dir = Path(work_dir).resolve() if work_dir is not None else None
+    if resolved_work_dir is not None:
+        if _paths_overlap(output_dir, resolved_work_dir):
+            raise ValueError("output_dir and work_dir must not overlap")
+        if _paths_overlap(source_dir, resolved_work_dir):
+            raise ValueError("source_dir and work_dir must not overlap")
+        if resume:
+            if not resolved_work_dir.is_dir():
+                raise FileNotFoundError(resolved_work_dir)
+        elif resolved_work_dir.exists():
+            raise FileExistsError(
+                f"refusing to reuse existing work directory {resolved_work_dir}"
+            )
 
     shared_expert_dtype = _validate_shared_expert_dtype(shared_expert_dtype)
-    artifact_version = _artifact_version(shared_expert_dtype)
+    weight_format = normalize_static_fp8_weight_format(static_fp8_weight_format)
+    if hf_streaming and not re.fullmatch(r"[0-9a-fA-F]{40}", source_revision):
+        raise ValueError(
+            "hf_streaming resume safety requires a pinned 40-hex commit revision"
+        )
+    artifact_version = _artifact_version(shared_expert_dtype, weight_format)
     config, config_sha256 = _validate_source_config(source_dir)
     config = dict(config)
     config["shared_expert_dtype"] = shared_expert_dtype
+    config["static_fp8_weight_format"] = weight_format
     source = _discover_source_checkpoint(source_dir)
     source_keys = tuple(sorted(source.weight_map))
     if strict_index_closure:
@@ -1098,27 +1580,136 @@ def convert_checkpoint(
         required_cache_scales,
     )
 
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=f".{output_dir.name}.staging-",
-            dir=output_dir.parent,
+    if resolved_work_dir is None:
+        work_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_dir.name}.work-",
+                dir=output_dir.parent,
+            )
         )
-    )
-    stats = ConversionStats(source_tensor_count=len(source_keys))
-    excluded_keys: list[str] = []
-    writer = _StreamingShardWriter(staging_dir, max_shard_bytes)
-    source_shards = []
+    else:
+        work_root = resolved_work_dir
+        if not resume:
+            work_root.mkdir(parents=True)
+    if work_root.stat().st_dev != output_dir.parent.stat().st_dev:
+        if not explicit_work_dir:
+            shutil.rmtree(work_root, ignore_errors=True)
+        raise ValueError(
+            "work_dir and output_dir must be on the same filesystem for "
+            "atomic publication"
+        )
+    staging_dir = work_root / RESUME_ARTIFACT_DIRNAME
+    publication_dir = work_root / "publication"
+    receipts_dir = work_root / RESUME_RECEIPTS_DIRNAME
+    identity_path = work_root / RESUME_IDENTITY_FILENAME
     download_root = (
         Path(download_staging_dir).resolve()
         if download_staging_dir is not None
-        else staging_dir / ".source-downloads"
+        else work_root / "downloads"
     )
+    if download_staging_dir is not None and (
+        _paths_overlap(download_root, source_dir)
+        or _paths_overlap(download_root, output_dir)
+        or _paths_overlap(download_root, work_root)
+    ):
+        raise ValueError(
+            "explicit download_staging_dir must not overlap source, output, "
+            "or work directories"
+        )
+    identity = _resume_identity(
+        source=source,
+        source_model_id=source_model_id,
+        source_revision=source_revision,
+        config_sha256=config_sha256,
+        calibration_manifest=calibration_manifest,
+        max_shard_bytes=max_shard_bytes,
+        quantization_chunk_elements=quantization_chunk_elements,
+        hf_streaming=hf_streaming,
+        download_staging_dir=(
+            str(download_root) if download_staging_dir is not None else "managed"
+        ),
+        strict_index_closure=strict_index_closure,
+        world_size=world_size,
+        ep_degree=ep_degree,
+        shared_expert_dtype=shared_expert_dtype,
+        static_fp8_weight_format=weight_format,
+        artifact_version=artifact_version,
+    )
+    if resume:
+        allowed = {
+            RESUME_ARTIFACT_DIRNAME,
+            RESUME_IDENTITY_FILENAME,
+            RESUME_RECEIPTS_DIRNAME,
+            "publication",
+        }
+        if download_staging_dir is None:
+            allowed.add("downloads")
+        unexpected = {path.name for path in work_root.iterdir()} - allowed
+        if unexpected:
+            raise ValueError(f"orphaned resume work state: {sorted(unexpected)!r}")
+        if not staging_dir.is_dir() or not receipts_dir.is_dir():
+            raise ValueError("resume work directory is missing required state")
+        if publication_dir.exists():
+            if not publication_dir.is_dir():
+                raise ValueError("invalid interrupted publication state")
+            shutil.rmtree(publication_dir)
+        if download_staging_dir is None and download_root.exists():
+            if any(download_root.iterdir()):
+                raise ValueError(f"orphaned transient download state: {download_root}")
+            download_root.rmdir()
+        try:
+            stored_identity = json.loads(identity_path.read_bytes())
+        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("missing or corrupted resume identity") from error
+        if stored_identity != identity:
+            raise ValueError(
+                "resume identity mismatch; source, revision, calibration, "
+                "runtime versions, FP8 format, or conversion options changed"
+            )
+        resume_state, previous_receipt_sha256 = _load_resume_receipts(
+            receipts_dir,
+            source.shard_names,
+        )
+        if resume_state is None:
+            stats = ConversionStats(source_tensor_count=len(source_keys))
+            excluded_keys: list[str] = []
+            source_shards: list[dict[str, Any]] = []
+            writer = _StreamingShardWriter(staging_dir, max_shard_bytes)
+        else:
+            stats = ConversionStats(**resume_state["stats"])
+            excluded_keys = list(resume_state["excluded_keys"])
+            source_shards = list(resume_state["completed_source_shards"])
+            writer = _StreamingShardWriter(
+                staging_dir,
+                max_shard_bytes,
+                state=resume_state["writer"],
+            )
+        for source_shard in source_shards:
+            _verify_completed_source_shard(
+                source_dir,
+                source_shard,
+                hf_streaming=hf_streaming,
+            )
+    else:
+        staging_dir.mkdir()
+        receipts_dir.mkdir()
+        _atomic_write_json(identity_path, identity)
+        stats = ConversionStats(source_tensor_count=len(source_keys))
+        excluded_keys = []
+        source_shards = []
+        previous_receipt_sha256 = None
+        writer = _StreamingShardWriter(staging_dir, max_shard_bytes)
     try:
         keys_by_shard: dict[str, list[str]] = defaultdict(list)
         for key, shard_name in source.weight_map.items():
             keys_by_shard[shard_name].append(key)
 
-        for shard_name in source.shard_names:
+        completed_source_count = len(source_shards)
+        for source_ordinal, shard_name in enumerate(source.shard_names, start=1):
+            if source_ordinal <= completed_source_count:
+                continue
+            writer_part_offset = len(writer.parts)
+            excluded_key_offset = len(excluded_keys)
             with _materialize_source_shard(
                 source_dir,
                 shard_name,
@@ -1127,14 +1718,12 @@ def convert_checkpoint(
                 source_revision=source_revision,
                 download_staging_dir=download_root,
             ) as (shard_path, transient):
-                source_shards.append(
-                    {
-                        "file": shard_name,
-                        "file_bytes": shard_path.stat().st_size,
-                        "sha256": _sha256_file(shard_path),
-                        "transient_download": transient,
-                    }
-                )
+                source_shard_record = {
+                    "file": shard_name,
+                    "file_bytes": shard_path.stat().st_size,
+                    "sha256": _sha256_file(shard_path),
+                    "transient_download": transient,
+                }
                 with safe_open(
                     shard_path,
                     framework="pt",
@@ -1179,8 +1768,9 @@ def convert_checkpoint(
                             key,
                             shared_expert_dtype=shared_expert_dtype,
                         ):
-                            quantized, weight_scale = quantize_bf16_per_tensor_ocp(
+                            quantized, weight_scale = quantize_bf16_per_tensor(
                                 tensor,
+                                static_fp8_weight_format=weight_format,
                                 chunk_elements=(quantization_chunk_elements),
                             )
                             output_group = {
@@ -1221,6 +1811,21 @@ def convert_checkpoint(
                 # preserved tensors before an ephemeral HF snapshot/blob is
                 # removed and makes local and HF-streaming output identical.
                 writer.flush()
+                source_shards.append(source_shard_record)
+                previous_receipt_sha256 = _write_resume_receipt(
+                    receipts_dir,
+                    previous_receipt_sha256=previous_receipt_sha256,
+                    source_shard=shard_name,
+                    ordinal=source_ordinal,
+                    state={
+                        "source_shard_identity": source_shard_record,
+                        "excluded_keys_added": excluded_keys[excluded_key_offset:],
+                        "stats": asdict(stats),
+                        "writer": writer.state(
+                            part_offset=writer_part_offset,
+                        ),
+                    },
+                )
 
         if (
             source.declared_total_size is not None
@@ -1250,29 +1855,33 @@ def convert_checkpoint(
         if download_staging_dir is None and download_root.exists():
             download_root.rmdir()
 
-        weight_map, output_shards = writer.finalize()
+        writer.flush()
+        publication_dir.mkdir()
+        weight_map, output_shards = writer.finalize(publication_dir)
         index = {
             "metadata": {
                 "artifact_version": artifact_version,
                 "shared_expert_dtype": shared_expert_dtype,
+                "static_fp8_weight_format": weight_format,
                 "total_size": stats.output_total_tensor_bytes,
                 "weight_scale_shape": "scalar",
             },
             "weight_map": dict(sorted(weight_map.items())),
         }
         index_bytes = _json_bytes(index)
-        (staging_dir / INDEX_FILENAME).write_bytes(index_bytes)
+        (publication_dir / INDEX_FILENAME).write_bytes(index_bytes)
         output_config_file = _write_output_config(
             config,
-            staging_dir,
+            publication_dir,
             shared_expert_dtype=shared_expert_dtype,
+            static_fp8_weight_format=weight_format,
             calibration_manifest=calibration_manifest,
             cache_quant_multipliers=cache_quant_multipliers,
             index_closure=index_closure,
         )
         auxiliary_files = [
             output_config_file,
-            *_copy_auxiliary_files(source_dir, staging_dir),
+            *_copy_auxiliary_files(source_dir, publication_dir),
         ]
         loader_ready = (
             calibration_manifest["loader_ready"] and index_closure["status"] == "passed"
@@ -1281,6 +1890,7 @@ def convert_checkpoint(
         identity = {
             "artifact_version": artifact_version,
             "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
             "source_model_id": source_model_id,
             "source_revision": source_revision,
             "source_index_sha256": source.index_sha256,
@@ -1294,6 +1904,7 @@ def convert_checkpoint(
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "artifact_version": artifact_version,
             "shared_expert_dtype": shared_expert_dtype,
+            "static_fp8_weight_format": weight_format,
             "artifact_id": _sha256_bytes(json.dumps(identity, sort_keys=True).encode()),
             "converter": {
                 "name": ("vllm_neuron.model.glm52_moe_dsa.checkpoint_converter"),
@@ -1324,16 +1935,10 @@ def convert_checkpoint(
                 "algorithm": "symmetric_per_tensor_absmax",
                 "source_dtype": "bfloat16",
                 "weight_dtype": "float8_e4m3fn",
-                "format": "OCP E4M3FN",
-                "qmax": _OCP_E4M3_MAX,
                 "scale_dtype": "float32",
                 "scale_shape": [],
                 "zero_tensor_scale": ZERO_TENSOR_SCALE,
-                "loader_compensation": {
-                    "weight_multiplier": _WEIGHT_DOWNSCALE,
-                    "scale_multiplier": _SCALE_COMPENSATION,
-                    "neuron_kernel_qmax": _NEURON_LEGACY_E4M3_MAX,
-                },
+                **static_fp8_manifest_contract(weight_format),
             },
             "calibration": calibration_manifest,
             "exclusions": {
@@ -1369,6 +1974,8 @@ def convert_checkpoint(
             "loader_validation": {
                 "loader_ready": loader_ready,
                 "required_artifact_version": artifact_version,
+                "required_static_fp8_weight_format": weight_format,
+                "required_static_weight_keys_sha256": _key_digest(target_keys),
                 "required_weight_scale_suffix": (STATIC_WEIGHT_SCALE_SUFFIX),
                 "required_weight_scale_shape": [],
                 "required_projection_input_scale_keys_sha256": (
@@ -1381,11 +1988,19 @@ def convert_checkpoint(
                 "ignored_prefixes": [MTP_IGNORED_PREFIX],
             },
         }
-        (staging_dir / MANIFEST_FILENAME).write_bytes(_json_bytes(manifest))
-        staging_dir.replace(output_dir)
+        generated_config = json.loads(
+            (publication_dir / "config.json").read_text(encoding="utf-8")
+        )
+        validate_static_fp8_artifact_metadata(manifest, generated_config)
+        (publication_dir / MANIFEST_FILENAME).write_bytes(_json_bytes(manifest))
+        publication_dir.replace(output_dir)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not explicit_work_dir:
+            shutil.rmtree(work_root, ignore_errors=True)
         return manifest
     except BaseException:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not explicit_work_dir:
+            shutil.rmtree(work_root, ignore_errors=True)
         raise
 
 
@@ -1425,6 +2040,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--download-staging-dir", type=Path)
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        help=(
+            "stable conversion state directory; preserved on failure and "
+            "required by --resume"
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a fail-closed conversion from --work-dir receipts",
+    )
     parser.add_argument("--world-size", type=_positive_int, default=64)
     parser.add_argument("--ep-degree", type=_positive_int, default=16)
     parser.add_argument(
@@ -1434,6 +2062,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "store and execute shared-expert projections in this dtype; "
             "bfloat16 creates the separately versioned hybrid artifact"
+        ),
+    )
+    parser.add_argument(
+        "--static-fp8-weight-format",
+        choices=(
+            OCP_E4M3FN_QMAX448,
+            NEURON_LEGACY_E4M3FN_QMAX240,
+        ),
+        default=OCP_E4M3FN_QMAX448,
+        help=(
+            "on-disk static-FP8 weight contract; direct legacy qmax240 "
+            "avoids the loader's second FP8 rounding"
         ),
     )
     parser.add_argument(
@@ -1458,10 +2098,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             or args.hf_streaming
             or args.download_staging_dir is not None
             or args.skip_index_closure
+            or args.work_dir is not None
+            or args.resume
         ):
             parser.error(
                 "--compile-stub cannot be combined with calibration, HF "
-                "streaming, download staging, or skipped closure"
+                "streaming, download staging, resume state, or skipped closure"
             )
         manifest = write_compile_stub(
             args.source_dir,
@@ -1471,6 +2113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             world_size=args.world_size,
             ep_degree=args.ep_degree,
             shared_expert_dtype=args.shared_expert_dtype,
+            static_fp8_weight_format=args.static_fp8_weight_format,
         )
     else:
         manifest = convert_checkpoint(
@@ -1487,6 +2130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             world_size=args.world_size,
             ep_degree=args.ep_degree,
             shared_expert_dtype=args.shared_expert_dtype,
+            static_fp8_weight_format=args.static_fp8_weight_format,
+            work_dir=args.work_dir,
+            resume=args.resume,
         )
     print(
         json.dumps(

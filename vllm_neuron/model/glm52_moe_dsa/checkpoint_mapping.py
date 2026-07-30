@@ -27,6 +27,15 @@ from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
 
 from .config import Glm52MoeDsaConfig
 from .parallelism import RoutedExpertPlan
+from .static_fp8 import (
+    NEURON_LEGACY_E4M3_MAX,
+    OCP_E4M3FN_QMAX448,
+    OCP_E4M3_MAX,
+    SCALE_COMPENSATION,
+    WEIGHT_DOWNSCALE,
+    prepare_static_fp8_weight,
+    static_fp8_scale_multiplier,
+)
 from .weight_manifest import iter_backbone_weight_specs
 
 if TYPE_CHECKING:
@@ -36,10 +45,10 @@ CheckpointSource = str | list[str]
 
 MTP_IGNORED_PREFIX = "model.layers.78."
 STATIC_WEIGHT_SCALE_SUFFIX = ".weight_scale"
-_OCP_E4M3_MAX = 448.0
-_NEURON_LEGACY_E4M3_MAX = 240.0
-_WEIGHT_DOWNSCALE = _NEURON_LEGACY_E4M3_MAX / _OCP_E4M3_MAX
-_SCALE_COMPENSATION = _OCP_E4M3_MAX / _NEURON_LEGACY_E4M3_MAX
+_OCP_E4M3_MAX = OCP_E4M3_MAX
+_NEURON_LEGACY_E4M3_MAX = NEURON_LEGACY_E4M3_MAX
+_WEIGHT_DOWNSCALE = WEIGHT_DOWNSCALE
+_SCALE_COMPENSATION = SCALE_COMPENSATION
 
 
 @dataclass(frozen=True)
@@ -210,14 +219,13 @@ def _read_scalar(slice_obj: "PySafeSlice") -> torch.Tensor:
     return scalar[0]
 
 
-def _to_neuron_legacy_fp8(weight: torch.Tensor) -> torch.Tensor:
-    """Convert ModelOpt OCP E4M3 values to the Trn2 kernel's 240 range."""
+def _to_neuron_legacy_fp8(
+    weight: torch.Tensor,
+    weight_format: str = OCP_E4M3FN_QMAX448,
+) -> torch.Tensor:
+    """Prepare declared on-disk FP8 values for the Trn2 qmax-240 kernel."""
 
-    return (
-        (weight.to(torch.float32) * _WEIGHT_DOWNSCALE)
-        .clamp(-_NEURON_LEGACY_E4M3_MAX, _NEURON_LEGACY_E4M3_MAX)
-        .to(torch.float8_e4m3fn)
-    )
+    return prepare_static_fp8_weight(weight, weight_format)
 
 
 def _expert_tp_bounds(plan: RoutedExpertPlan, rank: int) -> tuple[int, int]:
@@ -228,6 +236,8 @@ def _expert_tp_bounds(plan: RoutedExpertPlan, rank: int) -> tuple[int, int]:
 
 def routed_gate_up_weight_loader(
     plan: RoutedExpertPlan,
+    *,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     """Fuse separate ``[I,H]`` gate/up tensors into the qualified ABI."""
 
@@ -246,13 +256,18 @@ def routed_gate_up_weight_loader(
             gate = slices[offset][start:end, :]
             up = slices[offset + 1][start:end, :]
             experts.append(torch.stack((gate.T, up.T), dim=1))
-        return _to_neuron_legacy_fp8(torch.stack(experts, dim=0))
+        return _to_neuron_legacy_fp8(
+            torch.stack(experts, dim=0),
+            weight_format,
+        )
 
     return SafetensorsWeightLoader(transform=transform)
 
 
 def routed_down_weight_loader(
     plan: RoutedExpertPlan,
+    *,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     """Shard separate ``[H,I]`` down tensors into ``[E,I_rank,H]``."""
 
@@ -270,7 +285,8 @@ def routed_down_weight_loader(
             torch.stack(
                 [slice_obj[:, start:end].T for slice_obj in slices],
                 dim=0,
-            )
+            ),
+            weight_format,
         )
 
     return SafetensorsWeightLoader(transform=transform)
@@ -278,6 +294,8 @@ def routed_down_weight_loader(
 
 def routed_gate_up_scale_loader(
     plan: RoutedExpertPlan,
+    *,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     """Broadcast scalar gate/up dequant scales to kernel row scales."""
 
@@ -293,15 +311,12 @@ def routed_gate_up_scale_loader(
             )
         per_expert = []
         for offset in range(0, len(slices), 2):
-            pair = (
-                torch.stack(
-                    (
-                        _read_scalar(slices[offset]),
-                        _read_scalar(slices[offset + 1]),
-                    )
+            pair = torch.stack(
+                (
+                    _read_scalar(slices[offset]),
+                    _read_scalar(slices[offset + 1]),
                 )
-                * _SCALE_COMPENSATION
-            )
+            ) * static_fp8_scale_multiplier(weight_format)
             per_expert.append(pair[:, None].expand(2, plan.intermediate_per_rank))
         return torch.stack(per_expert, dim=0).contiguous()
 
@@ -312,6 +327,7 @@ def routed_down_scale_loader(
     plan: RoutedExpertPlan,
     *,
     hidden_size: int,
+    weight_format: str = OCP_E4M3FN_QMAX448,
 ) -> SafetensorsWeightLoader:
     """Broadcast scalar down dequant scales to ``[E_local,H]``."""
 
@@ -329,7 +345,7 @@ def routed_down_scale_loader(
             )
         scalars = (
             torch.stack([_read_scalar(slice_obj) for slice_obj in slices])
-            * _SCALE_COMPENSATION
+            * static_fp8_scale_multiplier(weight_format)
         )
         return scalars[:, None].expand(plan.experts_per_rank, hidden_size).contiguous()
 

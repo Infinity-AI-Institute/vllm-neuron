@@ -85,6 +85,7 @@ class Glm52DenseMlp(nn.Module):
                 num_shards=world_size,
                 pad_dim=1,
                 padded_size=self.kernel_intermediate_size,
+                weight_format=config.static_fp8_weight_format,
             )
             down_loader = _static_fp8_sharding_loader(
                 shard_dim=0,
@@ -92,20 +93,24 @@ class Glm52DenseMlp(nn.Module):
                 num_shards=world_size,
                 pad_dim=0,
                 padded_size=self.kernel_intermediate_size,
+                weight_format=config.static_fp8_weight_format,
             )
             self.gate_proj = _StaticFp8Projection(
                 (config.hidden_size, self.kernel_intermediate_size),
                 weight_loader=gate_up_loader,
+                weight_format=config.static_fp8_weight_format,
                 device=device,
             )
             self.up_proj = _StaticFp8Projection(
                 (config.hidden_size, self.kernel_intermediate_size),
                 weight_loader=gate_up_loader,
+                weight_format=config.static_fp8_weight_format,
                 device=device,
             )
             self.down_proj = _StaticFp8Projection(
                 (self.kernel_intermediate_size, config.hidden_size),
                 weight_loader=down_loader,
+                weight_format=config.static_fp8_weight_format,
                 device=device,
             )
             self.gate_up_input_scale = nn.Parameter(

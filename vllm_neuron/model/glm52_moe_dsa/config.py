@@ -10,6 +10,11 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
+from .static_fp8 import (
+    OCP_E4M3FN_QMAX448,
+    normalize_static_fp8_weight_format,
+)
+
 
 def _indexer_schedule(
     num_layers: int,
@@ -80,6 +85,7 @@ class Glm52MoeDsaConfig:
     n_routed_experts: int = 256
     n_shared_experts: int = 1
     shared_expert_dtype: str = "fp8"
+    static_fp8_weight_format: str = OCP_E4M3FN_QMAX448
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 2_048
     n_group: int = 1
@@ -128,6 +134,9 @@ class Glm52MoeDsaConfig:
             )
         if self.shared_expert_dtype not in ("fp8", "bfloat16"):
             raise ValueError("shared_expert_dtype must be either 'fp8' or 'bfloat16'")
+        self.static_fp8_weight_format = normalize_static_fp8_weight_format(
+            self.static_fp8_weight_format
+        )
         if self.scoring_func != "sigmoid" or self.topk_method != "noaux_tc":
             raise ValueError("GLM-5.2 requires sigmoid/noaux_tc expert routing")
         if not self.norm_topk_prob:

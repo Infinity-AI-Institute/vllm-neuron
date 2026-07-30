@@ -7,6 +7,10 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
 from vllm_neuron.model.glm52_moe_dsa.factory import GlmMoeDsaForCausalLM
+from vllm_neuron.model.glm52_moe_dsa.static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+    OCP_E4M3FN_QMAX448,
+)
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
@@ -15,7 +19,11 @@ def _hf_config() -> PretrainedConfig:
     values = {
         field: getattr(frozen, field)
         for field in frozen.__dataclass_fields__
-        if field not in ("neuron_config", "torch_dtype")
+        if field not in (
+            "neuron_config",
+            "static_fp8_weight_format",
+            "torch_dtype",
+        )
     }
     values.update(
         architectures=["GlmMoeDsaForCausalLM"],
@@ -73,6 +81,69 @@ def test_factory_accepts_explicit_bf16_shared_hybrid(monkeypatch) -> None:
     )
 
     GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
+def test_factory_accepts_explicit_direct_legacy_hybrid(monkeypatch) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    monkeypatch.setattr(
+        "vllm_neuron.model.glm52_moe_dsa.factory._get_tp_world_size",
+        lambda: 64,
+    )
+    config = _hf_config()
+    config.shared_expert_dtype = "bfloat16"
+    config.static_fp8_weight_format = NEURON_LEGACY_E4M3FN_QMAX240
+    config.glm52_artifact.update(
+        artifact_version=(
+            "glm52-trn2-static-fp8-direct-legacy-bf16-shared-v1"
+        ),
+        shared_expert_dtype="bfloat16",
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    config.quantization_config["quantization"].update(
+        weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    config.quantization_config["quantization"]["exclude_modules"].append(
+        "model.layers.*.mlp.shared_experts.*"
+    )
+
+    GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
+
+
+@pytest.mark.parametrize(
+    ("location", "value"),
+    (
+        ("top", OCP_E4M3FN_QMAX448),
+        ("artifact", OCP_E4M3FN_QMAX448),
+        ("quantization", OCP_E4M3FN_QMAX448),
+        ("missing_artifact", None),
+    ),
+)
+def test_factory_rejects_mixed_or_partial_direct_weight_format(
+    monkeypatch,
+    location: str,
+    value: str | None,
+) -> None:
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    config = _hf_config()
+    config.static_fp8_weight_format = NEURON_LEGACY_E4M3FN_QMAX240
+    config.glm52_artifact.update(
+        artifact_version="glm52-trn2-static-fp8-direct-legacy-v1",
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    config.quantization_config["quantization"]["weight_format"] = (
+        NEURON_LEGACY_E4M3FN_QMAX240
+    )
+    if location == "top":
+        config.static_fp8_weight_format = value
+    elif location == "artifact":
+        config.glm52_artifact["static_fp8_weight_format"] = value
+    elif location == "quantization":
+        config.quantization_config["quantization"]["weight_format"] = value
+    else:
+        config.glm52_artifact.pop("static_fp8_weight_format")
+
+    with pytest.raises(ValueError, match="static-FP8|mixed"):
+        GlmMoeDsaForCausalLM._validate_config(config, _neuron_config())
 
 
 def test_factory_rejects_hybrid_marker_without_bf16_exclusion(

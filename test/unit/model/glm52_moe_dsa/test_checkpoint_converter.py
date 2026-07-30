@@ -12,18 +12,22 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from vllm_neuron.model.glm52_moe_dsa import checkpoint_converter
 from vllm_neuron.model.glm52_moe_dsa.checkpoint_converter import (
     ARTIFACT_VERSION,
     BF16_SHARED_ARTIFACT_VERSION,
     COMPILE_CONSTANTS_FILENAME,
     COMPILE_STUB_MANIFEST_FILENAME,
+    DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION,
     INDEX_FILENAME,
     MANIFEST_FILENAME,
     convert_checkpoint,
+    quantize_bf16_per_tensor_direct_legacy,
     quantize_bf16_per_tensor_ocp,
     required_activation_scale_keys,
     required_cache_quant_multiplier_keys,
     required_loader_source_keys,
+    validate_static_fp8_artifact_metadata,
     validate_bf16_index_closure,
     write_compile_stub,
 )
@@ -33,6 +37,10 @@ from vllm_neuron.model.glm52_moe_dsa.checkpoint_mapping import (
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
 from vllm_neuron.model.glm52_moe_dsa.model import _Glm52CompileStubCheckpoint
 from vllm_neuron.model.glm52_moe_dsa.parallelism import RoutedExpertPlan
+from vllm_neuron.model.glm52_moe_dsa.static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+    OCP_E4M3FN_QMAX448,
+)
 
 
 TARGET = "model.layers.0.self_attn.q_a_proj.weight"
@@ -153,15 +161,67 @@ def _write_full_contract_metadata(root: Path) -> Path:
 
 
 def _convert(source: Path, output: Path, **kwargs):
+    source_revision = kwargs.pop(
+        "source_revision",
+        "b4734de4facf877f85769a911abafc5283eab3d9",
+    )
+    options = {
+        "strict_index_closure": False,
+        "max_shard_bytes": 16,
+        "quantization_chunk_elements": 2,
+    }
+    options.update(kwargs)
     return convert_checkpoint(
         source,
         output,
-        source_revision="b4734de4facf877f85769a911abafc5283eab3d9",
-        strict_index_closure=False,
-        max_shard_bytes=16,
-        quantization_chunk_elements=2,
-        **kwargs,
+        source_revision=source_revision,
+        **options,
     )
+
+
+def _interrupt_after_first_source_shard(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    output: Path,
+    work_dir: Path,
+    *,
+    static_fp8_weight_format: str = NEURON_LEGACY_E4M3FN_QMAX240,
+) -> None:
+    original = checkpoint_converter.quantize_bf16_per_tensor
+    calls = 0
+
+    def interrupt_on_second_quantized_weight(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("test interruption")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoint_converter,
+        "quantize_bf16_per_tensor",
+        interrupt_on_second_quantized_weight,
+    )
+    with pytest.raises(RuntimeError, match="test interruption"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            static_fp8_weight_format=static_fp8_weight_format,
+        )
+    monkeypatch.setattr(
+        checkpoint_converter,
+        "quantize_bf16_per_tensor",
+        original,
+    )
+
+
+def _artifact_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_compile_stub_is_metadata_only_and_never_loader_ready(
@@ -274,6 +334,28 @@ def test_quantization_is_deterministic_and_uses_ocp_range() -> None:
     assert first.float().abs().max().item() == 448.0
 
 
+def test_direct_legacy_quantization_uses_single_qmax240_rounding() -> None:
+    source = torch.tensor(
+        [[-4.0, -1.25, 0.0, 1.25, 4.0]],
+        dtype=torch.bfloat16,
+    )
+
+    quantized, scale = quantize_bf16_per_tensor_direct_legacy(
+        source,
+        chunk_elements=2,
+    )
+    expected_scale = torch.tensor(4.0 / 240.0, dtype=torch.float32)
+    expected = (
+        (source.to(torch.float32) / expected_scale)
+        .clamp(-240.0, 240.0)
+        .to(torch.float8_e4m3fn)
+    )
+
+    assert scale.item() == pytest.approx(expected_scale.item())
+    assert torch.equal(quantized.view(torch.uint8), expected.view(torch.uint8))
+    assert quantized.float().abs().max().item() == 240.0
+
+
 def test_conversion_excludes_mtp_and_emits_scalar_scales_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -311,6 +393,87 @@ def test_conversion_excludes_mtp_and_emits_scalar_scales_and_provenance(
     assert "lm_head" in quantization["quantization"]["exclude_modules"]
     assert not output_config["glm52_artifact"]["loader_ready"]
     assert output_config["dtype"] == "bfloat16"
+
+
+def test_direct_legacy_hybrid_conversion_marks_contract_and_preserves_shared_bf16(
+    tmp_path: Path,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    output = tmp_path / "output"
+
+    manifest = _convert(
+        source,
+        output,
+        shared_expert_dtype="bfloat16",
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    tensors = _load_output_tensors(output)
+    output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    source_target = torch.tensor(
+        [[-3.0, -1.0, 0.0], [0.5, 1.0, 3.0]],
+        dtype=torch.bfloat16,
+    )
+    expected_scale = torch.tensor(3.0 / 240.0, dtype=torch.float32)
+    expected_target = (
+        (source_target.to(torch.float32) / expected_scale)
+        .clamp(-240.0, 240.0)
+        .to(torch.float8_e4m3fn)
+    )
+
+    assert manifest["artifact_version"] == (DIRECT_LEGACY_BF16_SHARED_ARTIFACT_VERSION)
+    assert manifest["static_fp8_weight_format"] == NEURON_LEGACY_E4M3FN_QMAX240
+    assert manifest["quantization"]["qmax"] == 240.0
+    assert manifest["quantization"]["loader_compensation"] == {
+        "weight_multiplier": 1.0,
+        "scale_multiplier": 1.0,
+        "neuron_kernel_qmax": 240.0,
+    }
+    assert torch.equal(
+        tensors[TARGET].view(torch.uint8),
+        expected_target.view(torch.uint8),
+    )
+    assert tensors[f"{TARGET}_scale"].item() == pytest.approx(expected_scale.item())
+    assert tensors[SHARED_TARGET].dtype == torch.bfloat16
+    assert tensors[SHARED_UP_TARGET].dtype == torch.bfloat16
+    assert f"{SHARED_TARGET}_scale" not in tensors
+    assert f"{SHARED_UP_TARGET}_scale" not in tensors
+    assert output_config["static_fp8_weight_format"] == NEURON_LEGACY_E4M3FN_QMAX240
+    assert (
+        output_config["glm52_artifact"]["static_fp8_weight_format"]
+        == NEURON_LEGACY_E4M3FN_QMAX240
+    )
+    assert (
+        output_config["quantization_config"]["quantization"]["weight_format"]
+        == NEURON_LEGACY_E4M3FN_QMAX240
+    )
+    assert (
+        validate_static_fp8_artifact_metadata(manifest, output_config)
+        == NEURON_LEGACY_E4M3FN_QMAX240
+    )
+
+
+def test_artifact_metadata_rejects_mixed_or_undeclared_direct_format(
+    tmp_path: Path,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    output = tmp_path / "output"
+    manifest = _convert(
+        source,
+        output,
+        shared_expert_dtype="bfloat16",
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    output_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+
+    mixed = json.loads(json.dumps(output_config))
+    mixed["glm52_artifact"]["static_fp8_weight_format"] = OCP_E4M3FN_QMAX448
+    with pytest.raises(ValueError, match="mixed weight formats"):
+        validate_static_fp8_artifact_metadata(manifest, mixed)
+
+    undeclared = json.loads(json.dumps(output_config))
+    undeclared["quantization_config"]["quantization"].pop("weight_format")
+    with pytest.raises(ValueError, match="undeclared weight format"):
+        validate_static_fp8_artifact_metadata(manifest, undeclared)
 
 
 def test_hybrid_conversion_preserves_shared_expert_in_bf16(
@@ -377,6 +540,205 @@ def test_conversion_is_byte_deterministic_and_has_bounded_output_buffer(
         bounds["largest_output_group_bytes"],
     )
     assert len(first_manifest["output"]["shards"]) > 1
+
+
+def test_direct_conversion_resumes_to_byte_identical_clean_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    clean = tmp_path / "clean"
+    resumed = tmp_path / "resumed"
+    work_dir = tmp_path / "resume-work"
+    _convert(
+        source,
+        clean,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    _interrupt_after_first_source_shard(
+        monkeypatch,
+        source,
+        resumed,
+        work_dir,
+    )
+
+    _convert(
+        source,
+        resumed,
+        work_dir=work_dir,
+        resume=True,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+
+    assert _artifact_bytes(resumed) == _artifact_bytes(clean)
+    assert not (work_dir / "artifact").exists()
+
+
+def test_resume_rolls_back_contiguous_unreceipted_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    clean = tmp_path / "clean"
+    output = tmp_path / "output"
+    work_dir = tmp_path / "resume-work"
+    _convert(
+        source,
+        clean,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    original_add = checkpoint_converter._StreamingShardWriter.add
+    calls = 0
+
+    def interrupt_after_unreceipted_flush(self, tensors):
+        nonlocal calls
+        calls += 1
+        original_add(self, tensors)
+        if calls == 4:
+            raise RuntimeError("mid-shard interruption")
+
+    monkeypatch.setattr(
+        checkpoint_converter._StreamingShardWriter,
+        "add",
+        interrupt_after_unreceipted_flush,
+    )
+    with pytest.raises(RuntimeError, match="mid-shard interruption"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        )
+    monkeypatch.setattr(
+        checkpoint_converter._StreamingShardWriter,
+        "add",
+        original_add,
+    )
+
+    _convert(
+        source,
+        output,
+        work_dir=work_dir,
+        resume=True,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    assert _artifact_bytes(output) == _artifact_bytes(clean)
+
+
+def test_resume_rebuilds_interrupted_hardlink_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    clean = tmp_path / "clean"
+    output = tmp_path / "output"
+    work_dir = tmp_path / "resume-work"
+    _convert(
+        source,
+        clean,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    original_link = checkpoint_converter.os.link
+    links = 0
+
+    def interrupt_second_link(source_path, destination_path):
+        nonlocal links
+        links += 1
+        if links == 2:
+            raise RuntimeError("publication interruption")
+        return original_link(source_path, destination_path)
+
+    monkeypatch.setattr(checkpoint_converter.os, "link", interrupt_second_link)
+    with pytest.raises(RuntimeError, match="publication interruption"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        )
+    monkeypatch.setattr(checkpoint_converter.os, "link", original_link)
+
+    _convert(
+        source,
+        output,
+        work_dir=work_dir,
+        resume=True,
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    assert _artifact_bytes(output) == _artifact_bytes(clean)
+
+
+def test_resume_rejects_corrupted_receipt_and_output_part(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    output = tmp_path / "output"
+    work_dir = tmp_path / "resume-work"
+    _interrupt_after_first_source_shard(
+        monkeypatch,
+        source,
+        output,
+        work_dir,
+    )
+    part = next((work_dir / "artifact").glob(".part-*.safetensors"))
+    contents = bytearray(part.read_bytes())
+    contents[-1] ^= 1
+    part.write_bytes(contents)
+    with pytest.raises(ValueError, match="checksum changed"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            resume=True,
+            static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        )
+
+    part.write_bytes(bytes(contents[:-1]) + bytes([contents[-1] ^ 1]))
+    receipt = work_dir / "receipts" / "source-00001.json"
+    receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+    receipt_data["state"]["stats"]["output_tensor_count"] += 1
+    receipt.write_text(json.dumps(receipt_data), encoding="utf-8")
+    with pytest.raises(ValueError, match="receipt checksum"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            resume=True,
+            static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        )
+
+
+def test_resume_identity_rejects_fp8_format_and_revision_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path / "source")
+    output = tmp_path / "output"
+    work_dir = tmp_path / "resume-work"
+    _interrupt_after_first_source_shard(
+        monkeypatch,
+        source,
+        output,
+        work_dir,
+    )
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            resume=True,
+            static_fp8_weight_format=OCP_E4M3FN_QMAX448,
+        )
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _convert(
+            source,
+            output,
+            work_dir=work_dir,
+            resume=True,
+            source_revision="0123456789abcdef0123456789abcdef01234567",
+            static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+        )
 
 
 def _small_config() -> Glm52MoeDsaConfig:

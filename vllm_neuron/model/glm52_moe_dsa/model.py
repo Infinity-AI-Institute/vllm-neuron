@@ -22,6 +22,7 @@ from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
 )
 
+from .artifact_preflight import preflight_checkpoint_artifact
 from .cache_layout import Glm52CacheLayout
 from .checkpoint_mapping import build_checkpoint_contract
 from .config import Glm52MoeDsaConfig
@@ -673,6 +674,11 @@ class Glm52MoeDsaForCausalLM(nn.Module):
                 "a GLM-5.2 compile stub contains no serving weights and "
                 "cannot be loaded for execution"
             )
+        preflight_checkpoint_artifact(
+            checkpoint_path,
+            expected_weight_format=self.config.static_fp8_weight_format,
+            expected_shared_expert_dtype=self.config.shared_expert_dtype,
+        )
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         contract = build_checkpoint_contract(
             self.config,
@@ -700,6 +706,11 @@ class Glm52MoeDsaForCausalLM(nn.Module):
         if _is_compile_stub_directory(checkpoint_path):
             checkpoint = _Glm52CompileStubCheckpoint(checkpoint_path)
         else:
+            preflight_checkpoint_artifact(
+                checkpoint_path,
+                expected_weight_format=self.config.static_fp8_weight_format,
+                expected_shared_expert_dtype=self.config.shared_expert_dtype,
+            )
             checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         contract = build_checkpoint_contract(
             self.config,

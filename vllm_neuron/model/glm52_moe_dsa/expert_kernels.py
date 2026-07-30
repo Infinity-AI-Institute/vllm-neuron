@@ -125,19 +125,32 @@ class Glm52RoutedExperts(nn.Module):
 
         set_weight_loader(
             self.gate_up_proj,
-            routed_gate_up_weight_loader(plan),
+            routed_gate_up_weight_loader(
+                plan,
+                weight_format=config.static_fp8_weight_format,
+            ),
         )
         set_weight_loader(
             self.down_proj,
-            routed_down_weight_loader(plan),
+            routed_down_weight_loader(
+                plan,
+                weight_format=config.static_fp8_weight_format,
+            ),
         )
         set_weight_loader(
             self.gate_up_proj_scale,
-            routed_gate_up_scale_loader(plan),
+            routed_gate_up_scale_loader(
+                plan,
+                weight_format=config.static_fp8_weight_format,
+            ),
         )
         set_weight_loader(
             self.down_proj_scale,
-            routed_down_scale_loader(plan, hidden_size=config.hidden_size),
+            routed_down_scale_loader(
+                plan,
+                hidden_size=config.hidden_size,
+                weight_format=config.static_fp8_weight_format,
+            ),
         )
 
     def forward_decode(

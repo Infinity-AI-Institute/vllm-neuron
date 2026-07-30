@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from vllm_neuron.model.glm52_moe_dsa.config import Glm52MoeDsaConfig
+from vllm_neuron.model.glm52_moe_dsa.static_fp8 import (
+    NEURON_LEGACY_E4M3FN_QMAX240,
+)
 
 
 def test_frozen_glm52_geometry() -> None:
@@ -48,6 +51,24 @@ def test_frozen_glm52_geometry() -> None:
     assert config.mlp_layer_types[3:] == ("sparse",) * 75
 
 
+def test_static_fp8_weight_format_does_not_change_graph_geometry() -> None:
+    original = Glm52MoeDsaConfig()
+    direct = Glm52MoeDsaConfig(
+        static_fp8_weight_format=NEURON_LEGACY_E4M3FN_QMAX240,
+    )
+    ignored = {"static_fp8_weight_format", "neuron_config"}
+
+    assert {
+        field: getattr(original, field)
+        for field in original.__dataclass_fields__
+        if field not in ignored
+    } == {
+        field: getattr(direct, field)
+        for field in direct.__dataclass_fields__
+        if field not in ignored
+    }
+
+
 def test_from_frozen_hf_shape(tmp_path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -66,6 +87,18 @@ def test_from_frozen_hf_shape(tmp_path) -> None:
 
     assert config.torch_dtype is torch.bfloat16
     assert config.full_indexer_layer_ids[-1] == 74
+
+
+def test_from_configs_reads_explicit_direct_weight_format() -> None:
+    config = Glm52MoeDsaConfig.from_configs(
+        {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "static_fp8_weight_format": NEURON_LEGACY_E4M3FN_QMAX240,
+        },
+        None,
+    )
+
+    assert config.static_fp8_weight_format == NEURON_LEGACY_E4M3FN_QMAX240
 
 
 def test_rejects_wrong_router_semantics() -> None:
