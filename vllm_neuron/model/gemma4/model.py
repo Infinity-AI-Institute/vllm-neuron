@@ -200,6 +200,18 @@ class Gemma4WeightMapper:
     def is_expert_weight(cls, name: str) -> bool:
         return ".moe.experts." in cls.map_name(name)
 
+    @classmethod
+    def loader_kind(cls, name: str) -> str:
+        """Classify a parameter for the native TP/EP loader policy."""
+        mapped = cls.map_name(name)
+        if cls.is_expert_weight(mapped):
+            return "expert-local"
+        if any(token in mapped for token in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "gate_proj.weight", "up_proj.weight")):
+            return "column"
+        if any(token in mapped for token in ("o_proj.weight", "down_proj.weight")):
+            return "row"
+        return "replicated"
+
 
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):

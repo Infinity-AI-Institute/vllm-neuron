@@ -122,3 +122,7 @@ def test_weight_mapper_preserves_expert_indices():
     assert mapped == "layers.7.moe.experts.12.down_proj.weight"
     assert Gemma4WeightMapper.is_expert_weight(name)
     assert not Gemma4WeightMapper.is_expert_weight("model.layers.7.self_attn.q_proj.weight")
+    assert Gemma4WeightMapper.loader_kind("model.layers.7.self_attn.q_proj.weight") == "column"
+    assert Gemma4WeightMapper.loader_kind("model.layers.7.self_attn.o_proj.weight") == "row"
+    assert Gemma4WeightMapper.loader_kind(name) == "expert-local"
+    assert Gemma4WeightMapper.loader_kind("model.layers.7.input_layernorm.weight") == "replicated"
