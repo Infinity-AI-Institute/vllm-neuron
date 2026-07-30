@@ -212,6 +212,24 @@ class Gemma4WeightMapper:
             return "row"
         return "replicated"
 
+    @classmethod
+    def make_loader(cls, name: str, shard_size: int, tp_size: int):
+        """Build the vLLM-Neuron safetensors loader for a parameter role."""
+        from vllm_neuron.utils.weight_loader import (
+            SafetensorsWeightLoader,
+            sharding_weight_loader,
+        )
+
+        role = cls.loader_kind(name)
+        if role == "column":
+            return sharding_weight_loader(0, shard_size, tp_size)
+        if role == "row":
+            return sharding_weight_loader(1, shard_size, tp_size)
+        # Expert-local weights are selected by the EP layer; the loader must
+        # not apply TP slicing a second time. Replicated parameters are copied
+        # unchanged to every rank.
+        return SafetensorsWeightLoader()
+
 
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):

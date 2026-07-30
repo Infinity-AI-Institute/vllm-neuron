@@ -126,3 +126,5 @@ def test_weight_mapper_preserves_expert_indices():
     assert Gemma4WeightMapper.loader_kind("model.layers.7.self_attn.o_proj.weight") == "row"
     assert Gemma4WeightMapper.loader_kind(name) == "expert-local"
     assert Gemma4WeightMapper.loader_kind("model.layers.7.input_layernorm.weight") == "replicated"
+    assert Gemma4WeightMapper.make_loader("q_proj.weight", 8, 4).__class__.__name__ == "SafetensorsWeightLoader"
+    assert Gemma4WeightMapper.make_loader("o_proj.weight", 8, 4).__class__.__name__ == "SafetensorsWeightLoader"
