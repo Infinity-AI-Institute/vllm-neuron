@@ -6,6 +6,7 @@ registries or architecture-rewrite shims.
 """
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -379,7 +380,13 @@ class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        raise NotImplementedError(
-            "Gemma4 native vLLM-Neuron layers are not implemented yet; "
-            "use the committed serving baseline while this port is developed."
-        )
+        if os.environ.get("VLLM_NEURON_GEMMA4_REFERENCE") == "1":
+            self._reference = Gemma4ReferenceTextModel(config)
+        else:
+            raise NotImplementedError(
+                "Gemma4 Neuron kernels are not implemented yet; enable "
+                "VLLM_NEURON_GEMMA4_REFERENCE=1 only for CPU seam tests."
+            )
+
+    def forward(self, *args, **kwargs):
+        return self._reference(*args, **kwargs)
