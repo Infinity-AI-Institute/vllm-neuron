@@ -39,6 +39,14 @@ SO_DISABLED_MESSAGE = (
 )
 
 
+def _uses_vision_config(model_config) -> bool:
+    """Return whether platform setup should create Neuron vision buckets."""
+    return bool(
+        model_config.is_multimodal_model
+        and hasattr(model_config.hf_config, "vision_config")
+    )
+
+
 # Relax DCP config validation for prefill-side DCP where TP <= num_kv_heads.
 # Upstream asserts TP > num_kv_heads when DCP is enabled, but prefill DCP
 # with apply_prefill_dcp=True shards attention across the DCP sub-group, not full TP.
@@ -354,7 +362,12 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Some checkpoints (for example Gemma 4) expose a multimodal outer
+        # config while a deployment deliberately selects the registered
+        # text-only architecture through ``hf_overrides``.  The presence of
+        # ``vision_config`` alone must not opt that text model into vision
+        # compilation and encoder-cache scheduling.
+        if _uses_vision_config(model_config):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute per-image embed limit for request validation.

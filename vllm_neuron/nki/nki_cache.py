@@ -8,6 +8,7 @@ Storage: JSON files in {cache_dir}/nki/{key}.json
 Multi-process safety: filelock.FileLock per cache key
 """
 
+import base64
 import errno
 import hashlib
 import inspect
@@ -32,8 +33,9 @@ from .nki_dtype import str_to_torch_dtype
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 0
+_SCHEMA_VERSION = 1
 _NKI_CACHE_SUBDIR = "nki"
+_NKI_BINARY_SUBDIR = "binaries"
 _LOCK_TIMEOUT = 300  # seconds
 
 
@@ -111,17 +113,20 @@ def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
 
     local_path = os.path.join(local_dir, f"{cache_key}.json")
     tmp_path = f"{local_path}.tmp.{os.getpid()}"
+    cached_result, kernel_binary = _persist_kernel_binary(cache_key, result, local_dir)
 
     data = {
         "schema_version": _SCHEMA_VERSION,
-        "dumped_config": result.dumped_config,
+        "dumped_config": cached_result.dumped_config,
         "return_types": [
-            [str(dtype), list(shape)] for dtype, shape in result.return_types
+            [str(dtype), list(shape)] for dtype, shape in cached_result.return_types
         ],
         "operand_output_aliases": {
-            str(k): v for k, v in result.operand_output_aliases.items()
+            str(k): v for k, v in cached_result.operand_output_aliases.items()
         },
     }
+    if kernel_binary is not None:
+        data["kernel_binary"] = kernel_binary
 
     try:
         with open(tmp_path, "w") as f:
@@ -334,6 +339,33 @@ def _read_cache_file(path: str) -> Optional[NKICompileResult]:
         if data.get("schema_version") != _SCHEMA_VERSION:
             return None
 
+        dumped_config = data["dumped_config"]
+        kernel_binary = data.get("kernel_binary")
+        if kernel_binary is not None:
+            binary_path = os.path.abspath(
+                os.path.join(os.path.dirname(path), kernel_binary)
+            )
+            if not os.path.isfile(binary_path):
+                logger.debug(
+                    "NKI cache entry %s references missing kernel binary %s",
+                    path,
+                    binary_path,
+                )
+                return None
+            dumped_config = _replace_kernel_binary_path(dumped_config, binary_path)
+        else:
+            # Entries produced without a materialized binary are valid only
+            # while their backend-config path still exists. This also makes
+            # stale schema-v1 entries fail closed if a copy was interrupted.
+            binary_path = _kernel_binary_path(dumped_config)
+            if binary_path is not None and not os.path.isfile(binary_path):
+                logger.debug(
+                    "NKI cache entry %s references missing kernel binary %s",
+                    path,
+                    binary_path,
+                )
+                return None
+
         return_types = tuple(
             (str_to_torch_dtype(dtype_str), tuple(shape))
             for dtype_str, shape in data["return_types"]
@@ -344,13 +376,99 @@ def _read_cache_file(path: str) -> Optional[NKICompileResult]:
         }
 
         return NKICompileResult(
-            dumped_config=data["dumped_config"],
+            dumped_config=dumped_config,
             return_types=return_types,
             operand_output_aliases=operand_output_aliases,
         )
     except (json.JSONDecodeError, KeyError, OSError, ValueError) as e:
         logger.debug("Failed to read NKI cache file %s: %s", path, e)
         return None
+
+
+def _decode_backend_config(dumped_config: str) -> dict[str, Any]:
+    payload = base64.b64decode(dumped_config.encode("ascii"), validate=True)
+    config = json.loads(payload.decode("utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("NKI backend config must be a JSON object")
+    return config
+
+
+def _encode_backend_config(config: dict[str, Any]) -> str:
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
+
+
+def _kernel_binary_path(dumped_config: str) -> Optional[str]:
+    """Return the BIR/KLIR file referenced by an NKI backend config."""
+    try:
+        config = _decode_backend_config(dumped_config)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    klir_binary = config.get("klir_binary")
+    if not isinstance(klir_binary, dict):
+        return None
+    binary_path = klir_binary.get("binary")
+    return binary_path if isinstance(binary_path, str) else None
+
+
+def _replace_kernel_binary_path(dumped_config: str, binary_path: str) -> str:
+    config = _decode_backend_config(dumped_config)
+    klir_binary = config.get("klir_binary")
+    if not isinstance(klir_binary, dict):
+        raise ValueError("NKI backend config has no klir_binary object")
+    klir_binary["binary"] = binary_path
+    return _encode_backend_config(config)
+
+
+def _persist_kernel_binary(
+    cache_key: str,
+    result: NKICompileResult,
+    local_dir: str,
+) -> tuple[NKICompileResult, Optional[str]]:
+    """Copy the ephemeral NKI binary into the persistent compile cache.
+
+    ``CompileKernel`` emits backend config that names a file below
+    ``/var/tmp/nki-intermediate-cache``. Persisting only the base64 config
+    makes an HLO cache hit unusable after its container exits. Store the
+    referenced file with the cache record and make the record relocatable.
+    """
+    source = _kernel_binary_path(result.dumped_config)
+    if source is None or not os.path.isfile(source):
+        if source is not None:
+            logger.warning(
+                "NKI kernel binary does not exist while caching %s: %s",
+                cache_key,
+                source,
+            )
+        return result, None
+
+    extension = os.path.splitext(source)[1] or ".bin"
+    relative_path = os.path.join(_NKI_BINARY_SUBDIR, f"{cache_key}{extension}")
+    destination = os.path.join(local_dir, relative_path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    tmp_destination = f"{destination}.tmp.{os.getpid()}"
+    try:
+        shutil.copy2(source, tmp_destination)
+        os.replace(tmp_destination, destination)
+        persisted = NKICompileResult(
+            dumped_config=_replace_kernel_binary_path(
+                result.dumped_config, os.path.abspath(destination)
+            ),
+            return_types=result.return_types,
+            operand_output_aliases=result.operand_output_aliases,
+        )
+        return persisted, relative_path
+    except OSError as error:
+        logger.warning(
+            "Failed to persist NKI kernel binary for %s: %s",
+            cache_key,
+            error,
+        )
+        try:
+            os.unlink(tmp_destination)
+        except OSError:
+            pass
+        return result, None
 
 
 def _copy_to_local(remote_path: str, local_path: str) -> None:

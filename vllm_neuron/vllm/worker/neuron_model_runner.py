@@ -105,6 +105,36 @@ def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
     )
 
 
+_CPU_SAMPLING_TENSOR_FIELDS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "prompt_token_ids",
+    "frequency_penalties",
+    "presence_penalties",
+    "repetition_penalties",
+    "allowed_token_ids_mask",
+)
+
+
+def _copy_sampling_metadata_to_cpu(sampling_metadata: Any) -> Any:
+    """Return host-sampling metadata whose tensor fields live on CPU.
+
+    ``InputBatch`` is device-backed because its block tables and model inputs
+    are consumed by Neuron. Its sampling metadata consequently contains
+    Neuron tensors as well. The ordinary vLLM sampler is the explicit CPU
+    fallback when ``on_device_sampling_config`` is unset, so both its logits
+    and every tensor-valued sampling parameter must cross that boundary
+    together.
+    """
+    cpu_metadata = copy(sampling_metadata)
+    for field in _CPU_SAMPLING_TENSOR_FIELDS:
+        value = getattr(cpu_metadata, field, None)
+        if torch.is_tensor(value):
+            setattr(cpu_metadata, field, value.cpu())
+    return cpu_metadata
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -1883,7 +1913,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                generator_device = (
+                    self.device if self.on_device_sampling else torch.device("cpu")
+                )
+                generator = torch.Generator(device=generator_device)
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
@@ -7266,9 +7299,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if spec_decode_metadata is None:
             if not self.on_device_sampling:
                 logger.info("Using vLLM Sampler")
+                logits_cpu = model_output_tensor.cpu()
+                sampling_metadata_cpu = _copy_sampling_metadata_to_cpu(
+                    sampling_metadata
+                )
                 sampler_output = self.sampler(
-                    logits=model_output_tensor,
-                    sampling_metadata=sampling_metadata,
+                    logits=logits_cpu,
+                    sampling_metadata=sampling_metadata_cpu,
                 )
             else:
                 output_token_ids = [[x] for x in model_output_tensor.tolist()]
