@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import logging
 import os
 import threading
@@ -55,6 +56,15 @@ class _CheckpointSource(ABC):
         """Return full file path of file."""
         pass
 
+    def contains_tensor(self, file_name: str, tensor_name: str) -> bool:
+        """Return whether ``file_name`` is the canonical source for a tensor.
+
+        Sources without an index accept every tensor found in every file.
+        Indexed sources override this so duplicate or stale shards cannot
+        silently replace the tensor selected by the checkpoint index.
+        """
+        return True
+
 
 class _LocalCheckpointSource(_CheckpointSource):
     """
@@ -67,9 +77,56 @@ class _LocalCheckpointSource(_CheckpointSource):
 
     def __init__(self, checkpoint_dir: str, file_extension: str):
         self._file_dir = checkpoint_dir
-        self._file_names = sorted(
-            f for f in os.listdir(checkpoint_dir) if f.endswith(file_extension)
-        )
+        self._tensor_name_to_file_name: dict[str, str] | None = None
+
+        index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+        if file_extension == ".safetensors" and os.path.isfile(index_path):
+            with open(index_path, encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError(
+                    f"Invalid safetensors index without a weight_map: {index_path}"
+                )
+            if not all(
+                isinstance(name, str) and isinstance(file_name, str)
+                for name, file_name in weight_map.items()
+            ):
+                raise ValueError(
+                    f"Invalid non-string safetensors weight_map entry: {index_path}"
+                )
+            unsafe_file_names = sorted(
+                {
+                    file_name
+                    for file_name in weight_map.values()
+                    if file_name != os.path.basename(file_name)
+                    or "\\" in file_name
+                    or not file_name.endswith(file_extension)
+                    or os.path.isabs(file_name)
+                }
+            )
+            if unsafe_file_names:
+                raise ValueError(
+                    "Safetensors index references unsafe or non-safetensors "
+                    f"paths: {unsafe_file_names}"
+                )
+
+            self._tensor_name_to_file_name = weight_map
+            self._file_names = sorted(set(weight_map.values()))
+            missing_files = [
+                file_name
+                for file_name in self._file_names
+                if not os.path.isfile(os.path.join(checkpoint_dir, file_name))
+            ]
+            if missing_files:
+                raise FileNotFoundError(
+                    "Safetensors index references missing files: "
+                    + ", ".join(missing_files)
+                )
+        else:
+            self._file_names = sorted(
+                f for f in os.listdir(checkpoint_dir) if f.endswith(file_extension)
+            )
 
     def get_file_names(self) -> list[str]:
         """Return sorted list of filenames in the checkpoint directory."""
@@ -82,6 +139,11 @@ class _LocalCheckpointSource(_CheckpointSource):
     def get_file_path(self, file_name: str) -> str:
         """Return the absolute path to the specified file."""
         return os.path.join(self._file_dir, file_name)
+
+    def contains_tensor(self, file_name: str, tensor_name: str) -> bool:
+        if self._tensor_name_to_file_name is None:
+            return True
+        return self._tensor_name_to_file_name.get(tensor_name) == file_name
 
 
 class _HFCheckpointSource(_CheckpointSource):
@@ -224,7 +286,8 @@ class SafetensorsCheckpoint:
                 file_path, framework="pt", device="cpu"
             )
             for key in self._open_safetensor_files[file_path].keys():
-                self._tensor_name_to_file[key] = file_path
+                if self._source.contains_tensor(file_name, key):
+                    self._tensor_name_to_file[key] = file_path
 
         # Collect all checkpoint keys referenced by mappings for unexpected_keys calc
         referenced_checkpoint_keys: set[str] = set()
@@ -394,7 +457,8 @@ class SafetensorsCheckpoint:
                             file_path, framework="pt", device="cpu"
                         )
                         for key in self._open_safetensor_files[file_path].keys():
-                            self._tensor_name_to_file[key] = file_path
+                            if self._source.contains_tensor(file_name, key):
+                                self._tensor_name_to_file[key] = file_path
 
                 all_files_are_processed = len(processed_files) == self.get_num_files()
 
@@ -640,7 +704,8 @@ class SafetensorsCheckpoint:
                     file_path, framework="pt", device="cpu"
                 )
                 for key in self._open_safetensor_files[file_path].keys():
-                    self._tensor_name_to_file[key] = file_path
+                    if self._source.contains_tensor(file_name, key):
+                        self._tensor_name_to_file[key] = file_path
 
     def get_tensor_names(self) -> set[str]:
         """Return the set of tensor names available in the checkpoint."""
