@@ -132,6 +132,43 @@ class Gemma4ReferenceAttention(nn.Module):
         return torch.einsum("hts,shd->thd", probs, value)
 
 
+class Gemma4ReferenceMoE(nn.Module):
+    """CPU oracle for Gemma 4 top-k router dispatch and expert combine."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int, top_k: int):
+        super().__init__()
+        if top_k < 1 or top_k > num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(hidden_size, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(hidden_size, intermediate_size, bias=False),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(intermediate_size, hidden_size, bias=False),
+            )
+            for _ in range(num_experts)
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        original_shape = hidden_states.shape
+        flat = hidden_states.reshape(-1, self.hidden_size)
+        router_logits = self.router(flat).float()
+        weights, indices = torch.topk(router_logits, self.top_k, dim=-1)
+        weights = torch.softmax(weights, dim=-1).to(flat.dtype)
+        output = torch.zeros_like(flat)
+        for expert_id, expert in enumerate(self.experts):
+            token_rows, choices = torch.where(indices == expert_id)
+            if token_rows.numel() == 0:
+                continue
+            expert_output = expert(flat.index_select(0, token_rows))
+            output.index_add_(0, token_rows, expert_output * weights[token_rows, choices].unsqueeze(-1))
+        return output.reshape(original_shape)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()

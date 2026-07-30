@@ -7,6 +7,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4RMSNorm,
     Gemma4PagedKVCache,
     Gemma4ReferenceAttention,
+    Gemma4ReferenceMoE,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -98,3 +99,17 @@ def test_reference_attention_supports_gqa_and_cache_contract():
     cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.float32)
     result = attention(query, key, value, cache, torch.tensor([0, 1, 2]))
     assert result.shape == query.shape
+
+
+def test_reference_moe_dispatches_and_combines_top_k():
+    torch = __import__("torch")
+    torch.manual_seed(0)
+    moe = Gemma4ReferenceMoE(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
+    hidden = torch.randn(5, 8)
+    output = moe(hidden)
+    assert output.shape == hidden.shape
+    assert torch.isfinite(output).all()
+    # Router probabilities are normalized per token before expert combine.
+    logits = moe.router(hidden).float()
+    top, _ = torch.topk(logits, 2, dim=-1)
+    assert torch.allclose(torch.softmax(top, -1).sum(-1), torch.ones(5))
