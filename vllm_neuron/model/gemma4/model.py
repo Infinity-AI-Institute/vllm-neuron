@@ -11,11 +11,13 @@ import torch
 import torch.nn as nn
 
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 
 from .config import Gemma4Config
+from .weights import Gemma4WeightMapper
 
 
-class Gemma4MoeModel(nn.Module):
+class Gemma4ForCausalLM(nn.Module):
     """Native Gemma 4 causal-LM interface.
 
     The production Neuron layer implementation is still in development.  The
@@ -53,7 +55,6 @@ class Gemma4MoeModel(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         del (
-            positions,
             inputs_embeds,
             is_token_ids,
             attn_metadata,
@@ -63,7 +64,11 @@ class Gemma4MoeModel(nn.Module):
             rank,
             kwargs,
         )
-        return self._reference(input_ids, sampling_positions=sampling_positions)
+        return self._reference(
+            input_ids,
+            sampling_positions=sampling_positions,
+            position_ids=positions,
+        )
 
     def get_kv_spec(self) -> KVSpec:
         layers = []
@@ -100,7 +105,27 @@ class Gemma4MoeModel(nn.Module):
     def load_weights(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
     ) -> None:
-        del checkpoint_path, device, cache_dir
-        raise NotImplementedError(
-            "Gemma 4 native safetensors loading is not implemented yet."
+        if not hasattr(self, "_reference"):
+            raise NotImplementedError(
+                "Gemma 4 production Neuron parameter storage is not "
+                "implemented yet."
+            )
+        # The CPU oracle intentionally uses the simple loader: it is a TP1
+        # correctness seam and does not require a distributed Store.  The
+        # production model will use load_sharded_pipelined once its TP/EP
+        # parameter storage is present.
+        mappings = Gemma4WeightMapper.build_mappings(
+            (name for name, _ in self.named_parameters()),
+            tied_lm_head=self.config.tie_word_embeddings,
         )
+        checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
+        result = checkpoint.load_sharded(
+            rank=0,
+            world_size=1,
+            model=self,
+            mappings=mappings,
+            device=device,
+            strict=True,
+        )
+        self.load_state_dict(result.state_dict, strict=False, assign=True)
+        self._last_checkpoint_load_result = result

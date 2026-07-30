@@ -8,7 +8,6 @@ from vllm_neuron.model.gemma4.reference import (
     Gemma4PagedKVCache,
     Gemma4ReferenceAttention,
     Gemma4ReferenceMoE,
-    Gemma4WeightMapper,
     Gemma4Linear,
     Gemma4ReferenceAttentionBlock,
     Gemma4ReferenceDecoderLayer,
@@ -18,35 +17,64 @@ from vllm_neuron.model.gemma4.reference import (
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
+from vllm_neuron.model.gemma4.weights import Gemma4WeightMapper
 from vllm_neuron.model.registry import get_models
-from vllm_neuron.model.gemma4.factory import Gemma4MoeForCausalLM
+from vllm_neuron.model.gemma4.factory import Gemma4ForCausalLM
 
 
 def test_gemma4_is_registered():
     names = {name for name, _ in get_models()}
-    assert "Gemma4MoeForCausalLM" in names
+    assert "Gemma4ForCausalLM" in names
+    assert "Gemma4ForConditionalGeneration" in names
 
 
 def test_nested_text_config_is_parsed():
     config = SimpleNamespace(
         text_config=SimpleNamespace(
-            hidden_size=512,
-            intermediate_size=1024,
-            num_hidden_layers=4,
-            num_attention_heads=8,
-            num_key_value_heads=2,
-            head_dim=64,
-            vocab_size=1000,
+            hidden_size=2816,
+            intermediate_size=2112,
+            moe_intermediate_size=704,
+            num_hidden_layers=30,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=256,
+            global_head_dim=512,
+            num_global_key_value_heads=2,
+            num_experts=128,
+            top_k_experts=8,
+            enable_moe_block=True,
+            vocab_size=262144,
+            dtype="bfloat16",
         )
     )
     # The production HF config supplies to_dict(); this test uses the same
     # nested shape without importing Transformers model classes.
     config.to_dict = lambda: {"text_config": config.text_config.__dict__}
     parsed = Gemma4Config.from_configs(config)
-    assert parsed.hidden_size == 512
-    assert parsed.num_key_value_heads == 2
-    assert parsed.head_dim == 64
-    assert parsed.vocab_size == 1000
+    assert parsed.hidden_size == 2816
+    assert parsed.intermediate_size == 2112
+    assert parsed.moe_intermediate_size == 704
+    assert parsed.num_key_value_heads == 8
+    assert parsed.head_dim == 256
+    assert parsed.global_head_dim == 512
+    assert parsed.num_global_key_value_heads == 2
+    assert parsed.num_experts == 128
+    assert parsed.top_k_experts == 8
+    assert parsed.vocab_size == 262144
+    assert parsed.torch_dtype == __import__("torch").bfloat16
+
+
+def test_real_26b_a4b_architecture_defaults():
+    config = Gemma4Config()
+    assert config.hidden_size == 2816
+    assert config.intermediate_size == 2112
+    assert config.moe_intermediate_size == 704
+    assert config.num_hidden_layers == 30
+    assert config.num_experts == 128
+    assert config.top_k_experts == 8
+    assert config.enable_moe_block
+    assert config.attention_k_eq_v
+    assert config.final_logit_softcapping == 30.0
 
 
 def test_layer_attention_shape_preserves_hybrid_layout():
@@ -59,7 +87,7 @@ def test_layer_attention_shape_preserves_hybrid_layout():
 
 def test_rms_norm_matches_reference_formula():
     layer = Gemma4RMSNorm(8, dtype=None)
-    layer.weight.data.zero_()
+    layer.weight.data.fill_(1.0)
     x = __import__("torch").tensor([[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]])
     expected = x / (x.square().mean(-1, keepdim=True) + 1e-6).sqrt()
     assert __import__("torch").allclose(layer(x), expected, atol=1e-5, rtol=1e-5)
@@ -126,17 +154,16 @@ def test_reference_moe_dispatches_and_combines_top_k():
     assert output.shape == hidden.shape
     assert torch.isfinite(output).all()
     # Router probabilities are normalized per token before expert combine.
-    logits = moe.router(hidden).float()
-    top, _ = torch.topk(logits, 2, dim=-1)
-    assert torch.allclose(torch.softmax(top, -1).sum(-1), torch.ones(5))
+    probabilities, top_weights, _ = moe.router(hidden)
+    assert torch.allclose(probabilities.sum(-1), torch.ones(5))
+    assert torch.allclose(top_weights.sum(-1), torch.ones(5))
 
 
 def test_weight_mapper_preserves_expert_indices():
-    name = "model.layers.7.block_sparse_moe.experts.12.down_proj.weight"
-    mapped = Gemma4WeightMapper.map_name(name)
-    assert mapped == "layers.7.moe.experts.12.down_proj.weight"
-    assert Gemma4WeightMapper.is_expert_weight(name)
-    assert not Gemma4WeightMapper.is_expert_weight("model.layers.7.self_attn.q_proj.weight")
+    name = "model.layers.7.experts.down_proj"
+    assert Gemma4WeightMapper.checkpoint_name(name) == (
+        "model.language_model.layers.7.experts.down_proj"
+    )
     assert Gemma4WeightMapper.loader_kind("model.layers.7.self_attn.q_proj.weight") == "column"
     assert Gemma4WeightMapper.loader_kind("model.layers.7.self_attn.o_proj.weight") == "row"
     assert Gemma4WeightMapper.loader_kind(name) == "expert-local"
@@ -153,10 +180,25 @@ def test_linear_attaches_loader_and_uses_local_tp_shape():
 
 def test_reference_attention_block_composes_native_linear_and_cache():
     torch = __import__("torch")
-    block = Gemma4ReferenceAttentionBlock(16, 4, 2, 4)
+    config = Gemma4Config(
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        global_head_dim=4,
+        num_global_key_value_heads=2,
+        layer_types=["sliding_attention"],
+        sliding_window=8,
+    )
+    block = Gemma4ReferenceAttentionBlock(config, layer_idx=0)
     hidden = torch.randn(3, 16, dtype=torch.bfloat16)
     cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.bfloat16)
-    output = block(hidden, cache, torch.tensor([0, 1, 2]))
+    output = block(
+        hidden,
+        torch.tensor([0, 1, 2]),
+        cache,
+        torch.tensor([0, 1, 2]),
+    )
     assert output.shape == hidden.shape
 
 
@@ -164,11 +206,17 @@ def test_reference_decoder_layer_composes_attention_and_moe():
     torch = __import__("torch")
     config = Gemma4Config(hidden_size=16, intermediate_size=32, num_attention_heads=4,
                           num_key_value_heads=2, head_dim=4, layer_types=["local"],
-                          global_head_dim=4, num_global_key_value_heads=2)
-    layer = Gemma4ReferenceDecoderLayer(config, layer_idx=0, num_experts=4, top_k=2)
+                          global_head_dim=4, num_global_key_value_heads=2,
+                          moe_intermediate_size=8, num_experts=4, top_k_experts=2)
+    layer = Gemma4ReferenceDecoderLayer(config, layer_idx=0)
     hidden = torch.randn(3, 16, dtype=torch.bfloat16)
     cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.bfloat16)
-    output = layer(hidden, cache, torch.tensor([0, 1, 2]))
+    output = layer(
+        hidden,
+        torch.tensor([0, 1, 2]),
+        cache,
+        torch.tensor([0, 1, 2]),
+    )
     assert output.shape == hidden.shape
 
 
@@ -178,8 +226,10 @@ def test_reference_text_model_runs_tiny_stack():
                           num_hidden_layers=2, num_attention_heads=4,
                           num_key_value_heads=2, head_dim=4,
                           layer_types=["local"], global_head_dim=4,
-                          num_global_key_value_heads=2)
-    model = Gemma4ReferenceTextModel(config, num_experts=2, top_k=1)
+                          num_global_key_value_heads=2,
+                          moe_intermediate_size=8, num_experts=2,
+                          top_k_experts=1)
+    model = Gemma4ReferenceTextModel(config)
     output = model(torch.tensor([[1, 2, 3]]))
     assert output.shape == (1, 3, 16)
 
@@ -198,8 +248,10 @@ def test_reference_causal_lm_returns_selected_logits():
                           num_hidden_layers=1, num_attention_heads=4,
                           num_key_value_heads=2, head_dim=4,
                           layer_types=["local"], global_head_dim=4,
-                          num_global_key_value_heads=2)
-    model = Gemma4ReferenceCausalLM(config, num_experts=2, top_k=1)
+                          num_global_key_value_heads=2,
+                          moe_intermediate_size=8, num_experts=2,
+                          top_k_experts=1)
+    model = Gemma4ReferenceCausalLM(config)
     logits = model(torch.tensor([[1, 2, 3]]), torch.tensor([2]))
     assert logits.shape == (1, 32)
 
@@ -211,15 +263,17 @@ def test_registered_factory_smoke_with_reference_mode(monkeypatch):
                           num_hidden_layers=1, num_attention_heads=2,
                           num_key_value_heads=1, head_dim=4,
                           layer_types=["local"], global_head_dim=4,
-                          num_global_key_value_heads=1)
-    model = Gemma4MoeForCausalLM(config)
+                          num_global_key_value_heads=1,
+                          moe_intermediate_size=4, num_experts=2,
+                          top_k_experts=1)
+    model = Gemma4ForCausalLM.from_configs(config)
     output = model(
         torch.tensor([[1, 2]]),
         positions=torch.tensor([0, 1]),
         sampling_positions=torch.tensor([1]),
     )
     assert output.shape == (1, 16)
-    kv_spec = model.model.get_kv_spec()
+    kv_spec = model.get_kv_spec()
     assert len(kv_spec.layers) == 1
     assert kv_spec.layers[0].name == "layers.0.self_attn"
     assert kv_spec.layers[0].head_size == 4
@@ -238,11 +292,60 @@ def test_native_model_requires_complete_kv_bindings(monkeypatch):
         layer_types=["local", "global"],
         global_head_dim=4,
         num_global_key_value_heads=1,
+        moe_intermediate_size=4,
+        num_experts=2,
+        top_k_experts=1,
     )
-    model = Gemma4MoeForCausalLM(config)
+    model = Gemma4ForCausalLM.from_configs(config)
     try:
-        model.model.bind_kv_cache({"layers.0.self_attn": []})
+        model.bind_kv_cache({"layers.0.self_attn": []})
     except ValueError as error:
         assert "layers.1.self_attn" in str(error)
     else:
         raise AssertionError("incomplete KV binding was accepted")
+
+
+def test_reference_checkpoint_round_trip_uses_real_text_keys(
+    monkeypatch, tmp_path
+):
+    torch = __import__("torch")
+    from safetensors.torch import save_file
+
+    monkeypatch.setenv("VLLM_NEURON_GEMMA4_REFERENCE", "1")
+    config = Gemma4Config(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=12,
+        moe_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        global_head_dim=4,
+        num_global_key_value_heads=1,
+        num_experts=2,
+        top_k_experts=1,
+        layer_types=["sliding_attention"],
+        sliding_window=8,
+        torch_dtype=torch.float32,
+    )
+    model = Gemma4ForCausalLM.from_configs(config)
+    checkpoint_tensors = {}
+    expected = {}
+    for index, (name, parameter) in enumerate(model.named_parameters()):
+        value = torch.full_like(parameter, float(index + 1))
+        checkpoint_key = Gemma4WeightMapper.checkpoint_name(name)
+        assert checkpoint_key.startswith("model.language_model.")
+        checkpoint_tensors[checkpoint_key] = value
+        expected[name] = value
+        parameter.data.zero_()
+
+    save_file(checkpoint_tensors, tmp_path / "model.safetensors")
+    model.load_weights(str(tmp_path), torch.device("cpu"), cache_dir=None)
+
+    loaded = dict(model.named_parameters())
+    assert set(loaded) == set(expected)
+    for name, value in expected.items():
+        assert torch.equal(loaded[name], value), name
+    assert model._last_checkpoint_load_result.missing_keys == []
+    assert model._last_checkpoint_load_result.unexpected_keys == []
