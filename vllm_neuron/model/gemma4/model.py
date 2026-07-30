@@ -290,11 +290,12 @@ class Gemma4ReferenceDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.input_layernorm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
+        head_dim, num_kv_heads = config.attention_shape(layer_idx)
         self.attention = Gemma4ReferenceAttentionBlock(
             config.hidden_size,
             config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
+            num_kv_heads,
+            head_dim,
             f"layers.{layer_idx}.self_attn",
         )
         self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)

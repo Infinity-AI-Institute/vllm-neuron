@@ -45,6 +45,14 @@ def test_nested_text_config_is_parsed():
     assert parsed.vocab_size == 1000
 
 
+def test_layer_attention_shape_preserves_hybrid_layout():
+    config = Gemma4Config(layer_types=["local", "global"], head_dim=256,
+                          num_key_value_heads=2, global_head_dim=512,
+                          num_global_key_value_heads=1)
+    assert config.attention_shape(0) == (256, 2)
+    assert config.attention_shape(1) == (512, 1)
+
+
 def test_rms_norm_matches_reference_formula():
     layer = Gemma4RMSNorm(8, dtype=None)
     layer.weight.data.zero_()
@@ -151,7 +159,8 @@ def test_reference_attention_block_composes_native_linear_and_cache():
 def test_reference_decoder_layer_composes_attention_and_moe():
     torch = __import__("torch")
     config = Gemma4Config(hidden_size=16, intermediate_size=32, num_attention_heads=4,
-                          num_key_value_heads=2, head_dim=4)
+                          num_key_value_heads=2, head_dim=4, layer_types=["local"],
+                          global_head_dim=4, num_global_key_value_heads=2)
     layer = Gemma4ReferenceDecoderLayer(config, layer_idx=0, num_experts=4, top_k=2)
     hidden = torch.randn(3, 16, dtype=torch.bfloat16)
     cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.bfloat16)

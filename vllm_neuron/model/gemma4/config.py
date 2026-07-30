@@ -32,6 +32,19 @@ class Gemma4Config:
     torch_dtype: torch.dtype = torch.bfloat16
     neuron_config: NeuronConfig | None = None
 
+    def layer_is_global(self, layer_idx: int) -> bool:
+        """Return whether a layer uses full/global attention."""
+        if not self.layer_types:
+            return True
+        value = self.layer_types[layer_idx % len(self.layer_types)]
+        return str(value).lower() in {"global", "full", "full_attention"}
+
+    def attention_shape(self, layer_idx: int) -> tuple[int, int]:
+        """Return the native (head_dim, KV-heads) pair for a layer."""
+        if self.layer_is_global(layer_idx):
+            return self.global_head_dim, self.num_global_key_value_heads
+        return self.head_dim, self.num_key_value_heads
+
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config=None):
         raw = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
