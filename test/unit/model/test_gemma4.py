@@ -14,6 +14,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4ReferenceDecoderLayer,
     Gemma4ReferenceTextModel,
     Gemma4ReferenceLMHead,
+    Gemma4ReferenceCausalLM,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -188,3 +189,15 @@ def test_lm_head_selects_sampling_positions():
     hidden = torch.randn(2, 4, 8, dtype=torch.bfloat16)
     logits = head(hidden, torch.tensor([1, 6]))
     assert logits.shape == (2, 32)
+
+
+def test_reference_causal_lm_returns_selected_logits():
+    torch = __import__("torch")
+    config = Gemma4Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                          num_hidden_layers=1, num_attention_heads=4,
+                          num_key_value_heads=2, head_dim=4,
+                          layer_types=["local"], global_head_dim=4,
+                          num_global_key_value_heads=2)
+    model = Gemma4ReferenceCausalLM(config, num_experts=2, top_k=1)
+    logits = model(torch.tensor([[1, 2, 3]]), torch.tensor([2]))
+    assert logits.shape == (1, 32)

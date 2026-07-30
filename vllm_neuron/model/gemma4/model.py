@@ -360,6 +360,21 @@ class Gemma4ReferenceLMHead(nn.Module):
         return torch.matmul(flat.float(), weight.float().transpose(0, 1)).to(hidden_states.dtype)
 
 
+class Gemma4ReferenceCausalLM(nn.Module):
+    """End-to-end reference model with vLLM-style selected-token logits."""
+
+    def __init__(self, config: Gemma4Config, num_experts: int = 4, top_k: int = 2):
+        super().__init__()
+        self.model = Gemma4ReferenceTextModel(config, num_experts, top_k)
+        self.lm_head = Gemma4ReferenceLMHead(
+            config.hidden_size, config.vocab_size, self.model.embed_tokens
+        )
+
+    def forward(self, input_ids, sampling_positions=None, cache_layers=None, slot_mapping=None):
+        hidden_states = self.model(input_ids, cache_layers, slot_mapping)
+        return self.lm_head(hidden_states, sampling_positions)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
