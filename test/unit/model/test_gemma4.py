@@ -10,6 +10,7 @@ from vllm_neuron.model.gemma4.model import (
     Gemma4ReferenceMoE,
     Gemma4WeightMapper,
     Gemma4Linear,
+    Gemma4ReferenceAttentionBlock,
     Gemma4RotaryEmbedding,
     Gemma4ValueNorm,
 )
@@ -135,3 +136,12 @@ def test_linear_attaches_loader_and_uses_local_tp_shape():
     layer = Gemma4Linear(16, 32, "q_proj.weight", tp_size=4)
     assert tuple(layer.weight.shape) == (8, 16)
     assert hasattr(layer.weight, "weight_loader")
+
+
+def test_reference_attention_block_composes_native_linear_and_cache():
+    torch = __import__("torch")
+    block = Gemma4ReferenceAttentionBlock(16, 4, 2, 4)
+    hidden = torch.randn(3, 16, dtype=torch.bfloat16)
+    cache = Gemma4PagedKVCache(3, 2, 4, dtype=torch.bfloat16)
+    output = block(hidden, cache, torch.tensor([0, 1, 2]))
+    assert output.shape == hidden.shape

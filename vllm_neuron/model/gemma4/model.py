@@ -258,6 +258,31 @@ class Gemma4Linear(nn.Module):
         return torch.nn.functional.linear(hidden_states, self.weight)
 
 
+class Gemma4ReferenceAttentionBlock(nn.Module):
+    """Composable attention block used as the native numerical bridge."""
+
+    def __init__(self, hidden_size: int, num_query_heads: int, num_kv_heads: int,
+                 head_dim: int, layer_name: str = "layers.0.self_attn"):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.q_proj = Gemma4Linear(hidden_size, num_query_heads * head_dim, f"{layer_name}.q_proj.weight")
+        self.k_proj = Gemma4Linear(hidden_size, num_kv_heads * head_dim, f"{layer_name}.k_proj.weight")
+        self.v_proj = Gemma4Linear(hidden_size, num_kv_heads * head_dim, f"{layer_name}.v_proj.weight")
+        self.o_proj = Gemma4Linear(num_query_heads * head_dim, hidden_size, f"{layer_name}.o_proj.weight")
+        self.attention = Gemma4ReferenceAttention(head_dim, num_query_heads, num_kv_heads)
+
+    def forward(self, hidden_states: torch.Tensor, cache=None, slot_mapping=None):
+        tokens = hidden_states.reshape(-1, self.hidden_size)
+        query = self.q_proj(tokens).reshape(-1, self.num_query_heads, self.head_dim)
+        key = self.k_proj(tokens).reshape(-1, self.num_kv_heads, self.head_dim)
+        value = self.v_proj(tokens).reshape(-1, self.num_kv_heads, self.head_dim)
+        attended = self.attention(query, key, value, cache, slot_mapping)
+        return self.o_proj(attended.reshape(-1, self.num_query_heads * self.head_dim)).reshape_as(hidden_states)
+
+
 class Gemma4MoeModel(nn.Module):
     def __init__(self, config):
         super().__init__()
