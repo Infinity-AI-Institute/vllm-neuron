@@ -99,7 +99,7 @@ def _patch_dcp_config_validation():
 
 
 def _apply_dcp_patch(ModelConfig):
-    """Monkey-patch verify_with_parallel_config to bypass DCP assertion for prefill."""
+    """Install Neuron's ModelConfig-time compatibility hooks."""
     if getattr(
         ModelConfig.__dict__.get("verify_with_parallel_config"),
         "_neuron_dcp_patched",
@@ -121,6 +121,44 @@ def _apply_dcp_patch(ModelConfig):
 
     _patched_verify._neuron_dcp_patched = True
     ModelConfig.verify_with_parallel_config = _patched_verify
+
+    # ModelConfig consults its registry before NeuronWorker exists. Registering
+    # from the platform plugin callback itself is too early and recurses
+    # through vllm.platforms while current_platform is still resolving.
+    # Wrapping this property defers the lazy string registration until the
+    # first safe ModelConfig lookup. NeuronWorker still replaces it with the
+    # concrete class before loading/compilation.
+    registry_property = ModelConfig.__dict__.get("registry")
+    if registry_property is not None and not getattr(
+        registry_property.fget, "_neuron_models_patched", False
+    ):
+        original_registry_getter = registry_property.fget
+
+        def _neuron_registry(self):
+            registry = original_registry_getter(self)
+            _register_pre_model_config_architectures(registry)
+            return registry
+
+        _neuron_registry._neuron_models_patched = True
+        ModelConfig.registry = property(
+            _neuron_registry,
+            doc=registry_property.__doc__,
+        )
+
+
+def _register_pre_model_config_architectures(registry) -> None:
+    """Lazily expose Neuron-only names before ModelConfig inspection."""
+    implementation = (
+        "vllm_neuron.model.inkling.factory:"
+        "InklingForConditionalGeneration"
+    )
+    supported = registry.get_supported_archs()
+    for architecture in (
+        "InklingForConditionalGeneration",
+        "InklingForCausalLM",
+    ):
+        if architecture not in supported:
+            registry.register_model(architecture, implementation)
 
 
 class NeuronPlatform(Platform):

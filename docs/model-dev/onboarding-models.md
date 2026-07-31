@@ -405,6 +405,47 @@ The layer names used in `get_kv_spec` must match the keys that the model reads
 from `attn_metadata` — the runner uses the same names for both. By convention,
 existing models use `f"layers.{i}.self_attn"`.
 
+##### Hybrid-cache allocation ownership
+
+Models mixing cache types (for example full attention, sliding-window
+attention, convolution, or recurrent state) can be grouped by vLLM's hybrid
+cache manager. In that layout, each `KVCacheTensor` is intentionally shared by
+one layer from every cache group. The sharing layers can have different logical
+block sizes and can reinterpret the same bytes with different tensor shapes;
+their block tables keep live pages disjoint.
+
+`bind_kv_cache()` remains the scheduler-facing layer view. If independent
+per-layer mutations would create overlapping Neuron input/output aliases, opt
+into the two root-level hooks:
+
+```python
+def bind_kv_cache_roots(
+    self, cache_roots: dict[str, torch.Tensor]
+) -> None:
+    """Record each layer's full conventional [2, blocks, ...] view."""
+    ...
+
+def bind_kv_cache_allocation_roots(
+    self, allocation_roots: dict[str, torch.Tensor]
+) -> None:
+    """Record the canonical typed 1-D allocation behind every layer."""
+    ...
+```
+
+For all names in one `KVCacheTensor.shared_by`,
+`allocation_roots[layer_name]` is the exact same tensor object. Group by that
+identity, derive layer-specific shapes only inside the model, and explicitly
+thread the updated canonical root through every layer that shares it. Do not
+launch sibling writes from independently captured views. The correctness gate
+for this path is:
+
+1. one graph placeholder and one artifact `io_map` entry per physical
+   allocation;
+2. a serial mutation chain containing every sharing layer's writes;
+3. a two-invocation accelerator seam proving that disjoint writes from every
+   cache shape persist; and
+4. cached multi-token decode matching a fresh-prefill oracle.
+
 #### 1c. Define the factory (`factory.py`)
 
 The factory class satisfies vLLM's ModelRegistry interface and selects the correct

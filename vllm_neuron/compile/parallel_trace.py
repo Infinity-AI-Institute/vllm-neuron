@@ -461,20 +461,25 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
     ``self.k_cache`` / ``self.v_cache`` are bound this way via
     ``bind_kv_cache`` and live on the runtime device.
 
-    Storage-identity preservation: when two attribute slots reference
-    different views over the *same* underlying storage (the typical KV
-    cache pattern: ``typed_tensor[0]`` / ``typed_tensor[1]`` both come
-    from a shared raw buffer in ``initialize_kv_cache``), the meta
-    replacements must also share storage. The capture backend's input
-    dedup (``compile/backend.py::_detect_duplicate_inputs``) keys on
-    ``(id(untyped_storage), storage_offset, shape, stride, dtype)``,
+    Alias preservation: when two attribute slots are views descended from
+    the same source tensor (the typical KV cache pattern:
+    ``typed_tensor[0]`` / ``typed_tensor[1]`` both come from a shared raw
+    buffer in ``initialize_kv_cache``), the meta replacements must also share
+    storage. Neuron/XLA tensors expose one placeholder StorageImpl across
+    independent lazy allocations, so neither ``id(untyped_storage())`` nor
+    ``untyped_storage()._cdata`` can identify allocation ownership. We instead
+    walk PyTorch's explicit ``Tensor._base`` view chain and key on the root
+    tensor object. Independent tensors stay independent; real views and exact
+    Python aliases stay shared. The capture backend's input dedup
+    (``compile/backend.py::_detect_duplicate_inputs``) keys on
+    ``(alias_root, storage_offset, shape, stride, dtype)``,
     so any two slots with that same key collapse to a single FX
     placeholder. If we were to allocate a fresh meta storage per slot,
     those keys would diverge — placeholder count balloons (e.g. KV
     caches go from 12 → 24 in GPT-OSS-20B), HBM usage doubles, and the
     HLO verifier rejects the graph.
 
-    The ``storage_to_meta`` cache below maps each unique source storage
+    The ``storage_to_meta`` cache below maps each unique source alias root
     to a single meta storage; per-slot meta tensors are then constructed
     as views over that storage matching the source's offset / shape /
     stride / dtype. ``id_to_meta`` further dedupes by Python identity.
@@ -482,11 +487,21 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
     storage_to_meta: dict[int, torch.UntypedStorage] = {}
     id_to_meta: dict[int, torch.Tensor] = {}
 
+    def _alias_root_id(src: torch.Tensor) -> int:
+        root = src
+        seen: set[int] = set()
+        while isinstance(getattr(root, "_base", None), torch.Tensor):
+            if id(root) in seen:
+                break
+            seen.add(id(root))
+            root = root._base
+        return id(root)
+
     def _replacement_for(src: torch.Tensor) -> torch.Tensor:
         cached = id_to_meta.get(id(src))
         if cached is not None:
             return cached
-        storage_id = id(src.untyped_storage())
+        storage_id = _alias_root_id(src)
         meta_storage = storage_to_meta.get(storage_id)
         if meta_storage is None:
             meta_storage = torch.UntypedStorage(

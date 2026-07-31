@@ -6,6 +6,7 @@ from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .gemma4 import Gemma4ForCausalLM
+from .inkling import InklingForConditionalGeneration
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -27,6 +28,12 @@ def get_models() -> list[tuple[str, type]]:
         # conditional-generation config. Text-only Neuron serving uses the
         # same native text implementation for that outer architecture.
         ("Gemma4ForConditionalGeneration", Gemma4ForCausalLM),
+        ("InklingForConditionalGeneration", InklingForConditionalGeneration),
+        # The public checkpoint has a multimodal outer config.  Text-only
+        # Neuron serving overrides the architecture to this alias so vLLM
+        # does not initialize vision/audio preprocessing; the factory still
+        # unwraps and validates the exact nested text_config.
+        ("InklingForCausalLM", InklingForConditionalGeneration),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

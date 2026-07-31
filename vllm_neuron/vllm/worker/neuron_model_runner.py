@@ -7,6 +7,7 @@ ModelRunnerOutput with proper request tracking, output reordering, and persisten
 state management.
 """
 
+import json
 import logging
 import math
 import os
@@ -834,6 +835,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output: KVConnectorOutput | None = None
         # Full (2, ...) KV cache tensors for DI connector registration
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
+        # Canonical one-dimensional typed view of each vLLM-owned allocation.
+        # Multiple hybrid-cache layers can deliberately map to the exact same
+        # object. Models that need to thread overlapping cache views through a
+        # single graph input consume these through
+        # bind_kv_cache_allocation_roots().
+        self._kv_cache_allocation_roots: dict[str, torch.Tensor] = {}
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -3809,7 +3816,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # Trimmed SWA kv block counts must produce S_ctx divisible by P_MAX.
         P_MAX = 128
         min_blocks = sliding_window // block_size + 1
-        blocks_per_pmax = P_MAX // block_size
+        # Hybrid cache groups can enlarge a small-window layer's effective
+        # block size to equalize page sizes across groups. In that case a
+        # block can be wider than the attention kernel's P_MAX tile, so it is
+        # already aligned and must count as one block rather than zero.
+        blocks_per_pmax = max(P_MAX // block_size, 1)
         num_swa_blocks = (
             (min_blocks + blocks_per_pmax - 1) // blocks_per_pmax * blocks_per_pmax
         )
@@ -6298,6 +6309,314 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 Can be logits (for CPU sampling)
                 or sampled token ids (already sampled on device)
         """
+        if os.environ.get("VLLM_NEURON_TRACE_INPUTS", "0") == "1":
+            tp_group = get_tp_group()
+            tp_rank = tp_group.rank_in_group if tp_group else 0
+            if tp_rank == 0:
+
+                def summarize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
+                    cpu_tensor = tensor.detach().cpu()
+                    flat = cpu_tensor.reshape(-1)
+                    return {
+                        "shape": list(cpu_tensor.shape),
+                        "dtype": str(cpu_tensor.dtype),
+                        "values": flat[:256].tolist(),
+                        "truncated": flat.numel() > 256,
+                    }
+
+                metadata_groups: dict[int, dict[str, Any]] = {}
+                for layer_name, metadata in (attn_metadata or {}).items():
+                    group = metadata_groups.setdefault(
+                        id(metadata),
+                        {
+                            "layers": [],
+                            "max_query_len": metadata["max_query_len"],
+                            "decode_token_threshold": metadata[
+                                "decode_token_threshold"
+                            ],
+                            "block_size": metadata["block_size"],
+                            "max_blocks_per_seq": metadata[
+                                "max_blocks_per_seq"
+                            ],
+                            "block_table": summarize_tensor(
+                                metadata["block_table_tensor"]
+                            ),
+                            "full_block_table": summarize_tensor(
+                                metadata["full_block_table_tensor"]
+                            ),
+                            "slot_mapping": summarize_tensor(
+                                metadata["slot_mapping"]
+                            ),
+                            "cached_seq_len": summarize_tensor(
+                                metadata["cached_seq_len"]
+                            ),
+                        },
+                    )
+                    group["layers"].append(layer_name)
+                    if "swa_kv_pos_offset" in metadata:
+                        group["swa_kv_pos_offset"] = summarize_tensor(
+                            metadata["swa_kv_pos_offset"]
+                        )
+
+                num_reqs = self.input_batch.num_reqs
+                trace_payload = {
+                    "req_ids": list(self.input_batch.req_ids),
+                    "num_computed_tokens": self.input_batch.num_computed_tokens_cpu[
+                        :num_reqs
+                    ].tolist(),
+                    "input_ids": summarize_tensor(input_ids),
+                    "positions": summarize_tensor(positions),
+                    "logits_indices": summarize_tensor(logits_indices),
+                    "attention_groups": list(metadata_groups.values()),
+                }
+                logger.info(
+                    "NEURON_MODEL_INPUT_TRACE %s",
+                    json.dumps(trace_payload, sort_keys=True),
+                )
+
+        def trace_cache_rows(tag: str) -> None:
+            if os.environ.get("VLLM_NEURON_TRACE_CACHE", "0") != "1":
+                return
+            tp_group = get_tp_group()
+            tp_rank = tp_group.rank_in_group if tp_group else 0
+            if tp_rank != 0:
+                return
+
+            model = self.model
+            for _ in range(4):
+                original = getattr(model, "_orig_mod", None)
+                if original is None:
+                    break
+                model = original
+            bound_caches = getattr(model, "_bound_kv_caches", None)
+            if not bound_caches:
+                logger.info(
+                    "NEURON_MODEL_CACHE_TRACE %s",
+                    json.dumps(
+                        {"tag": tag, "status": "no_bound_cache"},
+                        sort_keys=True,
+                    ),
+                )
+                return
+
+            from vllm_neuron.compile import backend as compile_backend
+
+            bound_cache_roots = getattr(
+                model, "_bound_kv_cache_roots", {}
+            )
+            alias_labels = {
+                id(cache): f"{layer_name}[{cache_index}]"
+                for layer_name, caches in bound_caches.items()
+                for cache_index, cache in enumerate(caches)
+            }
+            alias_labels.update(
+                {
+                    id(cache): f"{layer_name}[kv_root]"
+                    for layer_name, cache in bound_cache_roots.items()
+                }
+            )
+            # Hybrid-cache models can compile one canonical allocation root
+            # instead of the per-layer reinterpretation views above. Label
+            # those exact graph inputs by allocation index as well.
+            text_model = getattr(model, "model", None)
+            for layer in getattr(text_model, "layers", ()):
+                allocation_root = getattr(layer, "cache_root", None)
+                allocation_index = getattr(
+                    layer, "cache_allocation_index", None
+                )
+                if allocation_root is not None:
+                    alias_labels[id(allocation_root)] = (
+                        f"hma_allocation[{allocation_index}]"
+                    )
+            compile_backend.set_alias_trace_tensor_labels(
+                alias_labels
+            )
+
+            records = []
+            for layer_name in (
+                "layers.0.self_attn",
+                "layers.0.conv_state",
+                "layers.1.self_attn",
+                "layers.1.conv_state",
+            ):
+                caches = bound_caches.get(layer_name)
+                metadata = (attn_metadata or {}).get(layer_name)
+                if not caches or metadata is None:
+                    continue
+                cache_root = bound_cache_roots.get(layer_name)
+                if cache_root is not None:
+                    trace_caches = [
+                        (cache_root, stream) for stream in range(2)
+                    ]
+                else:
+                    trace_caches = [
+                        (cache, None) for cache in caches
+                    ]
+                slots = (
+                    metadata["slot_mapping"]
+                    .detach()
+                    .cpu()
+                    .reshape(-1)
+                    .tolist()
+                )
+                valid_slots = [int(slot) for slot in slots if int(slot) >= 0]
+                if not valid_slots:
+                    continue
+                current_slot = valid_slots[-1]
+                block_size = int(metadata["block_size"])
+                slot_records = {}
+                for slot_label, physical_slot in (
+                    ("previous", current_slot - 1),
+                    ("current", current_slot),
+                ):
+                    if physical_slot < 0:
+                        continue
+                    block_index, block_offset = divmod(
+                        physical_slot, block_size
+                    )
+                    cache_records = []
+                    for cache, stream in trace_caches:
+                        if stream is None:
+                            cache_shape = cache.shape
+                            stream_element_offset = 0
+                            total_heads = int(cache_shape[1])
+                            first_head = 0
+                        elif cache.ndim == 4:
+                            # Inkling's page-major K/V representation:
+                            # [blocks, 2 * kv_heads, block, dim]. Read each
+                            # half directly from the full root so diagnostics
+                            # observe the exact persistent graph input.
+                            num_stream_heads = int(cache.shape[1]) // 2
+                            cache_shape = (
+                                cache.shape[0],
+                                num_stream_heads,
+                                cache.shape[2],
+                                cache.shape[3],
+                            )
+                            stream_element_offset = 0
+                            total_heads = int(cache.shape[1])
+                            first_head = stream * num_stream_heads
+                        else:
+                            cache_shape = cache.shape[1:]
+                            stream_element_offset = (
+                                stream * math.prod(cache_shape)
+                            )
+                            total_heads = int(cache_shape[1])
+                            first_head = 0
+                        if block_index >= cache_shape[0]:
+                            continue
+                        # Neuron host copies require a contiguous source, while
+                        # cache[:, block_offset, :] is a strided view.  The
+                        # Neuron contiguous() implementation cannot materialize
+                        # that view directly, so gather the row into a new,
+                        # contiguous tensor before copying it to the host.
+                        num_heads = int(cache_shape[1])
+                        head_dim = int(cache_shape[3])
+                        head_offsets = (
+                            torch.arange(
+                                num_heads,
+                                dtype=torch.int64,
+                                device=cache.device,
+                            )
+                            + first_head
+                        ) * block_size * head_dim
+                        dim_offsets = torch.arange(
+                            head_dim,
+                            dtype=torch.int64,
+                            device=cache.device,
+                        )
+                        row_indices = (
+                            block_index
+                            * total_heads
+                            * block_size
+                            * head_dim
+                            + stream_element_offset
+                            + head_offsets[:, None]
+                            + block_offset * head_dim
+                            + dim_offsets[None, :]
+                        ).reshape(-1)
+                        row = (
+                            torch.index_select(
+                                cache.detach().reshape(-1),
+                                0,
+                                row_indices,
+                            )
+                            .cpu()
+                            .float()
+                        )
+                        all_block_l2 = None
+                        if (
+                            os.environ.get(
+                                "VLLM_NEURON_TRACE_CACHE_BLOCKS", "0"
+                            )
+                            == "1"
+                        ):
+                            block_offsets = (
+                                torch.arange(
+                                    int(cache_shape[0]),
+                                    dtype=torch.int64,
+                                    device=cache.device,
+                                )[:, None, None]
+                                * total_heads
+                                * block_size
+                                * head_dim
+                            )
+                            all_row_indices = (
+                                block_offsets
+                                + stream_element_offset
+                                + head_offsets[None, :, None]
+                                + block_offset * head_dim
+                                + dim_offsets[None, None, :]
+                            ).reshape(-1)
+                            all_rows = (
+                                torch.index_select(
+                                    cache.detach().reshape(-1),
+                                    0,
+                                    all_row_indices,
+                                )
+                                .cpu()
+                                .float()
+                                .reshape(
+                                    int(cache_shape[0]),
+                                    num_heads,
+                                    head_dim,
+                                )
+                            )
+                            all_block_l2 = torch.linalg.vector_norm(
+                                all_rows, dim=(1, 2)
+                            ).tolist()
+                        cache_records.append(
+                            {
+                                "shape": list(cache_shape),
+                                "root_stream": stream,
+                                "mean_abs": row.abs().mean().item(),
+                                "max_abs": row.abs().max().item(),
+                                "l2": torch.linalg.vector_norm(row).item(),
+                                "values": row[:8].tolist(),
+                                "all_block_l2_at_offset": all_block_l2,
+                            }
+                        )
+                    slot_records[slot_label] = {
+                        "physical_slot": physical_slot,
+                        "caches": cache_records,
+                    }
+                records.append(
+                    {
+                        "layer": layer_name,
+                        "block_size": block_size,
+                        "slots": slot_records,
+                    }
+                )
+            logger.info(
+                "NEURON_MODEL_CACHE_TRACE %s",
+                json.dumps(
+                    {"tag": tag, "status": "ok", "records": records},
+                    sort_keys=True,
+                ),
+            )
+
+        trace_cache_rows("before_forward")
+
         # TODO: avoid f-string in production logging as f-strings are evaluated even if
         # the log is not printed
         if not self.use_async_scheduling:
@@ -6455,6 +6774,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         with model_forward_context(self.vllm_config):
             model_output = self.model(**model_kwargs)
+        trace_cache_rows("after_forward")
         if self._tensor_replacer is not None:
             set_active_context(None)
 
@@ -7674,6 +7994,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self._kv_cache_full_tensors.clear()
+        self._kv_cache_allocation_roots.clear()
 
         # TODO do we need to initialize attn_backend?
 
@@ -7714,6 +8036,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
+        # A dtype-changing view creates a new PyTorch ``_base`` even when two
+        # views originate from the same raw allocation. Construct it exactly
+        # once per allocation/dtype so hybrid-cache sharing remains explicit
+        # to Dynamo and the Neuron input-deduplication pass.
+        typed_allocation_roots: dict[
+            tuple[int, torch.dtype], torch.Tensor
+        ] = {}
+
+        def get_typed_allocation_root(
+            raw_tensor: torch.Tensor, dtype: torch.dtype
+        ) -> torch.Tensor:
+            key = (id(raw_tensor), dtype)
+            root = typed_allocation_roots.get(key)
+            if root is None:
+                root = raw_tensor.view(dtype)
+                typed_allocation_roots[key] = root
+            return root
+
+        bind_cache_roots = getattr(self.model, "bind_kv_cache_roots", None)
+        bind_allocation_roots = getattr(
+            self.model, "bind_kv_cache_allocation_roots", None
+        )
+        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+        bind_draft_cache_roots = getattr(
+            drafter_model, "bind_kv_cache_roots", None
+        )
+        bind_draft_allocation_roots = getattr(
+            drafter_model, "bind_kv_cache_allocation_roots", None
+        )
+        requires_cache_roots = callable(bind_cache_roots) or callable(
+            bind_draft_cache_roots
+        ) or callable(bind_allocation_roots) or callable(
+            bind_draft_allocation_roots
+        )
 
         # Build KV caches per group
         kv_caches = {}
@@ -7731,8 +8087,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     block_size = kv_cache_spec.block_size
                     num_kv_heads = kv_cache_spec.num_kv_heads
                     head_size = kv_cache_spec.head_size
-                    from vllm_neuron.envs import is_native_backend
-
                     # Packed FP8 K cache: store K swizzled as
                     # [num_blocks, num_kv_heads, block_size // 2, head_size, 2]
                     # so the decode kernel can bf16-reinterpret + DMA-transpose.
@@ -7745,7 +8099,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         num_blocks, num_kv_heads, block_size, head_size, k_is_packed
                     )
 
-                    if is_native_backend():
+                    if envs.is_native_backend() and not requires_cache_roots:
+                        # Preserve the established native-model contract:
+                        # independent K/V graph inputs. Models opt into a
+                        # combined persistent alias explicitly through
+                        # bind_kv_cache_roots below.
                         v_cache_shape = (
                             num_blocks,
                             num_kv_heads,
@@ -7764,20 +8122,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         )
                         kv_caches[layer_name] = [k_cache, v_cache]
                     else:
-                        kv_shape = (2, num_blocks, num_kv_heads, block_size, head_size)
-                        typed_tensor = raw_tensor.view(kv_cache_spec.dtype).view(
-                            kv_shape
+                        # Preserve vLLM's authoritative cache allocation. K
+                        # and V remain offset views of this root tensor,
+                        # keeping memory accounting, cache lifetime, and
+                        # connector ownership on one physical allocation.
+                        kv_shape = (
+                            2,
+                            num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            head_size,
                         )
-                        # K and V are backed by the same (2, ...) storage; only
-                        # the K slice is reshaped to the packed layout when FP8
-                        # packing is enabled (same numel, different view).
+                        typed_root = get_typed_allocation_root(
+                            raw_tensor, kv_cache_spec.dtype
+                        )
+                        typed_tensor = typed_root.view(kv_shape)
+                        # Only the K slice is reshaped for packed FP8. It has
+                        # the same number of elements as the unpacked view.
                         k_cache = typed_tensor[0]
                         if k_is_packed:
                             k_cache = k_cache.view(k_cache_shape)
                         kv_caches[layer_name] = [k_cache, typed_tensor[1]]
-                        # Store the full (2, ...) tensor for DI connector registration
-                        # typed_tensor[0] and typed_tensor[1] are views into this tensor
                         self._kv_cache_full_tensors[layer_name] = typed_tensor
+                        self._kv_cache_allocation_roots[layer_name] = typed_root
 
             # Spec decoding specifically use this because hidden_size of different layers
             # (draft and target model) are different.
@@ -7805,11 +8172,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                             f"Unsupported Attention spec type: {type(kv_cache_layer_spec)}"
                         )
 
-                    typed_tensor = raw_tensor.view(kv_cache_layer_spec.dtype).view(
-                        kv_shape
+                    typed_root = get_typed_allocation_root(
+                        raw_tensor, kv_cache_layer_spec.dtype
                     )
+                    typed_tensor = typed_root.view(kv_shape)
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
+                    self._kv_cache_allocation_roots[layer_name] = typed_root
 
             else:
                 raise NotImplementedError(
@@ -7818,11 +8187,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
+        if callable(bind_cache_roots):
+            bind_cache_roots(self._kv_cache_full_tensors)
+        if callable(bind_allocation_roots):
+            bind_allocation_roots(self._kv_cache_allocation_roots)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # This binds the cache tensors to the draft model
             self.drafter.model.bind_kv_cache(kv_caches)
+            if callable(bind_draft_cache_roots):
+                bind_draft_cache_roots(self._kv_cache_full_tensors)
+            if callable(bind_draft_allocation_roots):
+                bind_draft_allocation_roots(
+                    self._kv_cache_allocation_roots
+                )
             # validate all draft model layers belong to the same kv cache group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
@@ -7953,10 +8332,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         for i, layer in enumerate(layers):
             layer_name = f"layers.{i}.self_attn"
             attn = getattr(layer, "self_attn", None)
-            if attn and getattr(attn, "k_cache", None) is not None:
+            if attn is None:
+                attn = getattr(layer, "attention", None)
+            kv_root = getattr(attn, "kv_cache", None)
+            if kv_root is not None and kv_root.ndim == 4:
+                # Model-owned page-major roots pack K/V into adjacent head
+                # ranges: [blocks, 2 * kv_heads, block, head_dim].
+                kv_heads = getattr(attn, "num_kv_heads_per_rank", None)
+                if kv_heads is None or kv_root.shape[1] != 2 * kv_heads:
+                    raise ValueError(
+                        "cannot split page-major K/V cache with shape "
+                        f"{tuple(kv_root.shape)}"
+                    )
+                k_cache = kv_root[:, :kv_heads]
+                v_cache = kv_root[:, kv_heads:]
+            elif kv_root is not None:
+                k_cache = kv_root[0]
+                v_cache = kv_root[1]
+            else:
+                k_cache = getattr(attn, "k_cache", None)
+                v_cache = getattr(attn, "v_cache", None)
+            if attn and k_cache is not None and v_cache is not None:
                 # Serialize tensors to bytes to avoid pickle issues
-                k_cpu = attn.k_cache.detach().cpu()
-                v_cpu = attn.v_cache.detach().cpu()
+                k_cpu = k_cache.detach().cpu()
+                v_cpu = v_cache.detach().cpu()
                 buf = io.BytesIO()
                 torch.save({"k": k_cpu, "v": v_cpu}, buf)
                 kv_caches[layer_name] = buf.getvalue()

@@ -182,6 +182,55 @@ Neuron) at the logit and KV cache levels. This distinguishes BF16-inherent
 numerical noise from vLLM-on-Neuron-specific bugs.
 :::
 
+#### Audit stateful compiler dataflow
+
+For a model with native paged state (K/V, convolution, recurrent, or SSM
+caches), finding the expected scatter operations in FX or HLO is necessary but
+not sufficient. Prove all of the following before treating the graph as
+state-correct:
+
+1. Each logical cache is bound to the authoritative vLLM allocation, or to a
+   view whose root is that allocation.
+2. Input/output aliases map every updated cache result back to the correct
+   physical input. If K and V are views of one allocation, also test whether
+   the target runtime can persist two independently mutated views. A model can
+   opt into one full-root input/output alias via `bind_kv_cache_roots`.
+   For vLLM hybrid-cache (HMA) layouts, one physical allocation can also be
+   shared across layers from different cache groups and reinterpreted with
+   different shapes. Such a model should consume
+   `bind_kv_cache_allocation_roots`, expose one graph input/output alias per
+   physical allocation, and thread that root across every sharing layer.
+3. Multiple writes to one cache form a serial dataflow chain. For example, four
+   state streams must trace as `cache -> write_0 -> write_1 -> write_2 ->
+   write_3`, not as four sibling writes to `cache`.
+4. Reads within the same invocation consume the post-write value when the
+   algorithm requires read-after-write behavior.
+5. A value written by invocation N is observable by invocation N+1 on the
+   accelerator.
+
+In-place Python syntax does not establish these properties by itself. Return the
+updated tensor from the state primitive and thread it explicitly through every
+subsequent write and read. Add a two-invocation hardware seam that writes
+different sentinel values, then checks both current and previous physical rows.
+For a combined K/V root, perform one indexed write spanning the K/V dimension;
+slicing the updated root for attention reads is safe and keeps the graph's
+persistent state boundary unambiguous.
+
+For HMA, do not recreate `raw_tensor.view(dtype)` independently for every layer
+in `KVCacheTensor.shared_by`. A dtype-changing view becomes a new PyTorch
+`_base`, obscuring the fact that the layers share storage. Construct one typed
+root per raw allocation and dtype, map every sharing layer name to that exact
+tensor object, and derive all layer-specific views from it. Audit both the
+captured mutation chains and artifact `io_map`: the number of persistent aliases
+must equal the number of physical allocations, not the number of logical
+layers.
+
+When token zero is correct but token one diverges, compare normal cached decode
+with a fresh-prefill oracle that resubmits the entire accepted prefix for every
+next token. If fresh prefill remains correct, the checkpoint, tokenizer, most
+weight loading, and prefill graph are already exonerated; focus on persistent
+state, decode metadata, and the decode graph.
+
 ### Step 5: Interpret the divergence pattern
 
 Use the pattern of divergence to classify the root cause:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import contextlib
+import json
 import logging
 import os
 import shlex
@@ -22,6 +23,33 @@ from vllm_neuron.utils.timer import timer
 
 
 logger = logging.getLogger(__name__)
+
+_ALIAS_TRACE_TENSOR_LABELS: dict[int, str] = {}
+
+
+def set_alias_trace_tensor_labels(labels: dict[int, str] | None) -> None:
+    """Install process-local tensor labels for opt-in runtime alias tracing."""
+    global _ALIAS_TRACE_TENSOR_LABELS
+    _ALIAS_TRACE_TENSOR_LABELS = labels or {}
+
+
+def _alias_root_identity(tensor: torch.Tensor) -> int:
+    """Return the identity of the root tensor in a PyTorch view chain.
+
+    Neuron/XLA exposes placeholder storage identities shared by independent
+    lazy allocations. Python storage wrappers can also be transient. The
+    explicit ``Tensor._base`` chain is the only backend-independent alias
+    ownership signal available here: independent tensors keep distinct roots,
+    while genuine PyTorch views converge on the same root.
+    """
+    root = tensor
+    seen: set[int] = set()
+    while isinstance(getattr(root, "_base", None), torch.Tensor):
+        if id(root) in seen:
+            break
+        seen.add(id(root))
+        root = root._base
+    return id(root)
 
 
 def model_forward_context(vllm_config: "VllmConfig"):
@@ -69,13 +97,12 @@ def _detect_duplicate_inputs(
 
     for inp in example_inputs:
         if isinstance(inp, torch.Tensor):
-            # Use storage object identity + offset to detect views of the
-            # same buffer (e.g. shared KV cache).  We use id(storage)
-            # rather than data_ptr() because Neuron/XLA tensors return
-            # data_ptr()==0, but their storage objects are distinct per
-            # allocation.
+            # Use the explicit PyTorch view root + geometry. Neuron/XLA tensors
+            # return data_ptr()==0 and can share a placeholder StorageImpl
+            # across independent allocations, so storage-based identities
+            # falsely merge unrelated layer caches.
             key = (
-                id(inp.untyped_storage()),
+                _alias_root_identity(inp),
                 inp.storage_offset(),
                 tuple(inp.shape),
                 tuple(inp.stride()),
@@ -505,6 +532,31 @@ def build_executable(
                 ]
             else:
                 filtered_inputs = list(inputs)
+
+            if _ALIAS_TRACE_TENSOR_LABELS:
+                runtime_labels = {
+                    i: _ALIAS_TRACE_TENSOR_LABELS[id(inp)]
+                    for i, inp in enumerate(inputs)
+                    if id(inp) in _ALIAS_TRACE_TENSOR_LABELS
+                }
+                alias_records = [
+                    {
+                        "output": output_idx,
+                        "input": input_idx,
+                        "label": runtime_labels.get(input_idx),
+                    }
+                    for output_idx, input_idx in sorted(self.io_map.items())
+                ]
+                logger.info(
+                    "NEURON_EXECUTABLE_ALIAS_TRACE %s",
+                    json.dumps(
+                        {
+                            "matched_inputs": runtime_labels,
+                            "aliases": alias_records,
+                        },
+                        sort_keys=True,
+                    ),
+                )
 
             outputs = []
             for i, metadata in enumerate(program_shape.result.tuple_shapes):
