@@ -102,7 +102,12 @@ def sample(
     if all_greedy:
         # Cast to int32 so that sampled token ids can be fed into embedding layer
         # (NKI kernels may return uint32 indices)
-        return _argmax_sample(logits, tp_group).to(torch.int32)
+        return _argmax_sample(
+            logits,
+            tp_group,
+            deterministic_ties=deterministic,
+            rank=tp_rank,
+        ).to(torch.int32)
 
     # Derive dp_degree from all2all_group if provided
     if all2all_group is not None:
@@ -297,7 +302,13 @@ def _multinomial(probs: Tensor, deterministic: bool = False) -> Tensor:
     return torch.sum(rand.unsqueeze(-1) > cdf, dim=-1)
 
 
-def _argmax_sample(logits: Tensor, process_group: ProcessGroup | None = None) -> Tensor:
+def _argmax_sample(
+    logits: Tensor,
+    process_group: ProcessGroup | None = None,
+    *,
+    deterministic_ties: bool = False,
+    rank: Tensor | None = None,
+) -> Tensor:
     """Greedy sampling using argmax with optional distributed support."""
     if _can_use_distributed_argmax(process_group):
         return distributed_argmax(
@@ -306,6 +317,8 @@ def _argmax_sample(logits: Tensor, process_group: ProcessGroup | None = None) ->
             gather_dim=-1,
             keepdim=False,
             process_group=process_group,
+            deterministic_ties=deterministic_ties,
+            rank=rank,
         )
     return torch.argmax(logits, dim=-1)
 

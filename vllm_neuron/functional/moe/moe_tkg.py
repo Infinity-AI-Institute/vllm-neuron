@@ -30,6 +30,7 @@ def moe_tkg(
     expert_down_input_scale: Optional[Tensor] = None,
     mask_unselected_experts: bool = False,
     expert_affinities_eager: Optional[Tensor] = None,
+    pack_selected_experts: bool = False,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
     output_dtype: Optional[torch.dtype] = None,
@@ -101,6 +102,9 @@ def moe_tkg(
             mode with affinity scaling. (default: False)
         expert_affinities_eager: [T, K], Eager expert affinities. Not used in
             all_expert mode.
+        pack_selected_experts: Pair adjacent selected BF16 experts into full-width
+            matrix tiles. This is a narrow T=1, I=64, LNC2 optimization and is
+            ignored in all-expert mode. (default: False)
         expert_affinities_scaling_mode: When to apply affinity scaling. Supported
             values: NO_SCALE, POST_SCALE. (default: NO_SCALE)
         activation_fn: Activation function type. (default: SiLU)
@@ -175,6 +179,7 @@ def moe_tkg(
             expert_down_input_scale=expert_down_input_scale,
             mask_unselected_experts=mask_unselected_experts,
             expert_affinities_eager=expert_affinities_eager,
+            pack_selected_experts=pack_selected_experts,
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             activation_fn=activation_fn,
             output_dtype=output_dtype,

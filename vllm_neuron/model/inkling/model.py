@@ -11,6 +11,8 @@ intentionally outside the initial text-serving contract.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
@@ -22,6 +24,7 @@ import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
+from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
@@ -31,6 +34,35 @@ from vllm_neuron.utils.weight_loader import (
 
 from .config import InklingConfig
 from .routing import inkling_route
+
+
+def _mask_padded_vocab_logits(
+    logits: torch.Tensor,
+    rank: torch.Tensor | None,
+    *,
+    unpadded_vocab_size: int,
+    sharded: bool = True,
+) -> torch.Tensor:
+    """Mask padded rows of a full or uniformly TP-sharded projection."""
+    if sharded and rank is None:
+        raise ValueError("on-device sampling requires a tensor TP rank")
+    if sharded and rank.numel() != 1:
+        raise ValueError(f"TP rank must be scalar, got shape={tuple(rank.shape)}")
+    local_vocab_size = logits.shape[-1]
+    global_ids = torch.arange(
+        local_vocab_size,
+        dtype=torch.int64,
+        device=logits.device,
+    )
+    if sharded:
+        global_ids = (
+            global_ids
+            + rank.reshape(()).to(torch.int64) * local_vocab_size
+        )
+    return logits.masked_fill(
+        global_ids >= unpadded_vocab_size,
+        torch.finfo(logits.dtype).min,
+    )
 
 
 def _rms_norm(
@@ -168,6 +200,112 @@ def _local_expert_down_loader(*, num_local_experts: int) -> SafetensorsWeightLoa
     return SafetensorsWeightLoader(transform=transform)
 
 
+def _tp_expert_gate_up_loader(
+    *,
+    intermediate_size: int,
+    shard_size: int,
+    tp_size: int,
+) -> SafetensorsWeightLoader:
+    """Keep every expert and shard its interleaved intermediate pairs."""
+
+    def transform(slices, rank):
+        source = slices[0]
+        start = (rank % tp_size) * shard_size
+        get_shape = getattr(source, "get_shape", None)
+        source_shape = get_shape() if get_shape is not None else source.shape
+        experts, packed_intermediate, hidden = source_shape
+        if packed_intermediate != 2 * intermediate_size:
+            raise ValueError(
+                "Inkling gate/up checkpoint axis must contain interleaved pairs: "
+                f"expected {2 * intermediate_size}, got {packed_intermediate}"
+            )
+        # PySafeSlice is deliberately lazy and cannot be reshaped. Select only
+        # this rank's interleaved rows first, then reshape the materialized
+        # tensor. This also avoids reading every rank's expert shard from disk.
+        local = source[
+            :,
+            2 * start : 2 * (start + shard_size),
+            :,
+        ]
+        return (
+            local.reshape(experts, shard_size, 2, hidden)
+            .permute(0, 3, 2, 1)
+            .contiguous()
+        )
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _tp_expert_down_loader(
+    *,
+    shard_size: int,
+    tp_size: int,
+) -> SafetensorsWeightLoader:
+    """Keep every expert and shard the checkpoint's intermediate axis."""
+
+    def transform(slices, rank):
+        source = slices[0]
+        start = (rank % tp_size) * shard_size
+        return source[:, :, start : start + shard_size].transpose(1, 2).contiguous()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _tp_fused_expert_gate_up_loader(
+    *,
+    intermediate_size: int,
+    shard_size: int,
+    tp_size: int,
+) -> SafetensorsWeightLoader:
+    """Fuse routed and shared experts after slicing their TP shards."""
+
+    routed_loader = _tp_expert_gate_up_loader(
+        intermediate_size=intermediate_size,
+        shard_size=shard_size,
+        tp_size=tp_size,
+    )
+    shared_loader = _shared_gate_up_loader(
+        intermediate_size=intermediate_size,
+        shard_size=shard_size,
+        tp_size=tp_size,
+    )
+
+    def transform(slices, rank):
+        if len(slices) != 2:
+            raise ValueError("fused gate/up loading requires routed and shared weights")
+        routed = routed_loader.load([slices[0]], rank)
+        shared = shared_loader.load([slices[1]], rank)
+        return torch.cat((routed, shared), dim=0)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _tp_fused_expert_down_loader(
+    *,
+    shard_size: int,
+    tp_size: int,
+) -> SafetensorsWeightLoader:
+    """Fuse routed and shared down projections after TP slicing."""
+
+    routed_loader = _tp_expert_down_loader(
+        shard_size=shard_size,
+        tp_size=tp_size,
+    )
+    shared_loader = _shared_down_loader(
+        shard_size=shard_size,
+        tp_size=tp_size,
+    )
+
+    def transform(slices, rank):
+        if len(slices) != 2:
+            raise ValueError("fused down loading requires routed and shared weights")
+        routed = routed_loader.load([slices[0]], rank)
+        shared = shared_loader.load([slices[1]], rank)
+        return torch.cat((routed, shared), dim=0)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def _shared_gate_up_loader(
     *,
     intermediate_size: int,
@@ -288,13 +426,18 @@ class InklingPagedConv(nn.Module):
         )
         return valid, updated_cache
 
-    def _read_positions(
+    def _read_history(
         self,
         cache: torch.Tensor,
         absolute_positions: torch.Tensor,
         stream: int,
         metadata: dict,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read all historical convolution taps with one paged gather."""
+        if absolute_positions.ndim != 2:
+            raise ValueError(
+                "convolution history positions must have shape [tokens, taps]"
+            )
         block_table = metadata["block_table_tensor"].to(torch.long)
         batch = block_table.shape[0]
         tokens = absolute_positions.shape[0]
@@ -320,9 +463,9 @@ class InklingPagedConv(nn.Module):
         else:
             position_offset = position_offset.reshape(-1).to(torch.long)
 
-        relative_positions = absolute_positions.to(
-            torch.long
-        ) - position_offset.index_select(0, sequence_ids)
+        relative_positions = absolute_positions.to(torch.long) - position_offset.index_select(
+            0, sequence_ids
+        )[:, None]
         table_columns = torch.div(relative_positions, block_size, rounding_mode="floor")
         valid = (
             (absolute_positions >= 0)
@@ -330,22 +473,28 @@ class InklingPagedConv(nn.Module):
             & (table_columns < block_table.shape[1])
         )
         safe_columns = table_columns.clamp(0, block_table.shape[1] - 1)
-        block_ids = block_table[sequence_ids, safe_columns]
+        block_ids = block_table[sequence_ids[:, None], safe_columns]
         valid &= block_ids >= 0
         safe_blocks = block_ids.clamp(0, cache.shape[0] - 1)
         offsets = relative_positions.remainder(block_size)
 
         start_head = self.offsets[stream] // self.head_dim
         num_heads = self.widths[stream] // self.head_dim
-        selected = cache.index_select(0, safe_blocks)[
-            :, start_head : start_head + num_heads
-        ]
-        gather_index = offsets[:, None, None, None].expand(
-            -1, num_heads, 1, self.head_dim
+        head_indices = torch.arange(
+            num_heads,
+            device=cache.device,
+            dtype=torch.long,
+        ) + start_head
+        values = cache[
+            safe_blocks[:, :, None],
+            head_indices[None, None, :],
+            offsets[:, :, None],
+        ].reshape(
+            tokens,
+            absolute_positions.shape[1],
+            self.widths[stream],
         )
-        values = torch.gather(selected, 2, gather_index).squeeze(2)
-        values = values.reshape(tokens, self.widths[stream]).float()
-        return values, valid
+        return values.float(), valid
 
     def forward(
         self,
@@ -359,16 +508,33 @@ class InklingPagedConv(nn.Module):
         input_dtype = states.dtype
         states = states.reshape(-1, self.widths[stream])
         current_valid, cache = self._write(cache, states, stream, metadata)
-        output = states.float()
-        for tap in range(self.kernel_size):
-            tap_positions = positions.reshape(-1) - (self.kernel_size - 1 - tap)
-            cached, tap_valid = self._read_positions(
-                cache, tap_positions, stream, metadata
-            )
+        weight = weight.reshape(self.widths[stream], self.kernel_size)
+        # The newest convolution tap is the state we just wrote. Reuse that
+        # tensor directly instead of issuing a paged-cache read for the current
+        # position. Only the preceding taps require history from the cache.
+        output = states.float() + states.float() * weight[:, -1]
+        history_offsets = torch.arange(
+            self.kernel_size - 1,
+            0,
+            -1,
+            dtype=torch.long,
+            device=positions.device,
+        )
+        history_positions = positions.reshape(-1, 1) - history_offsets[None, :]
+        history, history_valid = self._read_history(
+            cache,
+            history_positions,
+            stream,
+            metadata,
+        )
+        # Keep the small, fixed tap reduction explicit. The compiler schedules
+        # these three vector operations more efficiently than a transpose plus
+        # generic reduction, while the expensive paged lookup remains batched.
+        for tap in range(self.kernel_size - 1):
             output = output + (
-                cached
-                * weight.reshape(self.widths[stream], self.kernel_size)[:, tap]
-                * tap_valid[:, None]
+                history[:, tap, :]
+                * weight[:, tap]
+                * history_valid[:, tap, None]
             )
         output = (output * current_valid[:, None].to(output.dtype)).to(input_dtype)
         return output, cache
@@ -863,7 +1029,7 @@ class InklingDenseMLP(nn.Module):
 
 
 class InklingMoE(nn.Module):
-    """Exact router plus EP-sharded routed and TP-sharded shared experts."""
+    """Exact router with selectable EP- or TP-sharded routed experts."""
 
     def __init__(self, config: InklingConfig):
         super().__init__()
@@ -872,22 +1038,60 @@ class InklingMoE(nn.Module):
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.rank = self.tp_group.rank_in_group
-        if not get_current_vllm_config().parallel_config.enable_expert_parallel:
-            raise ValueError("Inkling-Small requires --enable-expert-parallel")
-        from vllm_neuron.parallel.neuron_parallel_state import (
-            get_neuron_ep_degree,
-            get_neuron_ep_rank,
+        self.expert_sharding = os.environ.get("INKLING_EXPERT_SHARDING", "ep")
+        self.fuse_shared_experts = bool(
+            int(os.environ.get("INKLING_FUSE_SHARED_EXPERTS", "0"))
         )
-
-        self.ep_degree = get_neuron_ep_degree()
-        self.ep_rank = get_neuron_ep_rank()
-        if self.ep_degree != self.world_size:
-            raise NotImplementedError(
-                "Inkling-Small initial path requires pure EP across TP32"
+        self.direct_affinities = bool(
+            int(os.environ.get("INKLING_DIRECT_AFFINITIES", "0"))
+        )
+        self.pack_selected_experts = bool(
+            int(os.environ.get("INKLING_PACK_SELECTED_EXPERTS", "0"))
+        )
+        ep_enabled = get_current_vllm_config().parallel_config.enable_expert_parallel
+        if self.expert_sharding == "ep":
+            if not ep_enabled:
+                raise ValueError("EP expert sharding requires --enable-expert-parallel")
+            from vllm_neuron.parallel.neuron_parallel_state import (
+                get_neuron_ep_degree,
+                get_neuron_ep_rank,
             )
-        if config.n_routed_experts % self.ep_degree:
-            raise ValueError("Inkling experts must divide expert parallel degree")
-        self.num_local_experts = config.n_routed_experts // self.ep_degree
+
+            self.ep_degree = get_neuron_ep_degree()
+            self.ep_rank = get_neuron_ep_rank()
+            if self.ep_degree != self.world_size:
+                raise NotImplementedError(
+                    "Inkling EP expert sharding requires pure EP across TP32"
+                )
+            if config.n_routed_experts % self.ep_degree:
+                raise ValueError("Inkling experts must divide expert parallel degree")
+            self.expert_tp_degree = 1
+            self.num_local_experts = config.n_routed_experts // self.ep_degree
+        elif self.expert_sharding == "tp":
+            if ep_enabled:
+                raise ValueError("TP expert sharding requires expert parallelism off")
+            self.ep_degree = 1
+            self.ep_rank = 0
+            self.expert_tp_degree = self.world_size
+            self.num_local_experts = config.n_routed_experts
+        else:
+            raise ValueError(
+                f"unknown INKLING_EXPERT_SHARDING={self.expert_sharding!r}"
+            )
+        if self.fuse_shared_experts and self.expert_sharding != "tp":
+            raise ValueError("shared-expert fusion requires TP expert sharding")
+        if self.pack_selected_experts and self.expert_sharding != "tp":
+            raise ValueError("packed selected experts require TP sharding")
+        if self.pack_selected_experts and self.fuse_shared_experts:
+            raise ValueError("packed selected experts do not support shared-expert fusion")
+        self.num_kernel_experts = self.num_local_experts
+        if self.fuse_shared_experts:
+            self.num_kernel_experts += config.n_shared_experts
+        if config.intermediate_size % self.expert_tp_degree:
+            raise ValueError("Inkling expert width must divide expert TP degree")
+        self.expert_intermediate_per_rank = (
+            config.intermediate_size // self.expert_tp_degree
+        )
         self.router_weight = nn.Parameter(
             torch.empty(
                 config.n_routed_experts + config.n_shared_experts,
@@ -901,17 +1105,17 @@ class InklingMoE(nn.Module):
         self.global_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
         self.expert_gate_up_weight = nn.Parameter(
             torch.empty(
-                self.num_local_experts,
+                self.num_kernel_experts,
                 config.hidden_size,
                 2,
-                config.intermediate_size,
+                self.expert_intermediate_per_rank,
                 dtype=self.dtype,
             )
         )
         self.expert_down_weight = nn.Parameter(
             torch.empty(
-                self.num_local_experts,
-                config.intermediate_size,
+                self.num_kernel_experts,
+                self.expert_intermediate_per_rank,
                 config.hidden_size,
                 dtype=self.dtype,
             )
@@ -919,49 +1123,74 @@ class InklingMoE(nn.Module):
         if config.intermediate_size % self.world_size:
             raise ValueError("Inkling shared expert width must divide TP")
         self.shared_intermediate_per_rank = config.intermediate_size // self.world_size
-        self.shared_gate_up_weight = nn.Parameter(
-            torch.empty(
-                config.n_shared_experts,
-                config.hidden_size,
-                2,
-                self.shared_intermediate_per_rank,
-                dtype=self.dtype,
+        if self.fuse_shared_experts:
+            self.shared_gate_up_weight = None
+            self.shared_down_weight = None
+        else:
+            self.shared_gate_up_weight = nn.Parameter(
+                torch.empty(
+                    config.n_shared_experts,
+                    config.hidden_size,
+                    2,
+                    self.shared_intermediate_per_rank,
+                    dtype=self.dtype,
+                )
             )
-        )
-        self.shared_down_weight = nn.Parameter(
-            torch.empty(
-                config.n_shared_experts,
-                self.shared_intermediate_per_rank,
-                config.hidden_size,
-                dtype=self.dtype,
+            self.shared_down_weight = nn.Parameter(
+                torch.empty(
+                    config.n_shared_experts,
+                    self.shared_intermediate_per_rank,
+                    config.hidden_size,
+                    dtype=self.dtype,
+                )
             )
-        )
-        set_weight_loader(
-            self.expert_gate_up_weight,
-            _local_expert_gate_up_loader(
+        if self.expert_sharding == "ep":
+            expert_gate_up_loader = _local_expert_gate_up_loader(
                 num_local_experts=self.num_local_experts,
                 intermediate_size=config.intermediate_size,
-            ),
-        )
-        set_weight_loader(
-            self.expert_down_weight,
-            _local_expert_down_loader(num_local_experts=self.num_local_experts),
-        )
-        set_weight_loader(
-            self.shared_gate_up_weight,
-            _shared_gate_up_loader(
-                intermediate_size=config.intermediate_size,
-                shard_size=self.shared_intermediate_per_rank,
-                tp_size=self.world_size,
-            ),
-        )
-        set_weight_loader(
-            self.shared_down_weight,
-            _shared_down_loader(
-                shard_size=self.shared_intermediate_per_rank,
-                tp_size=self.world_size,
-            ),
-        )
+            )
+            expert_down_loader = _local_expert_down_loader(
+                num_local_experts=self.num_local_experts
+            )
+        else:
+            if self.fuse_shared_experts:
+                expert_gate_up_loader = _tp_fused_expert_gate_up_loader(
+                    intermediate_size=config.intermediate_size,
+                    shard_size=self.expert_intermediate_per_rank,
+                    tp_size=self.expert_tp_degree,
+                )
+                expert_down_loader = _tp_fused_expert_down_loader(
+                    shard_size=self.expert_intermediate_per_rank,
+                    tp_size=self.expert_tp_degree,
+                )
+            else:
+                expert_gate_up_loader = _tp_expert_gate_up_loader(
+                    intermediate_size=config.intermediate_size,
+                    shard_size=self.expert_intermediate_per_rank,
+                    tp_size=self.expert_tp_degree,
+                )
+                expert_down_loader = _tp_expert_down_loader(
+                    shard_size=self.expert_intermediate_per_rank,
+                    tp_size=self.expert_tp_degree,
+                )
+        set_weight_loader(self.expert_gate_up_weight, expert_gate_up_loader)
+        set_weight_loader(self.expert_down_weight, expert_down_loader)
+        if not self.fuse_shared_experts:
+            set_weight_loader(
+                self.shared_gate_up_weight,
+                _shared_gate_up_loader(
+                    intermediate_size=config.intermediate_size,
+                    shard_size=self.shared_intermediate_per_rank,
+                    tp_size=self.world_size,
+                ),
+            )
+            set_weight_loader(
+                self.shared_down_weight,
+                _shared_down_loader(
+                    shard_size=self.shared_intermediate_per_rank,
+                    tp_size=self.world_size,
+                ),
+            )
         self.prefill_chunk_size = 128
 
     def _run_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -975,31 +1204,77 @@ class InklingMoE(nn.Module):
             top_k=self.config.num_experts_per_tok,
             route_scale=self.config.route_scale,
         )
-        rank_id = torch.tensor(
-            [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
+        if self.fuse_shared_experts:
+            shared_indices = torch.arange(
+                self.config.n_shared_experts,
+                dtype=indices.dtype,
+                device=indices.device,
+            )
+            shared_indices = shared_indices + self.config.n_routed_experts
+            shared_indices = shared_indices.reshape(1, -1).expand(
+                hidden_states.shape[0], -1
+            )
+            kernel_indices = torch.cat((indices, shared_indices), dim=-1)
+            kernel_affinities = torch.cat((affinities, shared_gammas), dim=-1)
+        else:
+            kernel_indices = indices
+            kernel_affinities = affinities
+        use_all_experts = (
+            self.expert_sharding == "ep"
+            or hidden_states.shape[0] * kernel_indices.shape[-1]
+            >= self.num_kernel_experts
         )
+        eager_affinities = None
+        if self.direct_affinities and not use_all_experts:
+            eager_affinities = torch.gather(
+                kernel_affinities, -1, kernel_indices.to(torch.long)
+            )
+        rank_id = None
+        if use_all_experts:
+            rank_id = torch.tensor(
+                [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
+            )
         routed = NF.moe_tkg(
             hidden_input=hidden_states.to(self.dtype),
             expert_gate_up_weights=self.expert_gate_up_weight,
             expert_down_weights=self.expert_down_weight,
-            expert_affinities=affinities.to(self.dtype),
-            expert_index=indices,
-            is_all_expert=True,
+            # The all-expert kernel accepts BF16 affinities, while the
+            # selective-expert Trn2 path performs tensor-scalar affinity
+            # scaling in FP32. Preserve the router's FP32 output for that
+            # decode path or NKI emits invalid tensor_scalar_arith MLIR.
+            expert_affinities=(
+                kernel_affinities.to(self.dtype)
+                if use_all_experts
+                else kernel_affinities
+            ),
+            expert_index=kernel_indices,
+            is_all_expert=use_all_experts,
+            expert_affinities_eager=eager_affinities,
+            pack_selected_experts=self.pack_selected_experts,
             rank_id=rank_id,
-            mask_unselected_experts=True,
+            mask_unselected_experts=use_all_experts,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU,
             output_dtype=self.dtype,
         )
-        shared_gate_up = torch.einsum(
-            "th,ehpi->tepi",
-            hidden_states.to(self.dtype),
-            self.shared_gate_up_weight,
-        )
-        shared_hidden = F.silu(shared_gate_up[..., 0, :]) * shared_gate_up[..., 1, :]
-        shared = torch.einsum("tei,eih->teh", shared_hidden, self.shared_down_weight)
-        shared = (shared.float() * shared_gammas[..., None]).sum(dim=1).to(self.dtype)
-        output = routed + shared
+        if self.fuse_shared_experts:
+            output = routed
+        else:
+            shared_gate_up = torch.einsum(
+                "th,ehpi->tepi",
+                hidden_states.to(self.dtype),
+                self.shared_gate_up_weight,
+            )
+            shared_hidden = (
+                F.silu(shared_gate_up[..., 0, :]) * shared_gate_up[..., 1, :]
+            )
+            shared = torch.einsum(
+                "tei,eih->teh", shared_hidden, self.shared_down_weight
+            )
+            shared = (shared.float() * shared_gammas[..., None]).sum(dim=1).to(
+                self.dtype
+            )
+            output = routed + shared
         if self.world_size > 1:
             output = self.tp_group.all_reduce(output)
         return output
@@ -1160,10 +1435,6 @@ class InklingForConditionalGeneration(nn.Module):
             raise NotImplementedError(
                 f"Inkling initial path supports TP32/EP32 only: {invalid}"
             )
-        if neuron_config.on_device_sampling_config is not None:
-            raise NotImplementedError(
-                "Inkling correctness path requires on-device sampling disabled"
-            )
         if neuron_config.quantization not in (None, "bf16"):
             raise NotImplementedError(
                 "Trainium2 Inkling-Small supports the BF16 checkpoint only"
@@ -1172,6 +1443,14 @@ class InklingForConditionalGeneration(nn.Module):
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.rank = self.tp_group.rank_in_group
+        self.on_device_sampling_config = neuron_config.on_device_sampling_config
+        self.gather_sampling_logits = bool(
+            int(os.environ.get("INKLING_GATHER_SAMPLING_LOGITS", "0"))
+        )
+        if self.gather_sampling_logits and self.on_device_sampling_config is None:
+            raise ValueError(
+                "INKLING_GATHER_SAMPLING_LOGITS=1 requires on-device sampling"
+            )
         if self.world_size != 32:
             raise NotImplementedError("Inkling-Small initial path requires TP32")
         self.lm_head = neuron_nn.ColumnParallelLinear(
@@ -1179,9 +1458,21 @@ class InklingForConditionalGeneration(nn.Module):
             config.padded_vocab_size,
             bias=False,
             dtype=config.torch_dtype,
-            gather_output=True,
+            gather_output=(
+                self.on_device_sampling_config is None
+                or self.gather_sampling_logits
+            ),
             tp_group=self.tp_group.device_group,
         )
+        if self.on_device_sampling_config is not None:
+            self.sampler = Sampler(
+                self.on_device_sampling_config,
+                process_group=(
+                    None
+                    if self.gather_sampling_logits
+                    else self.tp_group.device_group
+                ),
+            )
         self._bound_kv_caches: dict[str, list[torch.Tensor]] = {}
         self._bound_kv_cache_roots: dict[str, torch.Tensor] = {}
 
@@ -1203,9 +1494,7 @@ class InklingForConditionalGeneration(nn.Module):
         del (
             inputs_embeds,
             is_token_ids,
-            sampling_params,
             spec_decode_metadata,
-            logit_mask,
             kwargs,
         )
         if attn_metadata is None:
@@ -1226,7 +1515,30 @@ class InklingForConditionalGeneration(nn.Module):
         if self.config.logits_mup_width_multiplier:
             hidden_states = hidden_states / self.config.logits_mup_width_multiplier
         logits = self.lm_head(hidden_states)
-        return logits[..., : self.config.unpadded_vocab_size]
+        if self.on_device_sampling_config is None:
+            return logits[..., : self.config.unpadded_vocab_size]
+
+        logits = _mask_padded_vocab_logits(
+            logits,
+            rank,
+            unpadded_vocab_size=self.config.unpadded_vocab_size,
+            sharded=not self.gather_sampling_logits,
+        )
+        if (
+            logit_mask is not None
+            and logit_mask.shape[-1] == self.config.unpadded_vocab_size
+        ):
+            logit_mask = F.pad(
+                logit_mask,
+                (0, self.config.padded_vocab_size - self.config.unpadded_vocab_size),
+                value=False,
+            )
+        return self.sampler(
+            logits,
+            sampling_params,
+            logit_mask=logit_mask,
+            tp_rank=rank,
+        )
 
     def get_kv_spec(self) -> KVSpec:
         layers: list[LayerSpec] = []
@@ -1362,8 +1674,8 @@ class InklingForConditionalGeneration(nn.Module):
             layer.cache_root = attention_root
             layer.cache_allocation_index = allocation_index
 
-    def _checkpoint_mappings(self) -> dict[str, str]:
-        mappings: dict[str, str] = {
+    def _checkpoint_mappings(self) -> dict[str, str | list[str]]:
+        mappings: dict[str, str | list[str]] = {
             "model.embed_tokens.weight": "model.llm.embed.weight",
             "model.embed_norm.weight": "model.llm.embed_norm.weight",
             "model.norm.weight": "model.llm.norm.weight",
@@ -1405,27 +1717,44 @@ class InklingForConditionalGeneration(nn.Module):
                     }
                 )
             else:
-                mappings.update(
-                    {
-                        f"{native}.mlp.router_weight": f"{source}.mlp.gate.weight",
-                        f"{native}.mlp.correction_bias": f"{source}.mlp.gate.bias",
-                        f"{native}.mlp.global_scale": (
-                            f"{source}.mlp.gate.global_scale"
-                        ),
-                        f"{native}.mlp.expert_gate_up_weight": (
-                            f"{source}.mlp.experts.w13_weight"
-                        ),
-                        f"{native}.mlp.expert_down_weight": (
-                            f"{source}.mlp.experts.w2_weight"
-                        ),
-                        f"{native}.mlp.shared_gate_up_weight": (
-                            f"{source}.mlp.shared_experts.shared_w13_weight"
-                        ),
-                        f"{native}.mlp.shared_down_weight": (
-                            f"{source}.mlp.shared_experts.shared_w2_weight"
-                        ),
-                    }
-                )
+                moe_mappings: dict[str, str | list[str]] = {
+                    f"{native}.mlp.router_weight": f"{source}.mlp.gate.weight",
+                    f"{native}.mlp.correction_bias": f"{source}.mlp.gate.bias",
+                    f"{native}.mlp.global_scale": (
+                        f"{source}.mlp.gate.global_scale"
+                    ),
+                }
+                if layer.mlp.fuse_shared_experts:
+                    moe_mappings.update(
+                        {
+                            f"{native}.mlp.expert_gate_up_weight": [
+                                f"{source}.mlp.experts.w13_weight",
+                                f"{source}.mlp.shared_experts.shared_w13_weight",
+                            ],
+                            f"{native}.mlp.expert_down_weight": [
+                                f"{source}.mlp.experts.w2_weight",
+                                f"{source}.mlp.shared_experts.shared_w2_weight",
+                            ],
+                        }
+                    )
+                else:
+                    moe_mappings.update(
+                        {
+                            f"{native}.mlp.expert_gate_up_weight": (
+                                f"{source}.mlp.experts.w13_weight"
+                            ),
+                            f"{native}.mlp.expert_down_weight": (
+                                f"{source}.mlp.experts.w2_weight"
+                            ),
+                            f"{native}.mlp.shared_gate_up_weight": (
+                                f"{source}.mlp.shared_experts.shared_w13_weight"
+                            ),
+                            f"{native}.mlp.shared_down_weight": (
+                                f"{source}.mlp.shared_experts.shared_w2_weight"
+                            ),
+                        }
+                    )
+                mappings.update(moe_mappings)
         return mappings
 
     def load_weights(
