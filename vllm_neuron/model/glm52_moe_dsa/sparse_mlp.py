@@ -9,7 +9,11 @@ import torch.nn as nn
 from .config import Glm52MoeDsaConfig
 from .expert_kernels import Glm52RoutedExperts, dense_glm52_affinities
 from .moe import Glm52ExpertRouter
-from .parallelism import RoutedExpertPlan
+from .parallelism import (
+    RoutedExpertPlan,
+    assert_plan_matches_physical_mesh,
+    physical_mesh_ep_ranks,
+)
 from .shared_expert import Glm52SharedExpert
 
 
@@ -88,6 +92,19 @@ class Glm52SparseMlp(nn.Module):
         if expert_tp_group.world_size != plan.expert_tp_degree:
             raise ValueError(
                 "expert TP subgroup size must match the expert plan TP degree"
+            )
+        # The size checks above compare the ownership plan against itself. They
+        # cannot see that `first_expert` below (line ~185, arithmetic) and
+        # `moe_group` (line ~207, mesh-derived) are two different rank->partition
+        # conventions. Compare them explicitly, once, at construction.
+        mesh_ranks = physical_mesh_ep_ranks()
+        if mesh_ranks is not None:
+            mesh_ep_rank, mesh_expert_tp_rank = mesh_ranks
+            assert_plan_matches_physical_mesh(
+                plan,
+                global_rank,
+                mesh_ep_rank=mesh_ep_rank,
+                mesh_expert_tp_rank=mesh_expert_tp_rank,
             )
 
         self.config = config
