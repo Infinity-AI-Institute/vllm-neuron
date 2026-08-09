@@ -241,13 +241,9 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
     t0 = time.perf_counter()
     try:
         if num_workers == 1:
-            _run_fresh_children_sequentially(
-                jobs, parent_rank, trace_rank_concurrency
-            )
+            _run_fresh_children_sequentially(jobs, parent_rank, trace_rank_concurrency)
         else:
-            _run_pool_fork(
-                jobs, parent_rank, num_workers, trace_rank_concurrency
-            )
+            _run_pool_fork(jobs, parent_rank, num_workers, trace_rank_concurrency)
     except Exception as exc:
         emit_trace_milestone(
             "pool_failed",
@@ -575,6 +571,7 @@ def _fork_child_main(
             jobs=len(jobs_slice),
         )
         _swap_unique_models_to_meta([model for model, _ in jobs_slice])
+        _validate_models_on_meta([model for model, _ in jobs_slice])
         emit_trace_milestone(
             "meta_swap_completed",
             parent_rank=parent_rank,
@@ -677,17 +674,29 @@ def _walk_tensors(obj: Any, path: str = ""):
     attributes. ``path`` is a dotted/bracketed accessor ("a.b[3].c")
     so the validator's error message can name the offending field.
     """
+    yield from _walk_tensors_seen(obj, path, set())
+
+
+def _walk_tensors_seen(obj: Any, path: str, seen: set[int]):
     if isinstance(obj, torch.Tensor):
         yield path, obj
         return
+    if isinstance(obj, torch.nn.Module):
+        return
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return
+    seen.add(obj_id)
+
     if isinstance(obj, dict):
         for k, v in obj.items():
             sep = "" if not path else "."
-            yield from _walk_tensors(v, f"{path}{sep}{k}")
+            yield from _walk_tensors_seen(v, f"{path}{sep}{k}", seen)
         return
     if isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
-            yield from _walk_tensors(v, f"{path}[{i}]")
+            yield from _walk_tensors_seen(v, f"{path}[{i}]", seen)
         return
     # Dataclass-like (e.g. AttentionMetadata). Skip primitives, modules,
     # and anything without a sensible __dict__.
@@ -695,7 +704,54 @@ def _walk_tensors(obj: Any, path: str = ""):
         type_name = type(obj).__name__
         for k, v in vars(obj).items():
             sep = "" if not path else "."
-            yield from _walk_tensors(v, f"{path}{sep}<{type_name}>.{k}")
+            yield from _walk_tensors_seen(v, f"{path}{sep}<{type_name}>.{k}", seen)
+
+
+def _validate_models_on_meta(models: list[Any]) -> None:
+    """Reject live device tensors still reachable from trace models.
+
+    This runs immediately after the child meta swap and before Dynamo starts.
+    The capture backend performs a similar device check much later, after the
+    model has been Python-expanded. Naming the owner path here turns a late,
+    expensive backend failure into an immediate diagnostic.
+    """
+    seen_modules: set[int] = set()
+    for model_index, model in enumerate(models):
+        underlying = _underlying_module(model)
+        if not isinstance(underlying, torch.nn.Module):
+            continue
+        if id(underlying) in seen_modules:
+            continue
+        seen_modules.add(id(underlying))
+
+        for module_path, submod in underlying.named_modules():
+            owner = f"models[{model_index}]"
+            if module_path:
+                owner += f".{module_path}"
+            for name, param in submod.named_parameters(recurse=False):
+                if param.device.type != "meta":
+                    raise ValueError(
+                        f"parallel trace model tensor {owner}.{name} remains "
+                        f"on {param.device} after meta swap "
+                        f"shape={tuple(param.shape)} dtype={param.dtype}"
+                    )
+            for name, buffer in submod.named_buffers(recurse=False):
+                if buffer.device.type != "meta":
+                    raise ValueError(
+                        f"parallel trace model tensor {owner}.{name} remains "
+                        f"on {buffer.device} after meta swap "
+                        f"shape={tuple(buffer.shape)} dtype={buffer.dtype}"
+                    )
+            for name, value in vars(submod).items():
+                if name in ("_parameters", "_buffers", "_modules"):
+                    continue
+                for nested_path, tensor in _walk_tensors(value, f"{owner}.{name}"):
+                    if tensor.device.type != "meta":
+                        raise ValueError(
+                            f"parallel trace model tensor {nested_path} remains "
+                            f"on {tensor.device} after meta swap "
+                            f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                        )
 
 
 # ---------------------------------------------------------------------------
@@ -732,10 +788,10 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
     NRT_STATE_CHILD. We keep the originals alive in a module-level list
     so destructors don't fire until child exit.
 
-    Beyond parameters/buffers, this also swaps plain tensor attributes
-    (``__dict__`` entries that are torch.Tensor) — KV caches like
-    ``self.k_cache`` / ``self.v_cache`` are bound this way via
-    ``bind_kv_cache`` and live on the runtime device.
+    Beyond parameters/buffers, this also swaps tensors held by plain
+    attributes, including tensors nested in dict/list/tuple containers.
+    K3 binds its paged MLA caches this way (for example ``_kv_caches``),
+    and those caches live on the runtime device.
 
     Alias preservation: when two attribute slots are views descended from
     the same source tensor (the typical KV cache pattern:
@@ -762,6 +818,8 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
     """
     storage_to_meta: dict[int, torch.UntypedStorage] = {}
     id_to_meta: dict[int, torch.Tensor] = {}
+    container_to_meta: dict[int, Any] = {}
+    containers_in_progress: set[int] = set()
 
     def _alias_root_id(src: torch.Tensor) -> int:
         root = src
@@ -796,6 +854,54 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
         _META_PARAM_KEEPALIVE.append(src)
         return repl
 
+    def _replace_nested_tensors(value: Any) -> Any:
+        """Replace tensors in supported attribute containers.
+
+        Dicts and lists are updated in place so shared-container aliases and
+        self-references remain intact. Tuples are rebuilt because they are
+        immutable, with completed replacements memoized for repeated aliases.
+        A pathological cycle that re-enters an in-progress tuple is left at
+        that edge rather than recursing forever; ordinary mutable-container
+        cycles are fully supported.
+        """
+        if isinstance(value, torch.Tensor):
+            if value.device.type == "meta":
+                return value
+            return _replacement_for(value)
+        if isinstance(value, torch.nn.Module):
+            return value
+
+        value_id = id(value)
+        cached = container_to_meta.get(value_id)
+        if cached is not None:
+            return cached
+
+        if isinstance(value, dict):
+            container_to_meta[value_id] = value
+            for key, item in list(value.items()):
+                value[key] = _replace_nested_tensors(item)
+            return value
+        if isinstance(value, list):
+            container_to_meta[value_id] = value
+            for index, item in enumerate(value):
+                value[index] = _replace_nested_tensors(item)
+            return value
+        if isinstance(value, tuple):
+            if value_id in containers_in_progress:
+                return value
+            containers_in_progress.add(value_id)
+            try:
+                items = tuple(_replace_nested_tensors(item) for item in value)
+                if hasattr(value, "_fields"):
+                    replacement = type(value)(*items)
+                else:
+                    replacement = items
+                container_to_meta[value_id] = replacement
+                return replacement
+            finally:
+                containers_in_progress.remove(value_id)
+        return value
+
     for submod in module.modules():
         for name, param in list(submod._parameters.items()):
             if param is None or param.device.type == "meta":
@@ -808,17 +914,13 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
             if buf is None or buf.device.type == "meta":
                 continue
             submod._buffers[name] = _replacement_for(buf)
-        # Plain tensor attributes (e.g. k_cache / v_cache bound after
-        # initialize_kv_cache). Skip the special _parameters / _buffers
-        # / _modules dicts — already handled above.
+        # Plain tensor attributes and supported nested containers (e.g.
+        # K3's _kv_caches dict bound after initialize_kv_cache). Skip the
+        # special _parameters / _buffers / _modules dicts already handled.
         for name, val in list(submod.__dict__.items()):
             if name in ("_parameters", "_buffers", "_modules"):
                 continue
-            if not isinstance(val, torch.Tensor):
-                continue
-            if val.device.type == "meta":
-                continue
-            submod.__dict__[name] = _replacement_for(val)
+            submod.__dict__[name] = _replace_nested_tensors(val)
 
 
 _META_PARAM_KEEPALIVE: list = []
