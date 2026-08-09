@@ -190,3 +190,115 @@ def test_async_on_device_sampling_preserves_dtype_for_validation():
     assert model.calls[0].dtype == torch.int64
     assert output.sampled_token_ids is raw
     assert updates == []
+
+
+def test_validated_async_output_is_materialized_before_scheduler_state_update():
+    model = _StrictSamplingOutputModel()
+    async_output, output, updates = _async_output(
+        torch.tensor([3], dtype=torch.int32), model
+    )
+    runner = async_output._model_runner
+    runner.use_async_scheduling = True
+    runner._host_validated_async_scheduling_enabled = True
+    runner.async_execution_buffer = {"async_output": async_output}
+    events = []
+
+    original_update = runner._update_batch_state_with_samples
+
+    def record_sample_update(sampled, snapshot_req_ids=None):
+        events.append("sample_validated")
+        return original_update(sampled, snapshot_req_ids)
+
+    runner._update_batch_state_with_samples = record_sample_update
+    runner._update_states = lambda scheduler_output: events.append("scheduler_state")
+
+    runner._update_states_after_async_sampling_validation(object())
+
+    assert events == ["sample_validated", "scheduler_state"]
+    assert output.sampled_token_ids == [[3]]
+    assert updates == [([[3]], ["req-0"])]
+    assert runner._host_validation_barrier_steps == 1
+
+
+@pytest.mark.parametrize("bad_id", [-1, 12])
+def test_invalid_async_output_blocks_scheduler_and_slot_lifecycle(bad_id):
+    model = _StrictSamplingOutputModel()
+    raw = torch.tensor([bad_id], dtype=torch.int32)
+    async_output, output, updates = _async_output(raw, model)
+    runner = async_output._model_runner
+    runner.use_async_scheduling = True
+    runner._host_validated_async_scheduling_enabled = True
+    runner.async_execution_buffer = {"async_output": async_output}
+    state_updates = []
+    runner._update_states = lambda scheduler_output: state_updates.append(
+        scheduler_output
+    )
+
+    with pytest.raises(RuntimeError, match="out-of-range"):
+        runner._update_states_after_async_sampling_validation(object())
+
+    assert state_updates == []
+    assert output.sampled_token_ids is raw
+    assert updates == []
+    assert runner._host_validation_barrier_steps == 1
+
+
+def test_async_models_without_validator_keep_unmaterialized_future_path():
+    raw = torch.tensor([4], dtype=torch.int32)
+    async_output, output, updates = _async_output(raw, SimpleNamespace())
+    runner = async_output._model_runner
+    runner.use_async_scheduling = True
+    runner.async_execution_buffer = {"async_output": async_output}
+    state_updates = []
+    runner._update_states = lambda scheduler_output: state_updates.append(
+        scheduler_output
+    )
+    marker = object()
+
+    runner._update_states_after_async_sampling_validation(marker)
+
+    assert state_updates == [marker]
+    assert output.sampled_token_ids is raw
+    assert updates == []
+    assert not hasattr(runner, "_host_validation_barrier_steps")
+
+
+def test_validated_async_scheduling_is_off_by_default(monkeypatch):
+    runner = _on_device_runner(_StrictSamplingOutputModel())
+    runner.use_async_scheduling = True
+    monkeypatch.delenv(
+        "VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING",
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="off-by-default experiment"):
+        runner._configure_host_validated_async_scheduling()
+
+    assert runner._host_validated_async_scheduling_enabled is False
+
+
+def test_validated_async_scheduling_requires_explicit_opt_in(monkeypatch):
+    runner = _on_device_runner(_StrictSamplingOutputModel())
+    runner.use_async_scheduling = True
+    monkeypatch.setenv(
+        "VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING", "1"
+    )
+
+    runner._configure_host_validated_async_scheduling()
+
+    assert runner._host_validated_async_scheduling_enabled is True
+
+
+def test_validated_async_state_update_refuses_missing_opt_in():
+    runner = _on_device_runner(_StrictSamplingOutputModel())
+    runner.use_async_scheduling = True
+    runner.async_execution_buffer = {}
+    state_updates = []
+    runner._update_states = lambda scheduler_output: state_updates.append(
+        scheduler_output
+    )
+
+    with pytest.raises(RuntimeError, match="without its explicit experiment opt-in"):
+        runner._update_states_after_async_sampling_validation(object())
+
+    assert state_updates == []

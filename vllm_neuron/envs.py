@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_TRACE_MILESTONE_DIR: str | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_ONLY: bool = False
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
@@ -257,6 +258,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Opt-in prototype for models whose on-device sampled-token ABI requires
+    # host validation. The runner inserts a validation barrier before applying
+    # the next SchedulerOutput, preserving scheduler overlap while forbidding
+    # unvalidated device-future chaining.
+    "VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING": lambda: (
+        maybe_convert_bool(
+            os.getenv(
+                "VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING"
+            )
+        )
+        or False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (

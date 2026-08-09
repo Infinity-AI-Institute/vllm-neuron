@@ -1881,7 +1881,10 @@ class NeuronWorker(WorkerBase):
     def get_async_scheduling_stats(self) -> dict:
         """Return async scheduling step counters from the model runner.
 
-        Returns a dict with ``async_steps`` and ``sync_fallback_steps``.
+        Returns a dict with ``async_steps``, ``sync_fallback_steps``, and
+        ``host_validation_barrier_steps``. The last counter identifies async
+        steps that retained scheduler overlap but could not chain an
+        unvalidated on-device token future into the next forward.
         Returns zeros when async scheduling is not enabled.
 
         Example:
@@ -1890,10 +1893,17 @@ class NeuronWorker(WorkerBase):
             42
         """
         if not getattr(self.model_runner, "use_async_scheduling", False):
-            return {"async_steps": 0, "sync_fallback_steps": 0}
+            return {
+                "async_steps": 0,
+                "sync_fallback_steps": 0,
+                "host_validation_barrier_steps": 0,
+            }
         return {
             "async_steps": self.model_runner._async_steps,
             "sync_fallback_steps": self.model_runner._sync_fallback_steps,
+            "host_validation_barrier_steps": getattr(
+                self.model_runner, "_host_validation_barrier_steps", 0
+            ),
         }
 
     def _use_neuron_device(self) -> bool:

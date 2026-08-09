@@ -754,6 +754,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # for tests to verify async scheduling is actually engaged.
             self._async_steps: int = 0
             self._sync_fallback_steps: int = 0
+            # Number of steps whose sampled-token future had to cross the
+            # host validation boundary before the next scheduler state update.
+            # This distinguishes validated async overlap from unrestricted
+            # device-future chaining in benchmark receipts.
+            self._host_validation_barrier_steps: int = 0
             self._batch_composition_changed: bool = False
             # Last accepted token tensor from prev spec step's rejection
             # sampler ([bs] int32 with default stride). Set at spec→non-spec
@@ -1222,6 +1227,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             self._sampling_output_validator = getattr(
                 self.model, "validate_sampling_output", None
             )
+            self._configure_host_validated_async_scheduling()
             logger.info(
                 "SyntheticNeuronModel — skipping weight loading and compilation"
             )
@@ -1247,6 +1253,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         self._sampling_output_validator = getattr(
             self.model, "validate_sampling_output", None
         )
+        self._configure_host_validated_async_scheduling()
 
         self._kda_slot_table = getattr(self.model, "slot_table", None)
         if self._kda_slot_table is not None:
@@ -1602,6 +1609,93 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         sampled_token_ids_cpu = sampled_token_ids.cpu()
         self._validate_on_device_sampling_output(sampled_token_ids_cpu)
         return sampled_token_ids_cpu
+
+    def _sampling_output_requires_host_validation(self) -> bool:
+        """Whether async output must cross the host boundary before reuse.
+
+        A model-provided sampling-output validator means its token-ID ABI can
+        encode a runtime failure (for example, Kimi K3 exact greedy returns an
+        out-of-vocabulary sentinel).  Feeding that unresolved device future to
+        another model step would let an invalid ID mutate KV/recurrent state
+        before the validator can fail closed.
+        """
+        if not (
+            getattr(self, "use_async_scheduling", False)
+            and getattr(self, "on_device_sampling", False)
+        ):
+            return False
+        validator = getattr(self, "_sampling_output_validator", None)
+        if validator is None:
+            validator = getattr(
+                getattr(self, "model", None), "validate_sampling_output", None
+            )
+        return callable(validator)
+
+    def _configure_host_validated_async_scheduling(self) -> None:
+        """Require an explicit experiment opt-in for a fallible token ABI.
+
+        vLLM 0.21 resolves ``async_scheduling=None`` to enabled whenever the
+        executor advertises support, so the scheduler flag alone is not an
+        off-by-default experiment gate. Models with a host validator must also
+        opt into this vLLM-Neuron barrier explicitly. Refusing at model load is
+        preferable to discovering the unsafe configuration after the first
+        token future has already been submitted.
+        """
+        self._host_validated_async_scheduling_enabled = False
+        if not self._sampling_output_requires_host_validation():
+            return
+        if not envs.VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING:
+            raise RuntimeError(
+                "async scheduling for a model with a host-validated on-device "
+                "sampling ABI is an off-by-default experiment. Disable it with "
+                "--no-async-scheduling, or explicitly set "
+                "VLLM_NEURON_EXPERIMENTAL_HOST_VALIDATED_ASYNC_SCHEDULING=1 "
+                "to use the validation-barrier prototype."
+            )
+        self._host_validated_async_scheduling_enabled = True
+        logger.warning(
+            "Experimental host-validated async scheduling is enabled; sampled "
+            "token futures will be materialized before scheduler state updates."
+        )
+
+    def _update_states_after_async_sampling_validation(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Apply scheduler state only after any required token validation.
+
+        vLLM's async scheduler may prepare the next ``SchedulerOutput`` before
+        the prior output is consumed.  Models with a fallible token-ID ABI must
+        therefore materialize and validate the prior output at this exact
+        boundary.  If validation raises, ``_update_states`` is not called: no
+        request can be removed, condensed, or assigned a reusable recurrent
+        state slot, and no next forward can be submitted.
+
+        Models without a validator retain the ordinary device-future path.
+        Validated async additionally requires the explicit vLLM-Neuron
+        experiment opt-in checked during model load.
+        """
+        if self._sampling_output_requires_host_validation():
+            if not getattr(
+                self, "_host_validated_async_scheduling_enabled", False
+            ):
+                raise RuntimeError(
+                    "host-validated async scheduling reached state update "
+                    "without its explicit experiment opt-in"
+                )
+            pending = self.async_execution_buffer.get("async_output")
+            pending_token_ids = getattr(
+                getattr(pending, "model_runner_output", None),
+                "sampled_token_ids",
+                None,
+            )
+            if torch.is_tensor(pending_token_ids):
+                self._host_validation_barrier_steps = (
+                    getattr(self, "_host_validation_barrier_steps", 0) + 1
+                )
+            self._materialize_pending_async_output(
+                "host validation required before scheduler state update"
+            )
+        self._update_states(scheduler_output)
 
     def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
         """Reorder batch to match scheduler output order if needed.
@@ -5220,9 +5314,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         self._drop_transition_spec_decode_if_cache_incomplete(scheduler_output)
 
-        # Update cached states (includes sequence ID management)
+        # Update cached states (includes sequence ID management). A model with
+        # a fallible on-device token-ID ABI must validate the previous async
+        # output before this point: _update_states owns request removal,
+        # InputBatch condensation, and recurrent-slot synchronization.
         with record_function_or_nullcontext("neuron_model_runner: update_states"):
-            self._update_states(scheduler_output)
+            self._update_states_after_async_sampling_validation(scheduler_output)
 
         # Register new requests for tensor replacement prompt matching.
         self._register_requests_for_replacement(scheduler_output)
