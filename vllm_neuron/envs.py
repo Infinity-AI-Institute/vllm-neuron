@@ -329,13 +329,18 @@ def is_native_backend() -> bool:
 
 
 def get_compile_backend_name() -> str:
-    """Return the torch.compile backend name: 'neuron' for native, 'vllm_neuron' for XLA."""
-    return "neuron" if is_native_backend() else "vllm_neuron"
+    """Return the torch.compile backend registered by the selected runtime."""
+    return "neuron_libtorch" if is_native_backend() else "vllm_neuron"
 
 
 def get_dist_backend() -> str:
-    """Return the distributed backend: 'neuron' for native, 'gloo' for XLA."""
-    return "neuron" if is_native_backend() else "gloo"
+    """Return the process-group backend used for rank metadata.
+
+    The lite runtime lowers functional collectives from the Gloo group's rank
+    metadata into XLA/HLO.  It does not register a ``neuron`` ProcessGroup with
+    torch.distributed, so asking vLLM to construct one fails before model load.
+    """
+    return "gloo"
 
 
 def get_neuron_compile_cache_dir() -> str:
