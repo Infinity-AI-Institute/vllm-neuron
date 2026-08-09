@@ -87,3 +87,66 @@ def test_nki_cache_rejects_missing_materialized_binary(monkeypatch, tmp_path):
     (cache_dir / "binaries" / "missing.json").unlink()
 
     assert nki_cache.get_nki_cache("missing") is None
+
+
+def test_compile_with_cache_reuses_result_without_reopening_disk(monkeypatch):
+    nki_cache.clear_nki_process_cache()
+    result = NKICompileResult(
+        dumped_config="cached",
+        return_types=((torch.bfloat16, (1,)),),
+        operand_output_aliases={},
+    )
+    disk_reads = 0
+    compiles = 0
+
+    def read_once(cache_key):
+        nonlocal disk_reads
+        assert cache_key == "same-key"
+        disk_reads += 1
+        return result
+
+    def must_not_compile():
+        nonlocal compiles
+        compiles += 1
+        return result
+
+    monkeypatch.setattr(nki_cache, "get_nki_cache", read_once)
+
+    first = nki_cache.compile_with_cache("same-key", must_not_compile)
+    second = nki_cache.compile_with_cache("same-key", must_not_compile)
+
+    assert first is result
+    assert second is result
+    assert disk_reads == 1
+    assert compiles == 0
+    assert nki_cache.nki_process_cache_stats() == {
+        "entries": 1,
+        "hits": 1,
+        "misses": 1,
+    }
+
+
+def test_disabled_compile_cache_does_not_use_process_cache(monkeypatch):
+    nki_cache.clear_nki_process_cache()
+    monkeypatch.setattr(nki_cache.envs, "VLLM_NEURON_DISABLE_COMPILE_CACHE", True)
+    calls = 0
+
+    def compile_each_time():
+        nonlocal calls
+        calls += 1
+        return NKICompileResult(
+            dumped_config=str(calls),
+            return_types=((torch.bfloat16, (1,)),),
+            operand_output_aliases={},
+        )
+
+    first = nki_cache.compile_with_cache("disabled", compile_each_time)
+    second = nki_cache.compile_with_cache("disabled", compile_each_time)
+
+    assert first.dumped_config == "1"
+    assert second.dumped_config == "2"
+    assert nki_cache.nki_process_cache_stats() == {
+        "entries": 0,
+        "hits": 0,
+        "misses": 0,
+    }

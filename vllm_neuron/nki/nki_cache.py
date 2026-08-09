@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from collections.abc import Callable, Hashable
 from typing import Any, Optional
 
@@ -37,6 +38,64 @@ _SCHEMA_VERSION = 1
 _NKI_CACHE_SUBDIR = "nki"
 _NKI_BINARY_SUBDIR = "binaries"
 _LOCK_TIMEOUT = 300  # seconds
+
+# One K3 prefill graph can contain tens of thousands of calls to the same NKI
+# kernel configurations.  The persistent cache prevents recompilation, but a
+# hit still opens and parses the same JSON record (and validates its binary)
+# for every FX node.  Keep successful results in the tracing process after the
+# first persistent lookup.  This is deliberately below create_nki_cache_key():
+# source, shape, dtype, constants, grid, platform, versions, and device-dump
+# mode therefore retain exactly the same invalidation contract as the disk
+# cache.
+_PROCESS_CACHE: dict[str, NKICompileResult] = {}
+_PROCESS_CACHE_LOCK = threading.Lock()
+_PROCESS_CACHE_HITS = 0
+_PROCESS_CACHE_MISSES = 0
+
+
+def clear_nki_process_cache() -> None:
+    """Clear process-local NKI results and counters.
+
+    Production code should not need this; it is an explicit seam for tests and
+    long-lived tooling that intentionally changes cache roots or kernel state.
+    """
+
+    global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES
+    with _PROCESS_CACHE_LOCK:
+        _PROCESS_CACHE.clear()
+        _PROCESS_CACHE_HITS = 0
+        _PROCESS_CACHE_MISSES = 0
+
+
+def nki_process_cache_stats() -> dict[str, int]:
+    """Return cheap instrumentation for repeated in-process cache lookups."""
+
+    with _PROCESS_CACHE_LOCK:
+        return {
+            "entries": len(_PROCESS_CACHE),
+            "hits": _PROCESS_CACHE_HITS,
+            "misses": _PROCESS_CACHE_MISSES,
+        }
+
+
+def _get_nki_process_cache(cache_key: str) -> Optional[NKICompileResult]:
+    global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES
+    with _PROCESS_CACHE_LOCK:
+        cached = _PROCESS_CACHE.get(cache_key)
+        if cached is None:
+            _PROCESS_CACHE_MISSES += 1
+        else:
+            _PROCESS_CACHE_HITS += 1
+        return cached
+
+
+def _put_nki_process_cache(
+    cache_key: str, result: NKICompileResult
+) -> NKICompileResult:
+    with _PROCESS_CACHE_LOCK:
+        # Preserve the first complete result if concurrent tracing lanes ever
+        # share a process.  The persistent key guarantees equivalence.
+        return _PROCESS_CACHE.setdefault(cache_key, result)
 
 
 def create_nki_cache_key(
@@ -158,10 +217,14 @@ def compile_with_cache(
     if cache_key is None or envs.VLLM_NEURON_DISABLE_COMPILE_CACHE:
         return compile_fn()
 
+    cached = _get_nki_process_cache(cache_key)
+    if cached is not None:
+        return cached
+
     # Fast path: lockless local read
     cached = get_nki_cache(cache_key)
     if cached is not None:
-        return cached
+        return _put_nki_process_cache(cache_key, cached)
 
     # Slow path: acquire lock, try remote fetch, then compile
     local_dir = _get_local_nki_cache_dir()
@@ -173,21 +236,21 @@ def compile_with_cache(
             # Double-check local after acquiring lock
             cached = get_nki_cache(cache_key)
             if cached is not None:
-                return cached
+                return _put_nki_process_cache(cache_key, cached)
 
             # Try remote fetch (only lock winner hits remote filesystem)
             cached = _fetch_from_remote(cache_key)
             if cached is not None:
-                return cached
+                return _put_nki_process_cache(cache_key, cached)
 
             result = compile_fn()
             put_nki_cache(cache_key, result)
-            return result
+            return _put_nki_process_cache(cache_key, result)
     except Timeout:
         logger.warning(
             "NKI cache lock timeout for %s, compiling without cache", cache_key
         )
-        return compile_fn()
+        return _put_nki_process_cache(cache_key, compile_fn())
 
 
 def save_nki_cache_to_remote(
