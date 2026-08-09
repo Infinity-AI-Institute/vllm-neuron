@@ -63,3 +63,28 @@ def test_trace_preflight_job_limit_fails_closed(monkeypatch, value):
     monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_JOBS", value)
     with pytest.raises(ValueError, match=r"must be an integer in \[1, 4096\]"):
         _ = _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_JOBS
+
+
+def test_trace_preflight_control_defaults_are_multi_hour(monkeypatch):
+    monkeypatch.delenv("VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv(
+        "VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS", raising=False
+    )
+    envs = _load_envs()
+
+    assert envs.VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS == 14400
+    assert envs.VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS == 300
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "86401", "1.5", "no"])
+def test_trace_preflight_timeout_fails_closed(monkeypatch, value):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError, match=r"must be an integer in \[1, 86400\]"):
+        _ = _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3601", "1.5", "no"])
+def test_trace_preflight_heartbeat_fails_closed(monkeypatch, value):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS", value)
+    with pytest.raises(ValueError, match=r"must be an integer in \[1, 3600\]"):
+        _ = _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS

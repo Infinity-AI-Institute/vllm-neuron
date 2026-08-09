@@ -64,10 +64,12 @@ import os
 import shutil
 import signal
 import tempfile
+import threading
 import time
 import traceback
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any
 
 import torch
@@ -125,6 +127,32 @@ def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None
         total_jobs=len(jobs),
     )
 
+    preflight_group = None
+    timeout_seconds = envs.VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS
+    heartbeat_seconds = envs.VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS
+    if heartbeat_seconds >= timeout_seconds:
+        raise ValueError(
+            "VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS must be less than "
+            "VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS: "
+            f"heartbeat={heartbeat_seconds}, timeout={timeout_seconds}"
+        )
+    if distributed:
+        # Every rank must create this group before the representative starts
+        # tracing. Creating it after the trace would leave parked ranks blocked
+        # in new_group() under the default group's shorter timeout.
+        preflight_group = dist.new_group(
+            ranks=list(range(world_size)),
+            timeout=timedelta(seconds=timeout_seconds),
+        )
+        emit_trace_milestone(
+            "preflight_control_group_ready",
+            parent_rank=parent_rank,
+            stage="preflight",
+            representative_rank=representative,
+            timeout_seconds=timeout_seconds,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+
     if rank == representative:
         try:
             with _preflight_child_mode():
@@ -145,11 +173,42 @@ def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None
             }
 
     if distributed:
-        dist.broadcast_object_list(
-            payload,
-            src=representative,
-            device=torch.device("cpu"),
-        )
+        try:
+            with _preflight_wait_heartbeat(
+                parent_rank=parent_rank,
+                representative_rank=representative,
+                timeout_seconds=timeout_seconds,
+                heartbeat_seconds=heartbeat_seconds,
+            ):
+                dist.broadcast_object_list(
+                    payload,
+                    src=representative,
+                    group=preflight_group,
+                    device=torch.device("cpu"),
+                )
+        except Exception as exc:
+            emit_trace_milestone(
+                "preflight_rendezvous_failed",
+                parent_rank=parent_rank,
+                stage="preflight",
+                representative_rank=representative,
+                timeout_seconds=timeout_seconds,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            raise RuntimeError(
+                "Representative trace preflight control rendezvous failed "
+                f"within its dedicated {timeout_seconds}s deadline"
+            ) from exc
+        finally:
+            if preflight_group is not None:
+                try:
+                    dist.destroy_process_group(preflight_group)
+                except Exception:
+                    logger.warning(
+                        "Unable to destroy preflight-only process group",
+                        exc_info=True,
+                    )
 
     result = payload[0]
     if not isinstance(result, dict):
@@ -177,6 +236,42 @@ def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None
         staged_jobs=result.get("staged_jobs"),
     )
     parallel_trace(jobs, parent_rank=parent_rank)
+
+
+@contextmanager
+def _preflight_wait_heartbeat(
+    *,
+    parent_rank: int,
+    representative_rank: int,
+    timeout_seconds: int,
+    heartbeat_seconds: int,
+):
+    """Emit progress without extending the preflight rendezvous deadline."""
+    stopped = threading.Event()
+    started = time.monotonic()
+
+    def emit_heartbeats() -> None:
+        while not stopped.wait(heartbeat_seconds):
+            emit_trace_milestone(
+                "preflight_wait_heartbeat",
+                parent_rank=parent_rank,
+                stage="preflight",
+                representative_rank=representative_rank,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                timeout_seconds=timeout_seconds,
+            )
+
+    thread = threading.Thread(
+        target=emit_heartbeats,
+        name=f"preflight-heartbeat-rank-{parent_rank}",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=1.0)
 
 
 @contextmanager

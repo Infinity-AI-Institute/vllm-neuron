@@ -39,6 +39,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_RANK: int | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_JOBS: int | None = None
+    VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS: int = 14400
+    VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS: int = 300
     VLLM_NEURON_TRACE_MILESTONE_DIR: str | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_ONLY: bool = False
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
@@ -241,6 +243,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_JOBS"),
             name="VLLM_NEURON_TRACE_PREFLIGHT_JOBS",
             maximum=4096,
+        )
+    ),
+    # Timeout for the preflight-only control process group. This is isolated
+    # from the default process group so a multi-hour Python/FakeTensor probe
+    # does not weaken timeouts for model collectives.
+    "VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS": lambda: (
+        maybe_convert_bounded_positive_int(
+            os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS", "14400"),
+            name="VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS",
+            maximum=86400,
+        )
+    ),
+    # Parked ranks emit best-effort progress while waiting on the dedicated
+    # preflight rendezvous. This does not reset or extend its hard timeout.
+    "VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS": lambda: (
+        maybe_convert_bounded_positive_int(
+            os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS", "300"),
+            name="VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS",
+            maximum=3600,
         )
     ),
     # Run-scoped local directory for per-rank JSONL trace milestones. Unset

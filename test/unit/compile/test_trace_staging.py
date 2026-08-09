@@ -33,6 +33,8 @@ def staging(monkeypatch):
         VLLM_NEURON_TRACE_RANK_CONCURRENCY=None,
         VLLM_NEURON_TRACE_PREFLIGHT_RANK=0,
         VLLM_NEURON_TRACE_PREFLIGHT_JOBS=None,
+        VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS=14400,
+        VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS=300,
         VLLM_NEURON_TRACE_PREFLIGHT_ONLY=False,
         VLLM_NEURON_TRACE_MILESTONE_DIR=None,
     )
@@ -54,6 +56,12 @@ def _distributed(monkeypatch, staging, *, rank: int, world_size: int = 2):
     monkeypatch.setattr(staging.torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(staging.torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(staging.torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        staging.torch.distributed, "new_group", lambda ranks, timeout: "preflight-group"
+    )
+    monkeypatch.setattr(
+        staging.torch.distributed, "destroy_process_group", lambda group: None
+    )
 
 
 def test_representative_probe_is_discarded_then_normal_trace_runs(monkeypatch, staging):
@@ -74,7 +82,7 @@ def test_representative_probe_is_discarded_then_normal_trace_runs(monkeypatch, s
     monkeypatch.setattr(
         staging.torch.distributed,
         "broadcast_object_list",
-        lambda payload, src, device: None,
+        lambda payload, src, group, device: None,
     )
 
     staging.parallel_trace_with_preflight(jobs, parent_rank=0)
@@ -105,7 +113,8 @@ def test_waiting_rank_receives_success_before_starting_normal_trace(
     jobs = [(object(), {})]
     calls = []
 
-    def release(payload, src, device):
+    def release(payload, src, group, device):
+        assert group == "preflight-group"
         payload[0] = {"ok": True, "representative_rank": 0, "staged_jobs": 1}
 
     monkeypatch.setattr(staging.torch.distributed, "broadcast_object_list", release)
@@ -129,7 +138,7 @@ def test_first_probe_failure_is_broadcast_and_blocks_normal_trace(monkeypatch, s
         assert os.environ["VLLM_NEURON_TRACE_PREFLIGHT_ONLY"] == "1"
         raise RuntimeError("fake tensor device mismatch")
 
-    def broadcast(payload, src, device):
+    def broadcast(payload, src, group, device):
         broadcasts.append(payload[0].copy())
 
     monkeypatch.setattr(staging, "parallel_trace", fail_trace)
@@ -149,7 +158,7 @@ def test_waiting_rank_raises_representative_failure_without_tracing(
     _distributed(monkeypatch, staging, rank=1)
     calls = []
 
-    def reject(payload, src, device):
+    def reject(payload, src, group, device):
         payload[0] = {
             "ok": False,
             "representative_rank": 0,
@@ -185,7 +194,7 @@ def test_job_limit_only_changes_probe_not_normal_trace(monkeypatch, staging):
     monkeypatch.setattr(
         staging.torch.distributed,
         "broadcast_object_list",
-        lambda payload, src, device: None,
+        lambda payload, src, group, device: None,
     )
 
     staging.parallel_trace_with_preflight(jobs, parent_rank=0)
@@ -199,6 +208,123 @@ def test_preflight_rank_must_exist(monkeypatch, staging):
 
     with pytest.raises(ValueError, match="outside the distributed world"):
         staging.parallel_trace_with_preflight([(object(), {})], parent_rank=0)
+
+
+def test_preflight_group_is_created_before_representative_trace(
+    monkeypatch, staging
+):
+    _distributed(monkeypatch, staging, rank=0, world_size=4)
+    events = []
+
+    def new_group(*, ranks, timeout):
+        events.append(("new_group", ranks, timeout.total_seconds()))
+        return "isolated-control-group"
+
+    def trace(jobs, parent_rank=0):
+        events.append(("trace", parent_rank))
+
+    def broadcast(payload, src, group, device):
+        events.append(("broadcast", src, group, device.type))
+
+    monkeypatch.setattr(staging.torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(staging.torch.distributed, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(staging, "parallel_trace", trace)
+
+    staging.parallel_trace_with_preflight([(object(), {})], parent_rank=0)
+
+    assert events == [
+        ("new_group", [0, 1, 2, 3], 14400.0),
+        ("trace", 0),
+        ("broadcast", 0, "isolated-control-group", "cpu"),
+        ("trace", 0),
+    ]
+
+
+def test_preflight_rendezvous_failure_is_bounded_and_group_is_destroyed(
+    monkeypatch, staging
+):
+    _distributed(monkeypatch, staging, rank=1)
+    destroyed = []
+    monkeypatch.setattr(
+        staging.torch.distributed,
+        "destroy_process_group",
+        lambda group: destroyed.append(group),
+    )
+    monkeypatch.setattr(
+        staging.torch.distributed,
+        "broadcast_object_list",
+        lambda payload, src, group, device: (_ for _ in ()).throw(
+            TimeoutError("control deadline")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="dedicated 14400s deadline"):
+        staging.parallel_trace_with_preflight([(object(), {})], parent_rank=1)
+
+    assert destroyed == ["preflight-group"]
+
+
+def test_preflight_heartbeat_must_be_shorter_than_deadline(monkeypatch, staging):
+    _distributed(monkeypatch, staging, rank=1)
+    staging.envs.VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS = 300
+    staging.envs.VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS = 300
+
+    with pytest.raises(ValueError, match="must be less than"):
+        staging.parallel_trace_with_preflight([(object(), {})], parent_rank=1)
+
+
+def test_wait_heartbeat_reports_elapsed_time_without_extending_deadline(
+    monkeypatch, staging
+):
+    records = []
+
+    class FakeEvent:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout):
+            assert timeout == 300
+            self.waits += 1
+            return self.waits > 1
+
+        def set(self):
+            pass
+
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            assert name == "preflight-heartbeat-rank-62"
+            assert daemon is True
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def join(self, timeout):
+            assert timeout == 1.0
+
+    monkeypatch.setattr(staging.threading, "Event", FakeEvent)
+    monkeypatch.setattr(staging.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(
+        staging,
+        "emit_trace_milestone",
+        lambda event, **fields: records.append((event, fields)),
+    )
+
+    with staging._preflight_wait_heartbeat(
+        parent_rank=62,
+        representative_rank=0,
+        timeout_seconds=14400,
+        heartbeat_seconds=300,
+    ):
+        pass
+
+    assert len(records) == 1
+    event, fields = records[0]
+    assert event == "preflight_wait_heartbeat"
+    assert fields["parent_rank"] == 62
+    assert fields["representative_rank"] == 0
+    assert fields["timeout_seconds"] == 14400
+    assert fields["elapsed_seconds"] >= 0
 
 
 def test_capture_preflight_stops_before_cache_or_hlo(monkeypatch):
