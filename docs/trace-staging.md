@@ -12,11 +12,19 @@ The representative uses the existing fork pool and meta swap, but the capture
 backend returns the existing `CaptureComplete` sentinel as soon as Dynamo hands
 it an FX graph. The child is then reaped.
 
-The preflight intentionally performs no FX passes, FX-to-HLO lowering, HLO
-write, compiler invocation, or cache write. After it succeeds, every rank,
-including the representative, executes the unmodified normal extraction. No
-graph or Dynamo state is transferred between ranks, and leader-only graph reuse
-semantics are not enabled or changed.
+By default the preflight intentionally performs no FX passes, FX-to-HLO
+lowering, HLO write, compiler invocation, or cache write. After it succeeds,
+every rank, including the representative, executes the unmodified normal
+extraction. No graph or Dynamo state is transferred between ranks, and
+leader-only graph reuse semantics are not enabled or changed.
+
+For the default-off same-process lowering experiment only, set
+`VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO=1` and provide a dedicated local path in
+`VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR`. The representative child then
+continues its live FX `GraphModule` through FX-to-HLO and writes `graph.hlo`,
+FX/input ABI hashes, lowering metadata, and an explicit diagnostic receipt.
+It performs no cache lookup/publication, writes no NEFF, enables no runtime
+bypass, and still exits before normal all-rank extraction.
 
 ## Integration
 

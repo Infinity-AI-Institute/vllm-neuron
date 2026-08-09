@@ -151,21 +151,21 @@ It does not prove:
 
 ## Next smallest safe experiment
 
-1. The isolated NDI prototype `codex/k3-rank-tensor-dataflow` now replaces
-   embedding `vocab_start`, EP dispatch `14 * ep_rank`, and `source_ranks` with
-   arithmetic from the existing rank tensor behind the exact default-off flag.
-   CPU execution proves integer and tensor EP dispatch are exact at ranks
-   0/47/48/63; Dynamo captures ranks 47 and 48 as identical 98-node FX graphs.
-   Finish a packed-embedding capture test before integration.
-2. Produce a 64-rank input manifest without Dynamo: tensor name, role,
-   shape/dtype/stride/layout/device/alias class plus K3 ownership metadata.
-   Reject on any mismatch. This specifically verifies the padded-head and dense
-   tail-padding cases rather than assuming them.
-3. On Trainium only after those pass, change the representative preflight child
-   to continue from captured rank-0 FX directly into lowering. Do not send an FX
-   pickle to another process. Lower bindings 0, 47, 48, and 63 in that same
-   process. Compare canonical HLO instructions, constants, custom-call configs,
-   aliases, channel IDs, and replica groups.
+1. The isolated NDI prototype `codex/k3-rank-tensor-dataflow` replaces embedding
+   `vocab_start`, EP dispatch `14 * ep_rank`, and `source_ranks` with arithmetic
+   from the existing rank tensor behind the exact default-off flag. CPU tests
+   now prove both EP dispatch and packed embedding capture identical FX at the
+   47/48 boundary.
+2. The same branch now emits and fail-closed validates a 64-rank pre-Dynamo
+   input/alias ABI manifest, including K3 ownership metadata and the padded-head
+   47/48 boundary. Tensor payloads are intentionally excluded.
+3. The audit integration now has a second default-off opt-in that continues the
+   representative preflight's live in-process FX graph through FX-to-HLO and
+   persists an isolated diagnostic receipt. CPU tests prove the path invokes no
+   cache lookup/publication and enables neither NEFF nor runtime bypass. The
+   next Trainium-only experiment is to run it at ranks 0/47/48/63 and compare
+   canonical HLO instructions, constants, custom-call configs, aliases, channel
+   IDs, and replica groups.
 4. If the four-rank boundary census matches, expand lowering to 64 ranks. Keep
    NEFF compilation deduplication disabled until all HLO hashes agree and the
    existing correctness gates pass.

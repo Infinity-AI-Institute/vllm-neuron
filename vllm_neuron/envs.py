@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS: int = 300
     VLLM_NEURON_TRACE_MILESTONE_DIR: str | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_ONLY: bool = False
+    VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO: bool = False
+    VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR: str | None = None
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
@@ -273,6 +275,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # should enable TRACE_PREFLIGHT_RANK rather than setting this directly.
     "VLLM_NEURON_TRACE_PREFLIGHT_ONLY": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_ONLY")) or False
+    ),
+    # Default-off diagnostic experiment: keep the representative preflight's
+    # in-process FX GraphModule alive through FX-to-HLO, but publish neither a
+    # cache artifact nor a NEFF. A separate receipt directory is mandatory.
+    "VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO"))
+        or False
+    ),
+    "VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR": lambda: (
+        os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR") or None
     ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.

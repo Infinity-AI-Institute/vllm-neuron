@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
+import json
 import logging
 import os
+import tempfile
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 
 from vllm_neuron import envs
 from vllm_neuron.compile.backend import (
@@ -19,6 +22,8 @@ from vllm_neuron.fx_passes.pass_manager import (
 from vllm_neuron.utils.timer import timer
 
 logger = logging.getLogger(__name__)
+
+_PREFLIGHT_HLO_RECEIPT_SCHEMA = 1
 
 
 class CaptureComplete(Exception):
@@ -52,8 +57,9 @@ def setup_workdir_common(
     compilation_hash = cache.create_cache_hash(gm, example_inputs, options)
     workdir = f"{base_workdir}/{compilation_hash}"
     if per_rank and dist.is_initialized():
-        from vllm_neuron.compile.platform import get_server_prefix
         from vllm.distributed.parallel_state import get_tp_group
+
+        from vllm_neuron.compile.platform import get_server_prefix
 
         tp_group = get_tp_group()
         tp_local_rank = tp_group.rank_in_group
@@ -119,10 +125,11 @@ def capture(gm, example_inputs, options={}):
     def bail(*args, **kwargs):
         raise CaptureComplete()
 
-    # Representative-rank staging validates the expensive Python/FakeTensor
-    # trace only. Reaching this backend proves Dynamo produced an FX graph. The
-    # fork child exits after ``bail`` and therefore cannot leak Dynamo state,
-    # HLO, or cache artifacts into the subsequent normal all-rank extraction.
+    # Representative-rank staging normally validates only the expensive
+    # Python/FakeTensor trace. A separate default-off experiment may continue
+    # the same in-process GraphModule through FX-to-HLO. It still cannot
+    # publish cache metadata, compile a NEFF, or bypass the normal all-rank
+    # extraction that follows the representative child.
     if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY:
         from vllm_neuron.compile.trace_milestones import emit_trace_milestone
 
@@ -133,6 +140,22 @@ def capture(gm, example_inputs, options={}):
             stage="preflight",
             fx_nodes=sum(1 for _ in gm.graph.nodes),
         )
+        if getattr(envs, "VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO", False):
+            options = _apply_platform_compiler_args(options)
+            receipt = _lower_preflight_hlo_receipt(
+                gm,
+                example_inputs,
+                options,
+                parent_rank=rank,
+            )
+            emit_trace_milestone(
+                "preflight_hlo_persisted",
+                parent_rank=rank,
+                stage="preflight",
+                receipt_path=receipt["receipt_path"],
+                hlo_sha256=receipt["hlo"]["sha256"],
+                fx_to_hlo_seconds=receipt["lowering"]["fx_to_hlo_seconds"],
+            )
         return bail
 
     from vllm_neuron.compile import cache
@@ -177,6 +200,167 @@ def capture(gm, example_inputs, options={}):
     cache.save_artifact_metadata(workdir, metadata)
 
     return bail
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _input_abi(example_inputs) -> dict[str, Any]:
+    aliases: dict[int, int] = {}
+    entries = []
+    for index, value in enumerate(example_inputs):
+        if not isinstance(value, torch.Tensor):
+            entries.append(
+                {
+                    "index": index,
+                    "kind": "python",
+                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "value": repr(value),
+                }
+            )
+            continue
+        try:
+            storage_id = int(value.untyped_storage()._cdata)
+            storage_offset = int(value.storage_offset())
+        except (AttributeError, RuntimeError, TypeError) as error:
+            raise RuntimeError(
+                f"cannot establish preflight input alias ABI for input {index}"
+            ) from error
+        entries.append(
+            {
+                "index": index,
+                "kind": "tensor",
+                "shape": [int(dim) for dim in value.shape],
+                "dtype": str(value.dtype),
+                "stride": [int(dim) for dim in value.stride()],
+                "layout": str(value.layout),
+                "device_type": value.device.type,
+                "requires_grad": bool(value.requires_grad),
+                "alias_group": aliases.setdefault(storage_id, len(aliases)),
+                "storage_offset": storage_offset,
+            }
+        )
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "entries": entries,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "tensor_payload_values_included": False,
+    }
+
+
+def _write_bytes_atomic(path: str, payload: bytes) -> None:
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "xb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+def _write_json_atomic(path: str, value: dict[str, Any]) -> None:
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    _write_bytes_atomic(path, payload)
+
+
+def _lower_preflight_hlo_receipt(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    options: dict,
+    *,
+    parent_rank: int,
+) -> dict[str, Any]:
+    """Lower the live preflight FX graph without publishing runtime artifacts."""
+
+    receipt_root = getattr(
+        envs,
+        "VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR",
+        None,
+    )
+    if not receipt_root:
+        raise RuntimeError(
+            "VLLM_NEURON_TRACE_PREFLIGHT_HLO_RECEIPT_DIR is required when "
+            "VLLM_NEURON_TRACE_PREFLIGHT_LOWER_HLO=1"
+        )
+    receipt_root = os.path.abspath(os.path.expanduser(receipt_root))
+    os.makedirs(receipt_root, mode=0o700, exist_ok=True)
+    if os.path.islink(receipt_root) or not os.path.isdir(receipt_root):
+        raise RuntimeError(f"unsafe preflight HLO receipt directory: {receipt_root}")
+
+    workdir = tempfile.mkdtemp(
+        prefix=f"rank-{parent_rank}-pid-{os.getpid()}-",
+        dir=receipt_root,
+    )
+    fx_text = str(gm.graph)
+    fx_payload = fx_text.encode()
+    header = _format_replica_groups_header(gm) or ""
+    input_abi = _input_abi(example_inputs)
+    started_ns = time.time_ns()
+    (
+        hlo_module,
+        unused_input_indices,
+        has_rng_seed_parameter,
+        io_map,
+        output_count,
+        fx_to_hlo_time,
+    ) = run_fx_to_hlo_pipeline(gm, example_inputs, options, workdir)
+    hlo_payload = hlo_module.SerializeToString()
+    hlo_path = os.path.join(workdir, "graph.hlo")
+    _write_bytes_atomic(hlo_path, hlo_payload)
+
+    receipt_path = os.path.join(workdir, "receipt.json")
+    receipt = {
+        "schema_version": _PREFLIGHT_HLO_RECEIPT_SCHEMA,
+        "status": "complete",
+        "artifact_scope": "diagnostic_preflight_hlo",
+        "receipt_path": receipt_path,
+        "workdir": workdir,
+        "parent_rank": parent_rank,
+        "pid": os.getpid(),
+        "started_wall_time_ns": started_ns,
+        "completed_wall_time_ns": time.time_ns(),
+        "same_process_fx_to_hlo": True,
+        "cross_process_fx_handoff": False,
+        "normal_all_rank_extraction_still_required": True,
+        "cache_key": None,
+        "cache_lookup_performed": False,
+        "cache_metadata_written": False,
+        "cache_published": False,
+        "neff_written": False,
+        "runtime_bypass_enabled": False,
+        "fx": {
+            "node_count": sum(1 for _ in gm.graph.nodes),
+            "sha256": hashlib.sha256(fx_payload).hexdigest(),
+            "replica_groups_header": header,
+            "replica_groups_header_sha256": hashlib.sha256(
+                header.encode()
+            ).hexdigest(),
+        },
+        "inputs": input_abi,
+        "hlo": {
+            "path": hlo_path,
+            "bytes": len(hlo_payload),
+            "sha256": hashlib.sha256(hlo_payload).hexdigest(),
+        },
+        "lowering": {
+            "fx_to_hlo_seconds": fx_to_hlo_time,
+            "unused_input_indices": _json_safe(unused_input_indices),
+            "has_rng_seed_parameter": bool(has_rng_seed_parameter),
+            "io_map": _json_safe(io_map),
+            "output_count": output_count,
+        },
+    }
+    _write_json_atomic(receipt_path, receipt)
+    return receipt
 
 
 def _run_fx_passes(
