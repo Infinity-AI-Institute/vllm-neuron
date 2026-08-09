@@ -159,6 +159,8 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `VLLM_NEURON_PARALLEL_COMPILE_WORKERS` | int | -- | Number of parallel compilation workers. |
 | `VLLM_NEURON_PARALLEL_TRACE_WORKERS` | int | 8 | Maximum forked trace children per rank parent. Set to 1 to reap each graph shape in a fresh child before starting the next shape. |
 | `VLLM_NEURON_TRACE_RANK_CONCURRENCY` | int | unset | Opt-in container-wide cap (1-4096) on trace children actively constructing graphs. Waiting occurs before capture imports and model meta-swapping. Invalid values or a live conflicting limit fail closed. Kernel `flock` leases under `/dev/shm` are released on normal exit, exceptions, and fatal signals. |
+| `VLLM_NEURON_FAST_TRACE` | bool | 0 | Opt in to suppressing successful FX graph text dumps. Ordinary failures still write one `fxgraph_failure.txt`; `MemoryError`, `KeyboardInterrupt`, and `SystemExit` never trigger graph rendering. No passes, recompiles, cache hashes, HLO/NEFF outputs, or cache metadata are skipped. |
+| `VLLM_NEURON_TRACE_METRICS` | bool | 0 | Write a fresh `trace_metrics.json` receipt for each FX-to-HLO pipeline without suppressing dumps. `VLLM_NEURON_FAST_TRACE=1` enables the same receipt automatically. RSS fields are per-process high-water marks, not aggregate host-memory measurements. |
 | `VLLM_NEURON_REMOTE_CACHE` | str | -- | Path to NFS/FSx mount for shared persistent cache across nodes. |
 | `VLLM_NEURON_DISABLE_COMPILE_CACHE` | bool | 0 | Disable compilation cache entirely. Forces recompilation on every startup. |
 | `VLLM_NEURON_COMPILATION_TIMEOUT` | int | -- | Timeout in seconds for individual NEFF compilation. |
@@ -186,6 +188,15 @@ namespace. Waiting children retain the parent's inherited copy-on-write
 mappings, so the setting bounds active graph construction and dirty-memory
 growth rather than virtual-memory or RSS accounting. Slot selection does not
 promise fairness, and a lower cap can increase cold-start duration.
+
+#### Safe fast trace
+
+`VLLM_NEURON_FAST_TRACE=1` removes only successful FX graph-to-string and
+generated-code dump work. It retains the original pass order, every
+`gm.recompile()`, both direct-compile cache-hash calls, normalized hash-copy
+recompilation, FX-to-HLO conversion, HLO passes, compiler invocation, and final
+HLO, NEFF, and cache metadata. See [Safe fast-trace A/B](../safe-fast-trace.md)
+for the qualification contract.
 
 ### What triggers recompilation
 

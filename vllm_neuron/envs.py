@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
     VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    VLLM_NEURON_FAST_TRACE: bool = False
+    VLLM_NEURON_TRACE_METRICS: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
@@ -200,6 +202,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Opt-in cold-start experiment. Suppresses only successful FX graph text
+    # dumps. Graph mutation, recompilation, hashing, FX/HLO passes, HLO/NEFF
+    # generation, cache metadata, and failure diagnostics remain enabled.
+    "VLLM_NEURON_FAST_TRACE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_FAST_TRACE")) or False
+    ),
+    # Emit a fresh per-FX-to-HLO-pipeline metrics receipt without changing
+    # trace behavior. Fast trace enables the receipt automatically.
+    "VLLM_NEURON_TRACE_METRICS": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_METRICS")) or False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (

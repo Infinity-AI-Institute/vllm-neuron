@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
-import os
-import socket
-import time
-import sys
-import shutil
-import logging
 import json
-import psutil
-import copy
+import logging
+import os
 import re
-from filelock import FileLock, Timeout
-from typing import TYPE_CHECKING, Dict, List, Optional, Callable, Any
+import shutil
+import socket
+import sys
+import time
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+import psutil
 import torch
 import torch.distributed as dist
+from filelock import FileLock, Timeout
 
 from vllm_neuron import envs
 from vllm_neuron.compile.platform import (
@@ -251,7 +251,10 @@ def create_cache_hash(
 
     normalized_gm = _add_kernel_backend_config_for_hashing(normalized_gm)
 
-    hash_components = [str(normalized_gm.graph)]
+    # Rendering a K3 graph is expensive. Reuse the exact normalized graph text
+    # that contributes to the hash when reporting its length below.
+    normalized_graph_str = str(normalized_gm.graph)
+    hash_components = [normalized_graph_str]
 
     # Include resolved replica group ranks so that different process group
     # configurations produce distinct cache keys.
@@ -291,7 +294,7 @@ def create_cache_hash(
     ]
     logger.debug(
         f"Compilation cache key: {combined_hash} | Components: "
-        f"graph_len={len(str(normalized_gm.graph))}, "
+        f"graph_len={len(normalized_graph_str)}, "
         f"inputs={input_summaries}, "
         f"torch_neuronx={torch_neuronx_version}, "
         f"neuronxcc={neuronxcc_version}, "

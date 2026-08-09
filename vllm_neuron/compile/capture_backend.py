@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-
 from vllm_neuron import envs
 from vllm_neuron.compile.backend import (
     _apply_platform_compiler_args,
@@ -17,6 +16,7 @@ from vllm_neuron.fx_passes.pass_manager import (
     _format_replica_groups_header,
 )
 from vllm_neuron.utils.timer import timer
+from vllm_neuron.utils.trace_metrics import TraceMetrics, render_code, render_graph
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +52,9 @@ def setup_workdir_common(
     compilation_hash = cache.create_cache_hash(gm, example_inputs, options)
     workdir = f"{base_workdir}/{compilation_hash}"
     if per_rank and dist.is_initialized():
-        from vllm_neuron.compile.platform import get_server_prefix
         from vllm.distributed.parallel_state import get_tp_group
+
+        from vllm_neuron.compile.platform import get_server_prefix
 
         tp_group = get_tp_group()
         tp_local_rank = tp_group.rank_in_group
@@ -85,26 +86,73 @@ def run_fx_to_hlo_pipeline(
     """
     from vllm_neuron.compile.hlo import convert_fx_to_hlo
 
-    _setup_compilation_logging(gm, example_inputs, workdir)
-    processed_gm, io_map, output_count = _run_fx_passes(gm, options, workdir)
+    fast_trace = envs.VLLM_NEURON_FAST_TRACE
+    trace_metrics = None
+    if fast_trace or envs.VLLM_NEURON_TRACE_METRICS:
+        # Deliberately fresh for every graph. Compilation options are caller
+        # owned and may be reused across graphs, so metrics never live there.
+        trace_metrics = TraceMetrics(fast_trace=fast_trace)
 
-    with timer() as fx_timer:
-        hlo_module, unused_input_indices, has_rng_seed_parameter = convert_fx_to_hlo(
-            processed_gm,
-            example_inputs,
-            log_path=f"{workdir}/hlo_passes/",
-            aliasing_map=io_map,
+    processed_gm = gm
+    failure: BaseException | None = None
+    try:
+        _setup_compilation_logging(
+            gm, example_inputs, workdir, trace_metrics=trace_metrics
         )
-    fx_to_hlo_time = fx_timer()
+        processed_gm, io_map, output_count = _run_fx_passes(
+            gm, options, workdir, trace_metrics=trace_metrics
+        )
 
-    return (
-        hlo_module,
-        unused_input_indices,
-        has_rng_seed_parameter,
-        io_map,
-        output_count,
-        fx_to_hlo_time,
-    )
+        with timer() as fx_timer:
+            hlo_module, unused_input_indices, has_rng_seed_parameter = (
+                convert_fx_to_hlo(
+                    processed_gm,
+                    example_inputs,
+                    log_path=f"{workdir}/hlo_passes/",
+                    aliasing_map=io_map,
+                )
+            )
+        fx_to_hlo_time = fx_timer()
+
+        return (
+            hlo_module,
+            unused_input_indices,
+            has_rng_seed_parameter,
+            io_map,
+            output_count,
+            fx_to_hlo_time,
+        )
+    except BaseException as exc:
+        failure = exc
+        if trace_metrics is not None and trace_metrics.fast_trace:
+            _write_pipeline_failure_diagnostic(
+                processed_gm, workdir, exc, trace_metrics=trace_metrics
+            )
+        raise
+    finally:
+        if trace_metrics is not None:
+            trace_metrics.finish(failure)
+            try:
+                receipt = trace_metrics.write(workdir)
+                logger.info(
+                    "FX trace metrics - %s | mode=%s wall=%.3fs "
+                    "renders=%d code_renders=%d dumps=%d suppressed=%d",
+                    receipt,
+                    "fast" if trace_metrics.fast_trace else "baseline",
+                    trace_metrics.trace_wall_seconds,
+                    trace_metrics.graph_string_renders,
+                    trace_metrics.graph_code_renders,
+                    trace_metrics.graph_dump_files,
+                    trace_metrics.graph_dump_files_suppressed,
+                )
+            except (
+                MemoryError,
+                OSError,
+                OverflowError,
+                TypeError,
+                ValueError,
+            ) as receipt_error:
+                logger.warning("Failed to write FX trace metrics: %s", receipt_error)
 
 
 def capture(gm, example_inputs, options={}):
@@ -164,7 +212,10 @@ def capture(gm, example_inputs, options={}):
 
 
 def _run_fx_passes(
-    gm: torch.fx.GraphModule, options: dict, workdir: str
+    gm: torch.fx.GraphModule,
+    options: dict,
+    workdir: str,
+    trace_metrics: TraceMetrics | None = None,
 ) -> Tuple[torch.fx.GraphModule, Optional[Dict[str, Any]]]:
     """Run FX passes and return results.
 
@@ -181,6 +232,7 @@ def _run_fx_passes(
         gm,
         target_device=options.get("target_device", "xla"),
         compiler_workdir=workdir,
+        trace_metrics=trace_metrics,
     )
     gm.recompile()
 
@@ -195,7 +247,12 @@ def _run_fx_passes(
     return gm, io_map, output_count
 
 
-def _setup_compilation_logging(gm: torch.fx.GraphModule, example_inputs, workdir: str):
+def _setup_compilation_logging(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    workdir: str,
+    trace_metrics: TraceMetrics | None = None,
+):
     """Setup logging and metadata files for compilation.
 
     Args:
@@ -205,14 +262,22 @@ def _setup_compilation_logging(gm: torch.fx.GraphModule, example_inputs, workdir
     """
     os.makedirs(os.path.join(workdir, "hlo_passes"), exist_ok=True)
 
-    # Log FX graph
-    fx_filename = os.path.join(workdir, "fxgraph.txt")
-    with open(fx_filename, "w") as f:
-        header = _format_replica_groups_header(gm)
-        if header:
-            f.write(header + "\n")
-        print(gm.graph, file=f)
-    logger.info(f"FX graph - {fx_filename}")
+    fast_trace = trace_metrics is not None and trace_metrics.fast_trace
+
+    # The full graph is redundant with pass dumps and costly for large models.
+    # Fast mode suppresses only successful text dumps; failures get one dump.
+    if not fast_trace:
+        fx_filename = os.path.join(workdir, "fxgraph.txt")
+        with open(fx_filename, "w") as f:
+            header = _format_replica_groups_header(gm)
+            if header:
+                f.write(header + "\n")
+            f.write(render_graph(gm, trace_metrics) + "\n")
+        if trace_metrics is not None:
+            trace_metrics.graph_dump_files += 1
+        logger.info(f"FX graph - {fx_filename}")
+    elif trace_metrics is not None:
+        trace_metrics.graph_dump_files_suppressed += 1
 
     # Log example inputs metadata
     input_metadata = []
@@ -237,3 +302,51 @@ def _setup_compilation_logging(gm: torch.fx.GraphModule, example_inputs, workdir
             f.write(f"  Dtype: {meta['dtype']}\n")
             f.write(f"  Device: {meta['device']}\n\n")
     logger.info(f"Example inputs - {inputs_filename}")
+
+
+_NON_RENDERABLE_FAILURES = (MemoryError, KeyboardInterrupt, SystemExit)
+
+
+def _contains_non_renderable_failure(error: BaseException) -> bool:
+    """Detect fatal/low-memory failures, including wrapped pass failures."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _NON_RENDERABLE_FAILURES):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _write_pipeline_failure_diagnostic(
+    gm: torch.fx.GraphModule,
+    workdir: str,
+    error: BaseException,
+    trace_metrics: TraceMetrics,
+) -> None:
+    """Write exactly one FX diagnostic for an ordinary fast-trace failure."""
+    if _contains_non_renderable_failure(error):
+        logger.warning(
+            "Skipping FX graph rendering for non-renderable failure %s",
+            type(error).__name__,
+        )
+        return
+
+    try:
+        filename = os.path.join(workdir, "fxgraph_failure.txt")
+        with open(filename, "w") as f:
+            f.write(f"FX-to-HLO failure: {type(error).__name__}: {error}\n")
+            f.write("=" * 50 + "\n\n")
+            header = _format_replica_groups_header(gm)
+            if header:
+                f.write(header + "\n")
+            f.write(render_graph(gm, trace_metrics))
+            f.write("\n\n" + "=" * 50 + "\n")
+            f.write("GraphModule code:\n")
+            f.write(render_code(gm, trace_metrics))
+        trace_metrics.graph_dump_files += 1
+        trace_metrics.failure_diagnostics += 1
+        logger.error("FX failure graph - %s", filename)
+    except Exception as dump_error:  # noqa: BLE001 - diagnostics must not mask failure
+        logger.warning("Failed to dump FX failure graph: %s", dump_error)
