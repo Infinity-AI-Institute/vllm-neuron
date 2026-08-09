@@ -148,15 +148,22 @@ def _apply_dcp_patch(ModelConfig):
 
 def _register_pre_model_config_architectures(registry) -> None:
     """Lazily expose Neuron-only names before ModelConfig inspection."""
-    implementation = (
-        "vllm_neuron.model.inkling.factory:"
-        "InklingForConditionalGeneration"
-    )
+    implementations = {
+        "InklingForConditionalGeneration": (
+            "vllm_neuron.model.inkling.factory:"
+            "InklingForConditionalGeneration"
+        ),
+        "InklingForCausalLM": (
+            "vllm_neuron.model.inkling.factory:"
+            "InklingForConditionalGeneration"
+        ),
+        "KimiK3ForCausalLM": (
+            "neuronx_distributed_inference.models.kimi_k3.serving.factory:"
+            "KimiK3ForCausalLM"
+        ),
+    }
     supported = registry.get_supported_archs()
-    for architecture in (
-        "InklingForConditionalGeneration",
-        "InklingForCausalLM",
-    ):
+    for architecture, implementation in implementations.items():
         if architecture not in supported:
             registry.register_model(architecture, implementation)
 
