@@ -66,10 +66,22 @@ def _is_cpu_compile() -> bool:
 
 
 def _init_backend():
-    """Initialize the vllm_neuron backend (XLA path)."""
+    """Initialize the compile and device backend selected for this process."""
     from vllm_neuron import envs
 
     if envs.is_native_backend():
+        # Registers the ``neuron`` PrivateUse1 device, the
+        # ``neuron_libtorch`` torch.compile backend, and XLA implementations of
+        # functional collectives.  It intentionally does not register a
+        # torch.distributed ProcessGroup named ``neuron``.
+        import libtorch_neuronx_lite
+
+        # libtorch-neuronx-lite avoids automatic backend registration while
+        # ``vllm_neuron`` is present in sys.modules, because the packaged
+        # plugin normally owns registration.  The source overlay is that
+        # plugin, so complete the native initialization explicitly.
+        libtorch_neuronx_lite._register_compile_backends()
+
         return
 
     # In CPU mode, the NKI CPU simulator is OFF by default.

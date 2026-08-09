@@ -7,6 +7,8 @@ import time
 
 import torch
 
+from vllm_neuron.utils.trace_metrics import TraceMetrics, render_code, render_graph
+
 from .base import FXPass
 
 
@@ -31,7 +33,11 @@ class FXPassManager:
         self.passes.append(pass_obj)
 
     def run_passes(
-        self, gm: torch.fx.GraphModule, **kwargs
+        self,
+        gm: torch.fx.GraphModule,
+        *,
+        trace_metrics: TraceMetrics | None = None,
+        **kwargs,
     ) -> tuple[torch.fx.GraphModule, dict]:
         """Execute all passes sequentially with timing and debugging.
 
@@ -46,10 +52,15 @@ class FXPassManager:
             RuntimeError: If any pass fails during execution
         """
         compiler_workdir = kwargs.get("compiler_workdir")
+        fast_trace = trace_metrics is not None and trace_metrics.fast_trace
 
         # Dump original graph
-        if compiler_workdir:
-            self._dump_graph(gm, compiler_workdir, 0, "original")
+        if compiler_workdir and not fast_trace:
+            self._dump_graph(
+                gm, compiler_workdir, 0, "original", trace_metrics=trace_metrics
+            )
+        elif compiler_workdir and trace_metrics is not None:
+            trace_metrics.graph_dump_files_suppressed += 1
 
         current_gm = gm
         all_metadata = {}
@@ -62,6 +73,8 @@ class FXPassManager:
                 )
                 current_gm.recompile()
                 elapsed_time = time.perf_counter() - start_time
+                if trace_metrics is not None:
+                    trace_metrics.pass_wall_seconds[pass_obj.name] = elapsed_time
 
                 # Collect metadata from this pass
                 all_metadata[pass_obj.name] = pass_metadata
@@ -71,8 +84,16 @@ class FXPassManager:
                 )
 
                 # Dump graph after pass
-                if compiler_workdir:
-                    self._dump_graph(current_gm, compiler_workdir, idx, pass_obj.name)
+                if compiler_workdir and not fast_trace:
+                    self._dump_graph(
+                        current_gm,
+                        compiler_workdir,
+                        idx,
+                        pass_obj.name,
+                        trace_metrics=trace_metrics,
+                    )
+                elif compiler_workdir and trace_metrics is not None:
+                    trace_metrics.graph_dump_files_suppressed += 1
 
             except Exception as e:
                 error_msg = f"FX Pass '{pass_obj.name}' failed: {str(e)}"
@@ -82,7 +103,12 @@ class FXPassManager:
         return current_gm, all_metadata
 
     def _dump_graph(
-        self, gm: torch.fx.GraphModule, compiler_workdir: str, idx: int, pass_name: str
+        self,
+        gm: torch.fx.GraphModule,
+        compiler_workdir: str,
+        idx: int,
+        pass_name: str,
+        trace_metrics: TraceMetrics | None = None,
     ) -> None:
         """Dump GraphModule to file for debugging.
 
@@ -112,10 +138,13 @@ class FXPassManager:
                     f.write(replica_header)
                     f.write("\n")
 
-                f.write(str(gm.graph))
+                f.write(render_graph(gm, trace_metrics))
                 f.write("\n\n" + "=" * 50 + "\n")
                 f.write("GraphModule code:\n")
-                f.write(gm.code)
+                f.write(render_code(gm, trace_metrics))
+
+            if trace_metrics is not None:
+                trace_metrics.graph_dump_files += 1
 
             self.logger.debug(f"Dumped graph to {filepath}")
 

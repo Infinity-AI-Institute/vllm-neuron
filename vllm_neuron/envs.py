@@ -36,7 +36,10 @@ if TYPE_CHECKING:
     # TODO: Determine the optimal forks-per-worker automatically based on
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
+    VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    VLLM_NEURON_FAST_TRACE: bool = False
+    VLLM_NEURON_TRACE_METRICS: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
@@ -114,6 +117,28 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
+def maybe_convert_bounded_positive_int(
+    value: str | None,
+    *,
+    name: str,
+    maximum: int,
+) -> int | None:
+    """Parse an optional positive integer without treating invalid values as off."""
+    if value is None:
+        return None
+    try:
+        converted = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer in [1, {maximum}], got {value!r}"
+        ) from exc
+    if not 1 <= converted <= maximum:
+        raise ValueError(
+            f"{name} must be an integer in [1, {maximum}], got {value!r}"
+        )
+    return converted
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -162,10 +187,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_PARALLEL_TRACE_WORKERS": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_PARALLEL_TRACE_WORKERS")) or 8
     ),
+    # Optional container-wide cap on trace children actively constructing
+    # graphs. Unset preserves the existing unthrottled behavior. An explicit
+    # value must be in [1, 4096]; invalid values raise before trace children
+    # are forked instead of silently disabling the safety bound.
+    "VLLM_NEURON_TRACE_RANK_CONCURRENCY": lambda: (
+        maybe_convert_bounded_positive_int(
+            os.getenv("VLLM_NEURON_TRACE_RANK_CONCURRENCY"),
+            name="VLLM_NEURON_TRACE_RANK_CONCURRENCY",
+            maximum=4096,
+        )
+    ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Opt-in cold-start experiment. Suppresses only successful FX graph text
+    # dumps. Graph mutation, recompilation, hashing, FX/HLO passes, HLO/NEFF
+    # generation, cache metadata, and failure diagnostics remain enabled.
+    "VLLM_NEURON_FAST_TRACE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_FAST_TRACE")) or False
+    ),
+    # Emit a fresh per-FX-to-HLO-pipeline metrics receipt without changing
+    # trace behavior. Fast trace enables the receipt automatically.
+    "VLLM_NEURON_TRACE_METRICS": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_METRICS")) or False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (
@@ -329,13 +376,18 @@ def is_native_backend() -> bool:
 
 
 def get_compile_backend_name() -> str:
-    """Return the torch.compile backend name: 'neuron' for native, 'vllm_neuron' for XLA."""
-    return "neuron" if is_native_backend() else "vllm_neuron"
+    """Return the torch.compile backend registered by the selected runtime."""
+    return "neuron_libtorch" if is_native_backend() else "vllm_neuron"
 
 
 def get_dist_backend() -> str:
-    """Return the distributed backend: 'neuron' for native, 'gloo' for XLA."""
-    return "neuron" if is_native_backend() else "gloo"
+    """Return the process-group backend used for rank metadata.
+
+    The lite runtime lowers functional collectives from the Gloo group's rank
+    metadata into XLA/HLO.  It does not register a ``neuron`` ProcessGroup with
+    torch.distributed, so asking vLLM to construct one fails before model load.
+    """
+    return "gloo"
 
 
 def get_neuron_compile_cache_dir() -> str:

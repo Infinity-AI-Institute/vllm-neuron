@@ -46,4 +46,16 @@ def get_models() -> list[tuple[str, type]]:
 
         models.append(("SyntheticNeuronModel", SyntheticNeuronModel))
 
+    # Kimi K3's model class lives in neuronx_distributed_inference, which is
+    # optional for vLLM-Neuron. Keep the rest of the registry available when
+    # that package is not installed.
+    try:
+        from neuronx_distributed_inference.models.kimi_k3.serving.factory import (
+            KimiK3ForCausalLM,
+        )
+    except ImportError:
+        pass
+    else:
+        models.append(("KimiK3ForCausalLM", KimiK3ForCausalLM))
+
     return models

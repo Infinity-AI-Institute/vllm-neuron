@@ -60,26 +60,43 @@ def compile_nki(
         kernel = CompileKernel(func=func, lnc=lnc, target=get_platform_target())
         inputs = {name: _convert_input(v, name) for name, v in args.items()}
 
-        compile_opts = kernel._compile_opts()
+        def compile_to_nir(active_kernel: CompileKernel):
+            compile_opts = active_kernel._compile_opts()
+            if envs.VLLM_NEURON_KERNEL_DEVICE_DUMP:
+                # Runtime env vars (NEURON_RT_DEBUG_OUTPUT_DIR,
+                # NEURON_RT_DEBUG_SAVE_BINARY) are set in executor.py.
+                from nki.compiler.frontend import TracerFrontend
 
-        if envs.VLLM_NEURON_KERNEL_DEVICE_DUMP:
-            # Runtime env vars (NEURON_RT_DEBUG_OUTPUT_DIR, NEURON_RT_DEBUG_SAVE_BINARY)
-            # are set in executor.py worker_process().
-            # Default output dir: /tmp/vllm_neuron_kernel_device_dumps
-            from nki.compiler.frontend import TracerFrontend
-
-            compile_opts = replace(compile_opts, enable_device_dump=True)
-            frontend = TracerFrontend(enable_backend_opt=kernel._enable_backend_opt)
-        else:
-            frontend = kernel._frontend_cls(
-                enable_backend_opt=kernel._enable_backend_opt,
+                compile_opts = replace(compile_opts, enable_device_dump=True)
+                frontend = TracerFrontend(
+                    enable_backend_opt=active_kernel._enable_backend_opt
+                )
+            else:
+                frontend = active_kernel._frontend_cls(
+                    enable_backend_opt=active_kernel._enable_backend_opt,
+                )
+            return active_kernel._cached_compile_to_bir(
+                frontend=frontend,
+                inputs=inputs,
+                compile_opts=compile_opts,
             )
 
-        nir = kernel._cached_compile_to_bir(
-            frontend=frontend,
-            inputs=inputs,
-            compile_opts=compile_opts,
-        )
+        try:
+            nir = compile_to_nir(kernel)
+        except RuntimeError as error:
+            # ParserFrontend serializes called Python helpers as nested defs.
+            # TracerFrontend executes those helpers while constructing NKI IR
+            # and is the supported route for such kernels. Keep this fallback
+            # diagnostic-specific so unrelated parser failures remain fatal.
+            if "inner function definitions" not in str(error):
+                raise
+            from nki.compiler.frontend import TracerFrontend
+
+            logger.warning(
+                "NKI parser rejected helper functions; retrying with tracer frontend"
+            )
+            kernel = replace(kernel, _frontend_cls=TracerFrontend)
+            nir = compile_to_nir(kernel)
 
         config = nir.build_config()
 

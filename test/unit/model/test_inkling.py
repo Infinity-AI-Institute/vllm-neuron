@@ -57,10 +57,14 @@ def test_model_config_hook_registers_architecture_lazily():
     assert {
         "InklingForConditionalGeneration",
         "InklingForCausalLM",
+        "KimiK3ForCausalLM",
     } <= names
-    assert all(
-        model.endswith(":InklingForConditionalGeneration")
-        for model in registry.models.values()
+    assert registry.models["InklingForCausalLM"].endswith(
+        ":InklingForConditionalGeneration"
+    )
+    assert registry.models["KimiK3ForCausalLM"] == (
+        "neuronx_distributed_inference.models.kimi_k3.serving.factory:"
+        "KimiK3ForCausalLM"
     )
 
 
