@@ -431,6 +431,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         """
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
+        # Optional recurrent-state protocol. Kimi K3 exposes a slot table;
+        # ordinary paged-attention models leave both fields unused.
+        self._kda_slot_table: Any | None = None
+        self._kda_state_assignment: Any | None = None
 
         # TODO: Initialize LORA configuration and manager
         # Why required: Required before LORA adapters can be used
@@ -1226,6 +1230,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     self.neuron_config,
                 )
 
+        self._kda_slot_table = getattr(self.model, "slot_table", None)
+        if self._kda_slot_table is not None:
+            from neuronx_distributed_inference.models.kimi_k3.serving.scheduler_gate import (
+                assert_scheduler_compatible,
+            )
+
+            assert_scheduler_compatible(self.vllm_config)
+
         # TODO: Load LORA model wrapper if LORA config exists
         # Why required: Required to actually load LORA adapters onto the model
         # Current: Base model loaded without LORA support
@@ -1546,7 +1558,52 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         This is a no-op for Neuron since we don't support reordering yet.
         """
-        pass
+        if self._kda_slot_table is not None:
+            self._kda_slot_table.sync(
+                list(self.input_batch.req_ids),
+                finished_req_ids=scheduler_output.finished_req_ids,
+            )
+
+    def _add_kda_state_metadata(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        num_rows: int,
+        device: torch.device,
+        synthetic: bool,
+    ) -> AttentionMetadata | None:
+        """Attach fixed-shape recurrent-state inputs to attention metadata.
+
+        Synthetic graph extraction must not mutate the live request allocator.
+        It uses deterministic unique slots and a false reset mask. Runtime uses
+        the request-id keyed table, including its padding sink and pending-reset
+        flags. Both paths expose identical tensor keys and shapes to Dynamo.
+        """
+        if self._kda_slot_table is None or not attn_metadata:
+            return attn_metadata
+        if synthetic:
+            slots = torch.arange(num_rows, dtype=torch.int64, device=device)
+            reset_mask = torch.zeros(num_rows, dtype=torch.bool, device=device)
+        else:
+            assignment = self._kda_slot_table.assign(
+                list(self.input_batch.req_ids),
+                batch_size=num_rows,
+                device=device,
+            )
+            self._kda_state_assignment = assignment
+            slots = assignment.slots
+            reset_mask = assignment.reset_mask
+        for metadata in attn_metadata.values():
+            metadata["state_slot_mapping"] = slots
+            metadata["state_reset_mask"] = reset_mask
+        return attn_metadata
+
+    def _commit_kda_state_slots(self) -> None:
+        assignment = self._kda_state_assignment
+        if self._kda_slot_table is None or assignment is None:
+            return
+        self._kda_slot_table.commit(assignment)
+        self._kda_state_assignment = None
 
     def _get_valid_sampled_token_count(self) -> list[int]:
         """Get the number of valid sampled tokens for each request.
@@ -4314,6 +4371,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             decode_token_threshold=1,
             device=device,
         )
+        attn_metadata = self._add_kda_state_metadata(
+            attn_metadata, num_rows=num_reqs, device=device, synthetic=True
+        )
 
         # Create dummy sampling params for warmup
         dummy_sampling_params = torch.tensor(
@@ -4641,6 +4701,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             decode_token_threshold=decode_token_threshold,
             ctx_bucket=ctx_bucket,
             device=device,
+        )
+        attn_metadata = self._add_kda_state_metadata(
+            attn_metadata, num_rows=num_reqs, device=device, synthetic=True
         )
 
         # Create dummy sampling params for warmup
@@ -6684,6 +6747,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             sampling_params_tensor = sampling_params_tensor.to(self.device)
 
         # Execute model on Neuron device (compiled with vllm_neuron backend)
+        if attn_metadata:
+            padded_num_reqs = next(iter(attn_metadata.values()))[
+                "block_table_tensor"
+            ].shape[0]
+            attn_metadata = self._add_kda_state_metadata(
+                attn_metadata,
+                num_rows=padded_num_reqs,
+                device=self.device,
+                synthetic=False,
+            )
         model_kwargs = {
             "input_ids": input_ids,
             "positions": positions,
@@ -6774,6 +6847,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         with model_forward_context(self.vllm_config):
             model_output = self.model(**model_kwargs)
+        self._commit_kda_state_slots()
         trace_cache_rows("after_forward")
         if self._tensor_replacer is not None:
             set_active_context(None)
