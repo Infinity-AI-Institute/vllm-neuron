@@ -37,11 +37,15 @@ The process cache is namespaced by normalized local and remote cache roots plus
 the complete semantic key. Every hit revalidates a materialized NKI binary.
 Deleting that binary turns the next lookup into a miss.
 
-After POSIX `fork`, the child detects its changed PID and drops inherited
-process entries and counters. It may repopulate from the locked persistent
-cache, but child updates remain child-local and cannot masquerade as parent
-state. Cache-mode transitions and explicit clears likewise advance the process
-generation so an in-flight lookup cannot resurrect stale entries.
+After POSIX `fork`, an at-fork handler gives the child fresh process-cache and
+source-digest locks, then drops inherited process entries and counters. The
+immutable, stat-keyed source digests remain reusable. Replacing the locks is
+necessary because another parent thread may have held an inherited copy at
+fork; a PID check inside that lock would deadlock. The child may repopulate from
+the locked persistent cache, but its updates remain child-local and cannot
+masquerade as parent state. Cache-mode transitions and explicit clears likewise
+advance the process generation so an in-flight lookup cannot resurrect stale
+entries.
 
 ## Qualification boundary
 
@@ -49,5 +53,6 @@ These checks establish deterministic cache invalidation, not kernel numerical
 correctness or NEFF portability across rank classes. Cache reuse still requires
 the caller's model, shape, topology, compiler flags, source overlay, and SDK
 contract to be compatible. Unknown custom objects, recursive containers,
-incomplete tensor metadata, cyclic wrapped callables, or uninspectable Python
-callables disable caching for that invocation.
+incomplete tensor metadata, cyclic wrapped callables, uninspectable Python
+callables, or classes without inspectable source disable caching for that
+invocation.

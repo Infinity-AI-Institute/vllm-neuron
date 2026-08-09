@@ -24,7 +24,7 @@ import threading
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from filelock import FileLock, Timeout
 
@@ -65,14 +65,14 @@ _ProcessCacheKey = tuple[str, str, str]
 @dataclass(frozen=True)
 class _ProcessCacheEntry:
     result: NKICompileResult
-    binary_path: Optional[str]
+    binary_path: str | None
 
 
 _PROCESS_CACHE: dict[_ProcessCacheKey, _ProcessCacheEntry] = {}
 _PROCESS_CACHE_LOCK = threading.Lock()
 _PROCESS_CACHE_HITS = 0
 _PROCESS_CACHE_MISSES = 0
-_PROCESS_CACHE_DISABLED: Optional[bool] = None
+_PROCESS_CACHE_DISABLED: bool | None = None
 _PROCESS_CACHE_GENERATION = 0
 _PROCESS_CACHE_PID = os.getpid()
 
@@ -95,6 +95,34 @@ def _reset_process_cache_after_fork_locked() -> None:
     _PROCESS_CACHE_DISABLED = None
     _PROCESS_CACHE_GENERATION += 1
     _PROCESS_CACHE_PID = current_pid
+
+
+def _reset_process_cache_in_fork_child() -> None:
+    """Reinitialize process-cache synchronization in a fork child.
+
+    A ``threading.Lock`` may be inherited in the locked state when another
+    parent thread owns it at ``fork``. A PID check performed *inside* that
+    lock cannot recover: the child would block forever before reaching it.
+    Replace the lock from an at-fork handler, then discard inherited entries.
+    The ordinary PID checks remain as a fallback for runtimes without
+    ``register_at_fork`` and for tests that simulate a PID transition.
+    """
+
+    global _PROCESS_CACHE_DISABLED, _PROCESS_CACHE_GENERATION, _PROCESS_CACHE_LOCK
+    global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES, _PROCESS_CACHE_PID
+    global _SOURCE_DIGEST_LOCK
+    _PROCESS_CACHE_LOCK = threading.Lock()
+    _SOURCE_DIGEST_LOCK = threading.Lock()
+    _PROCESS_CACHE.clear()
+    _PROCESS_CACHE_HITS = 0
+    _PROCESS_CACHE_MISSES = 0
+    _PROCESS_CACHE_DISABLED = None
+    _PROCESS_CACHE_GENERATION += 1
+    _PROCESS_CACHE_PID = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_process_cache_in_fork_child)
 
 
 def clear_nki_process_cache() -> None:
@@ -145,7 +173,7 @@ def _sync_nki_process_cache_mode(disabled: bool) -> int:
 
 def _get_nki_process_cache(
     process_key: _ProcessCacheKey,
-) -> Optional[NKICompileResult]:
+) -> NKICompileResult | None:
     global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES
     with _PROCESS_CACHE_LOCK:
         _reset_process_cache_after_fork_locked()
@@ -187,7 +215,7 @@ def _put_nki_process_cache(
         return _PROCESS_CACHE.setdefault(process_key, entry).result
 
 
-def _normalize_cache_root(path: Optional[str]) -> str:
+def _normalize_cache_root(path: str | None) -> str:
     if path is None:
         return ""
     return os.path.normcase(os.path.abspath(path))
@@ -196,7 +224,7 @@ def _normalize_cache_root(path: Optional[str]) -> str:
 def _nki_process_cache_key(
     cache_key: str,
     local_dir: str,
-    remote_dir: Optional[str],
+    remote_dir: str | None,
 ) -> _ProcessCacheKey:
     return (
         _normalize_cache_root(local_dir),
@@ -209,7 +237,7 @@ def create_nki_cache_key(
     func: Callable,
     args: dict[str, Any],
     grid: tuple[int, ...],
-) -> Optional[str]:
+) -> str | None:
     """Generate a persistent cache key for an NKI kernel invocation.
 
     Returns None if any semantic input cannot be represented deterministically
@@ -267,7 +295,7 @@ def create_nki_cache_key(
         return None
 
 
-def get_nki_cache(cache_key: str) -> Optional[NKICompileResult]:
+def get_nki_cache(cache_key: str) -> NKICompileResult | None:
     """Load a cached NKICompileResult from local disk cache.
 
     Returns None on miss. Does not check remote — use
@@ -276,9 +304,7 @@ def get_nki_cache(cache_key: str) -> Optional[NKICompileResult]:
     return _get_nki_cache_from_dir(cache_key, _get_local_nki_cache_dir())
 
 
-def _get_nki_cache_from_dir(
-    cache_key: str, local_dir: str
-) -> Optional[NKICompileResult]:
+def _get_nki_cache_from_dir(cache_key: str, local_dir: str) -> NKICompileResult | None:
     local_path = os.path.join(local_dir, f"{cache_key}.json")
 
     result = _read_cache_file(local_path)
@@ -337,7 +363,7 @@ def _put_nki_cache_in_dir(
 
 
 def compile_with_cache(
-    cache_key: Optional[str],
+    cache_key: str | None,
     compile_fn: Callable[[], NKICompileResult],
 ) -> NKICompileResult:
     """Check cache, or compile under lock if miss.
@@ -396,8 +422,8 @@ def compile_with_cache(
 
 
 def save_nki_cache_to_remote(
-    local_cache_dir: Optional[str] = None,
-    remote_cache_dir: Optional[str] = None,
+    local_cache_dir: str | None = None,
+    remote_cache_dir: str | None = None,
 ) -> None:
     """Promote local NKI cache entries to the remote cache atomically.
 
@@ -459,14 +485,14 @@ def _get_local_nki_cache_dir() -> str:
     return os.path.join(envs.get_neuron_compile_cache_dir(), _NKI_CACHE_SUBDIR)
 
 
-def _get_remote_nki_cache_dir() -> Optional[str]:
+def _get_remote_nki_cache_dir() -> str | None:
     remote = envs.VLLM_NEURON_REMOTE_CACHE
     if remote:
         return os.path.join(remote, _NKI_CACHE_SUBDIR)
     return None
 
 
-def _fetch_from_remote(cache_key: str) -> Optional[NKICompileResult]:
+def _fetch_from_remote(cache_key: str) -> NKICompileResult | None:
     """Fetch a single NKI cache entry from the remote cache into local.
 
     Returns the deserialized result on hit, None on miss. Copies the
@@ -482,8 +508,8 @@ def _fetch_from_remote(cache_key: str) -> Optional[NKICompileResult]:
 def _fetch_from_remote_dirs(
     cache_key: str,
     local_dir: str,
-    remote_dir: Optional[str],
-) -> Optional[NKICompileResult]:
+    remote_dir: str | None,
+) -> NKICompileResult | None:
     if not remote_dir:
         return None
 
@@ -621,10 +647,10 @@ def _canonical_value(
         _enter_key_object(value, owner, active)
         try:
             items = []
-            for key, item in value.items():
+            for index, (key, item) in enumerate(value.items()):
                 canonical_key = _canonical_value(key, f"{owner}.key", active, depth + 1)
                 canonical_item = _canonical_value(
-                    item, f"{owner}[{key!r}]", active, depth + 1
+                    item, f"{owner}.value[{index}]", active, depth + 1
                 )
                 items.append([canonical_key, canonical_item])
             items.sort(key=lambda pair: _canonical_json(pair[0]))
@@ -859,12 +885,17 @@ def _class_semantics(cls: type[Any]) -> dict[str, Any]:
         source = inspect.getsource(cls)
     except (OSError, TypeError):
         source = None
+    if source is None:
+        # Module + qualname alone is not semantic identity: dynamically
+        # replaced classes can reuse both while changing specialization-time
+        # behavior. Bypass the cache instead of risking a stale binary.
+        raise _UnsafeCacheKey(
+            f"class {cls.__module__}.{cls.__qualname__} has no inspectable source"
+        )
     return {
         "module": cls.__module__,
         "qualname": cls.__qualname__,
-        "source_digest": (
-            hashlib.sha256(source.encode("utf-8")).hexdigest() if source else None
-        ),
+        "source_digest": (hashlib.sha256(source.encode("utf-8")).hexdigest()),
     }
 
 
@@ -920,7 +951,7 @@ def _hash_kernel_source(func: Callable) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def _read_cache_file(path: str) -> Optional[NKICompileResult]:
+def _read_cache_file(path: str) -> NKICompileResult | None:
     """Read and deserialize a cache JSON file. Returns None on any failure."""
     if not os.path.exists(path):
         return None
@@ -982,7 +1013,9 @@ def _decode_backend_config(dumped_config: str) -> dict[str, Any]:
     payload = base64.b64decode(dumped_config.encode("ascii"), validate=True)
     config = json.loads(payload.decode("utf-8"))
     if not isinstance(config, dict):
-        raise ValueError("NKI backend config must be a JSON object")
+        raise ValueError(  # noqa: TRY004 - decoded payload content is invalid
+            "NKI backend config must be a JSON object"
+        )
     return config
 
 
@@ -991,7 +1024,7 @@ def _encode_backend_config(config: dict[str, Any]) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
-def _kernel_binary_path(dumped_config: str) -> Optional[str]:
+def _kernel_binary_path(dumped_config: str) -> str | None:
     """Return the BIR/KLIR file referenced by an NKI backend config."""
     try:
         config = _decode_backend_config(dumped_config)
@@ -1008,7 +1041,9 @@ def _replace_kernel_binary_path(dumped_config: str, binary_path: str) -> str:
     config = _decode_backend_config(dumped_config)
     klir_binary = config.get("klir_binary")
     if not isinstance(klir_binary, dict):
-        raise ValueError("NKI backend config has no klir_binary object")
+        raise ValueError(  # noqa: TRY004 - decoded payload content is invalid
+            "NKI backend config has no klir_binary object"
+        )
     klir_binary["binary"] = binary_path
     return _encode_backend_config(config)
 
@@ -1017,7 +1052,7 @@ def _persist_kernel_binary(
     cache_key: str,
     result: NKICompileResult,
     local_dir: str,
-) -> tuple[NKICompileResult, Optional[str]]:
+) -> tuple[NKICompileResult, str | None]:
     """Copy the ephemeral NKI binary into the persistent compile cache.
 
     ``CompileKernel`` emits backend config that names a file below

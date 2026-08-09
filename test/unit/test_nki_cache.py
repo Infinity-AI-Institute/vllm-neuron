@@ -1,6 +1,7 @@
 """Regression tests for portable NKI compile-cache records."""
 
 import base64
+import enum
 import importlib.util
 import json
 import os
@@ -47,7 +48,7 @@ def stable_key_environment(monkeypatch):
 
 def _dynamic_kernel_namespace():
     namespace = {"GLOBAL_SCALE": 2}
-    exec(
+    exec(  # noqa: S102 - isolated namespace models mutable kernel helpers
         "def helper(value):\n"
         "    return value + 1\n"
         "def kernel(value):\n"
@@ -414,7 +415,9 @@ def test_transitive_helper_mutation_misses(stable_key_environment):
     namespace = _dynamic_kernel_namespace()
     tensor = torch.empty((2, 3), device="meta")
     first = _key(namespace["kernel"], tensor)
-    exec("def helper(value):\n    return value + 2\n", namespace)
+    exec(  # noqa: S102 - isolated namespace models a helper source edit
+        "def helper(value):\n    return value + 2\n", namespace
+    )
 
     second = _key(namespace["kernel"], tensor)
 
@@ -476,9 +479,31 @@ def test_nondeterministic_specialization_value_fails_closed(
     assert _key(namespace["kernel"], object()) is None
 
 
+def test_cache_identity_does_not_execute_mapping_key_repr(stable_key_environment):
+    class HostileEnum(enum.Enum):
+        VALUE = 1
+
+        def __repr__(self):
+            raise AssertionError("mapping-key repr must not execute")
+
+    namespace = _dynamic_kernel_namespace()
+
+    assert _key(namespace["kernel"], {HostileEnum.VALUE: 1}) is not None
+
+
 def test_nondeterministic_global_fails_closed(stable_key_environment):
     namespace = _dynamic_kernel_namespace()
     namespace["GLOBAL_SCALE"] = object()
+
+    assert _key(namespace["kernel"], torch.empty(1, device="meta")) is None
+
+
+def test_dynamic_class_global_fails_closed(stable_key_environment):
+    namespace = _dynamic_kernel_namespace()
+    namespace["DynamicClass"] = type("DynamicClass", (), {})
+    exec(  # noqa: S102 - isolated namespace models generated kernel code
+        "def kernel(value):\n    return DynamicClass, value\n", namespace
+    )
 
     assert _key(namespace["kernel"], torch.empty(1, device="meta")) is None
 
@@ -552,3 +577,64 @@ def test_fork_child_drops_inherited_process_cache():
     assert status == 0
     assert json.loads(child_payload) == {"entries": 0, "hits": 0, "misses": 0}
     assert nki_cache.nki_process_cache_stats()["entries"] == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_child_reinitializes_an_inherited_locked_cache_lock():
+    nki_cache.clear_nki_process_cache()
+    parent_pid = os.getpid()
+    read_fd, write_fd = os.pipe()
+    nki_cache._PROCESS_CACHE_LOCK.acquire()
+    try:
+        pid = os.fork()
+    finally:
+        # Only the parent still owns the original lock. The registered child
+        # hook replaced its inherited copy before Python resumed after fork.
+        if os.getpid() == parent_pid:
+            nki_cache._PROCESS_CACHE_LOCK.release()
+
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            child_stats = nki_cache.nki_process_cache_stats()
+            os.write(write_fd, json.dumps(child_stats).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    child_payload = os.read(read_fd, 4096)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+
+    assert status == 0
+    assert json.loads(child_payload) == {"entries": 0, "hits": 0, "misses": 0}
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_child_reinitializes_an_inherited_source_digest_lock():
+    parent_pid = os.getpid()
+    read_fd, write_fd = os.pipe()
+    nki_cache._SOURCE_DIGEST_LOCK.acquire()
+    try:
+        pid = os.fork()
+    finally:
+        if os.getpid() == parent_pid:
+            nki_cache._SOURCE_DIGEST_LOCK.release()
+
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            digest = nki_cache._sealed_source_digest(__file__)
+            os.write(write_fd, digest.encode("ascii"))
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    child_payload = os.read(read_fd, 4096)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+
+    assert status == 0
+    assert len(child_payload) == 64

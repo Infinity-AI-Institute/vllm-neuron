@@ -230,6 +230,39 @@ def test_audit_follows_dataclass_slots_resolved_weakrefs_and_cycles(
     )
 
 
+def test_audit_ignores_dead_weak_references(parallel_trace_module):
+    class WeakOwner:
+        pass
+
+    weak_owner = WeakOwner()
+    dead_reference = weakref.ref(weak_owner)
+    del weak_owner
+
+    assert (
+        parallel_trace_module._collect_job_tensor_owners(
+            [(lambda: None, {"weak": dead_reference})]
+        )
+        == []
+    )
+
+
+def test_audit_does_not_execute_mapping_key_repr(parallel_trace_module):
+    tensor = torch.ones(1)
+
+    class HostileKey:
+        def __repr__(self):
+            raise AssertionError("mapping-key repr must not execute")
+
+    records = _owners_by_tensor(
+        parallel_trace_module,
+        [(lambda: None, {HostileKey(): tensor})],
+    )
+
+    [owner_path] = records[id(tensor)].owner_paths
+    assert "kwargs[key:0<" in owner_path
+    assert owner_path.endswith("HostileKey>]")
+
+
 def test_audit_does_not_scan_whole_function_globals_or_module_namespaces(
     parallel_trace_module,
 ):
@@ -279,6 +312,17 @@ def test_audit_accepts_only_meta_tensor_roots(parallel_trace_module):
     meta = torch.empty(2, 3, device="meta")
     parallel_trace_module._audit_jobs_on_meta(
         [(functools.partial(lambda value: value, meta), {"value": meta})]
+    )
+
+
+def test_production_audit_does_not_retain_clean_meta_path_suffixes(
+    parallel_trace_module,
+):
+    meta = torch.empty(2, 3, device="meta")
+    jobs = [(lambda **_kwargs: None, {"nested": [{"value": meta}]})]
+
+    assert (
+        parallel_trace_module._collect_job_tensor_owners(jobs, include_meta=False) == []
     )
 
 

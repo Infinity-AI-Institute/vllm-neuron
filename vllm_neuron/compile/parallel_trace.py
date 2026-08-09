@@ -167,7 +167,7 @@ def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None
                 "representative_rank": representative,
                 "staged_jobs": len(staged_jobs),
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - serialize any preflight failure
             payload[0] = {
                 "ok": False,
                 "representative_rank": representative,
@@ -217,7 +217,9 @@ def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None
 
     result = payload[0]
     if not isinstance(result, dict):
-        raise RuntimeError("Representative trace preflight returned no result")
+        raise RuntimeError(  # noqa: TRY004 - distributed protocol failure
+            "Representative trace preflight returned no result"
+        )
     if not result.get("ok"):
         emit_trace_milestone(
             "preflight_failed",
@@ -448,11 +450,11 @@ def _run_pool_fork(
                         trace_rank_concurrency,
                     )
                     os._exit(0)
-                except BaseException:
+                except BaseException:  # noqa: BLE001 - child must report before _exit
                     try:
                         with open(rp, "w") as f:
                             f.write("ERROR\n" + traceback.format_exc())
-                    except Exception:
+                    except Exception:  # noqa: BLE001,S110 - final child fallback
                         pass
                     os._exit(1)
             else:
@@ -713,7 +715,7 @@ def _fork_child_main(
                 elapsed_seconds=time.perf_counter() - job_started,
             )
         failing_job = None
-    except BaseException as e:
+    except BaseException as e:  # noqa: BLE001 - status must cover child termination
         status = "ERROR"
         emit_trace_milestone(
             "job_failed" if failing_job is not None else "child_failed",
@@ -862,7 +864,8 @@ class _CallableTensorAudit:
     omitted because that set is infinite and adds no ownership information.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_meta: bool = True) -> None:
+        self._include_meta = include_meta
         self.records: dict[int, _TensorAuditRecord] = {}
         self._active: set[int] = set()
         self._descendants: dict[
@@ -877,6 +880,12 @@ class _CallableTensorAudit:
 
     def _scan(self, obj: Any) -> list[tuple[str, torch.Tensor]]:
         if isinstance(obj, torch.Tensor):
+            # The production audit only needs offenders. Dropping clean meta
+            # leaves here prevents every ancestor in a large model graph from
+            # caching another copy of their path suffixes. The generic owner
+            # collector retains meta tensors for diagnostics and unit tests.
+            if not self._include_meta and obj.device.type == "meta":
+                return []
             return [("", obj)]
         if obj is None or isinstance(
             obj,
@@ -916,7 +925,11 @@ class _CallableTensorAudit:
             elif isinstance(obj, dict):
                 for index, (key, value) in enumerate(obj.items()):
                     self._extend(descendants, f".keys[{index}]", key)
-                    self._extend(descendants, f"[{key!r}]", value)
+                    self._extend(
+                        descendants,
+                        _audit_mapping_value_edge(key, index),
+                        value,
+                    )
             elif isinstance(obj, (list, tuple)):
                 for index, value in enumerate(obj):
                     self._extend(descendants, f"[{index}]", value)
@@ -994,7 +1007,7 @@ class _CallableTensorAudit:
         for field in dataclasses.fields(obj):
             try:
                 value = getattr(obj, field.name)
-            except (AttributeError, RuntimeError):
+            except (AttributeError, ReferenceError, RuntimeError):
                 continue
             self._extend(descendants, f".{field.name}", value)
 
@@ -1007,7 +1020,7 @@ class _CallableTensorAudit:
     ) -> None:
         try:
             state = vars(obj)
-        except TypeError:
+        except (ReferenceError, TypeError):
             return
         skipped = skip_names or set()
         for name, value in state.items():
@@ -1030,14 +1043,33 @@ class _CallableTensorAudit:
                 seen_names.add(name)
                 try:
                     value = getattr(obj, name)
-                except (AttributeError, RuntimeError):
+                except (AttributeError, ReferenceError, RuntimeError):
                     continue
                 self._extend(descendants, f".{name}", value)
 
 
-def _collect_job_tensor_owners(jobs: list[Job]) -> list[_TensorAuditRecord]:
+def _audit_mapping_value_edge(key: Any, index: int) -> str:
+    """Format a mapping edge without invoking an arbitrary key ``__repr__``."""
+
+    if type(key) is str:
+        suffix = "..." if len(key) > 80 else ""
+        return f"[{key[:80]!r}{suffix}]"
+    if type(key) is bytes:
+        suffix = "..." if len(key) > 80 else ""
+        return f"[{key[:80]!r}{suffix}]"
+    if key is None or type(key) in (bool, int, float):
+        return f"[{key!r}]"
+    key_type = type(key)
+    return f"[key:{index}<{key_type.__module__}.{key_type.__qualname__}>]"
+
+
+def _collect_job_tensor_owners(
+    jobs: list[Job],
+    *,
+    include_meta: bool = True,
+) -> list[_TensorAuditRecord]:
     """Return tensor records reachable from every callable and kwarg root."""
-    audit = _CallableTensorAudit()
+    audit = _CallableTensorAudit(include_meta=include_meta)
     for job_index, (model, kwargs) in enumerate(jobs):
         audit.collect(model, f"jobs[{job_index}].callable")
         audit.collect(kwargs, f"jobs[{job_index}].kwargs")
@@ -1055,7 +1087,7 @@ def _audit_jobs_on_meta(jobs: list[Job]) -> None:
     """
     offenders = [
         record
-        for record in _collect_job_tensor_owners(jobs)
+        for record in _collect_job_tensor_owners(jobs, include_meta=False)
         if record.tensor.device.type != "meta"
     ]
     if not offenders:
