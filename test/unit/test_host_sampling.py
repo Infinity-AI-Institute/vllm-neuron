@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_neuron.vllm.worker.neuron_model_runner import (
+    AsyncNeuronModelRunnerOutput,
     NeuronModelRunner,
     _copy_sampling_metadata_to_cpu,
 )
@@ -48,6 +50,9 @@ def test_host_sampler_materializes_logits_on_cpu():
     runner.input_batch = SimpleNamespace(sampling_metadata=_sampling_metadata())
     runner.use_async_scheduling = False
     runner.on_device_sampling = False
+    runner._sampling_output_validator = lambda _: (_ for _ in ()).throw(
+        AssertionError("host sampling must not call the token-ID validator")
+    )
     captured = {}
 
     def sampler(**kwargs):
@@ -63,3 +68,125 @@ def test_host_sampler_materializes_logits_on_cpu():
     assert logits.cpu_calls == 1
     assert captured["logits"].device.type == "cpu"
     assert captured["sampling_metadata"].temperature.device.type == "cpu"
+
+
+class _StrictSamplingOutputModel:
+    def __init__(self, vocab_size=12):
+        self.vocab_size = vocab_size
+        self.calls = []
+
+    def validate_sampling_output(self, token_ids):
+        self.calls.append(token_ids)
+        if token_ids.device.type != "cpu":
+            raise ValueError("sampling output must be on CPU")
+        if token_ids.dtype != torch.int32:
+            raise TypeError("sampling output must use int32")
+        if token_ids.ndim != 1:
+            raise ValueError("sampling output must be one-dimensional")
+        if torch.any((token_ids < 0) | (token_ids >= self.vocab_size)):
+            raise RuntimeError("sampling output contains an out-of-range token ID")
+
+
+def _on_device_runner(model=None):
+    runner = NeuronModelRunner.__new__(NeuronModelRunner)
+    runner.on_device_sampling = True
+    runner.use_async_scheduling = False
+    runner._on_device_logits = None
+    runner._sampling_output_validator = getattr(model, "validate_sampling_output", None)
+    runner.model = model
+    runner.input_batch = SimpleNamespace(
+        vocab_size=12,
+        sampling_metadata=SimpleNamespace(max_num_logprobs=0),
+    )
+    runner.drafter = None
+    return runner
+
+
+def test_sync_on_device_sampling_validates_raw_cpu_ids_before_list_conversion():
+    model = _StrictSamplingOutputModel()
+    runner = _on_device_runner(model)
+    # load_model() captures the bound hook before torch.compile replaces this
+    # field with an OptimizedModule wrapper.
+    runner.model = SimpleNamespace()
+
+    result = runner._sample(torch.tensor([0, 11], dtype=torch.int32))
+
+    assert result.sampled_token_ids == [[0], [11]]
+    assert len(model.calls) == 1
+    assert model.calls[0].device.type == "cpu"
+    assert model.calls[0].shape == (2,)
+    assert model.calls[0].dtype == torch.int32
+
+
+def test_on_device_sampling_falls_back_for_models_without_validation_hook():
+    runner = _on_device_runner(SimpleNamespace())
+
+    result = runner._sample(torch.tensor([2, 7], dtype=torch.int32))
+
+    assert result.sampled_token_ids == [[2], [7]]
+
+
+def _async_output(token_ids, model):
+    runner = _on_device_runner(model)
+    updates = []
+    runner._update_batch_state_with_samples = lambda sampled, snapshot_req_ids=None: (
+        updates.append((sampled, snapshot_req_ids))
+    )
+    output = SimpleNamespace(
+        sampled_token_ids=token_ids,
+        req_ids=[f"req-{i}" for i in range(token_ids.shape[0])],
+    )
+    return AsyncNeuronModelRunnerOutput(output, runner), output, updates
+
+
+def test_async_on_device_sampling_validates_before_state_and_output_mutation():
+    model = _StrictSamplingOutputModel()
+    async_output, output, updates = _async_output(
+        torch.tensor([0, 11], dtype=torch.int32), model
+    )
+
+    materialized = async_output.get_output()
+
+    assert materialized is output
+    assert output.sampled_token_ids == [[0], [11]]
+    assert updates == [([[0], [11]], ["req-0", "req-1"])]
+    assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize("bad_id", [-1, 12])
+def test_async_on_device_sampling_rejects_invalid_id_before_mutation(bad_id):
+    model = _StrictSamplingOutputModel()
+    raw = torch.tensor([bad_id], dtype=torch.int32)
+    async_output, output, updates = _async_output(raw, model)
+
+    with pytest.raises(RuntimeError, match="out-of-range"):
+        async_output.get_output()
+
+    assert output.sampled_token_ids is raw
+    assert updates == []
+
+
+def test_async_on_device_sampling_preserves_shape_for_validation():
+    model = _StrictSamplingOutputModel()
+    raw = torch.tensor([[1]], dtype=torch.int32)
+    async_output, output, updates = _async_output(raw, model)
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        async_output.get_output()
+
+    assert model.calls[0].shape == (1, 1)
+    assert output.sampled_token_ids is raw
+    assert updates == []
+
+
+def test_async_on_device_sampling_preserves_dtype_for_validation():
+    model = _StrictSamplingOutputModel()
+    raw = torch.tensor([1], dtype=torch.int64)
+    async_output, output, updates = _async_output(raw, model)
+
+    with pytest.raises(TypeError, match="int32"):
+        async_output.get_output()
+
+    assert model.calls[0].dtype == torch.int64
+    assert output.sampled_token_ids is raw
+    assert updates == []
