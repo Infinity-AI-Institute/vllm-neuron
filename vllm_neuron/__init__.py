@@ -74,7 +74,13 @@ def _init_backend():
         # ``neuron_libtorch`` torch.compile backend, and XLA implementations of
         # functional collectives.  It intentionally does not register a
         # torch.distributed ProcessGroup named ``neuron``.
-        import libtorch_neuronx_lite  # noqa: F401
+        import libtorch_neuronx_lite
+
+        # libtorch-neuronx-lite avoids automatic backend registration while
+        # ``vllm_neuron`` is present in sys.modules, because the packaged
+        # plugin normally owns registration.  The source overlay is that
+        # plugin, so complete the native initialization explicitly.
+        libtorch_neuronx_lite._register_compile_backends()
 
         return
 
