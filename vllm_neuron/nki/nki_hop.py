@@ -362,6 +362,17 @@ def _materialize_fake_arg(a: Any) -> Any:
     return a
 
 
+def _fake_output_device(args: Sequence[Any]) -> torch.device:
+    """Choose the logical runtime device from mixed meta/runtime inputs."""
+    tensor_devices = [a.device for a in args if isinstance(a, torch.Tensor)]
+    if not tensor_devices:
+        raise ValueError("No tensor arguments — cannot infer device")
+    return next(
+        (candidate for candidate in tensor_devices if candidate.type != "meta"),
+        tensor_devices[0],
+    )
+
+
 @nki_kernel_wrapper.py_impl(FakeTensorMode)
 def _fake_impl(
     mode: FakeTensorMode,
@@ -374,9 +385,13 @@ def _fake_impl(
     arg_names: Sequence[str],
     constant_args_key: int,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
-    if device is None:
-        raise ValueError("No tensor arguments — cannot infer device")
+    # Parallel graph extraction swaps model parameters to meta while leaving
+    # synthetic runtime inputs and cache roots on their logical Neuron device.
+    # Packed kernels conventionally receive weights first, so selecting the
+    # first tensor would incorrectly make every NKI result meta and later fail
+    # when it is written to a Neuron cache. Prefer the first logical runtime
+    # device and retain meta only when every tensor argument is meta.
+    device = _fake_output_device(args)
 
     # In CPU sim mode, the NKI compiler is not available for shape inference.
     # Run the simulator on ones-filled tensors to determine output shape/dtype.
