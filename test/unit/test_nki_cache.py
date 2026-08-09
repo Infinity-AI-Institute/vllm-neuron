@@ -2,12 +2,50 @@
 
 import base64
 import json
+import multiprocessing
+import os
 import shutil
+import time
 
 import torch
+from _nki_test_loader import load_nki_modules
 
-from vllm_neuron.nki import nki_cache
-from vllm_neuron.nki.nki_compile import NKICompileResult
+nki_cache, nki_compile, _ = load_nki_modules()
+NKICompileResult = nki_compile.NKICompileResult
+
+
+def _cache_result(value: str = "compiled") -> NKICompileResult:
+    dumped_config = base64.b64encode(
+        json.dumps({"value": value}).encode("utf-8")
+    ).decode("ascii")
+    return NKICompileResult(
+        dumped_config=dumped_config,
+        return_types=((torch.bfloat16, (1,)),),
+        operand_output_aliases={},
+    )
+
+
+def _compile_cache_process_worker(
+    cache_dir: str,
+    compile_marker: str,
+    start_event,
+    result_queue,
+) -> None:
+    """Exercise the real file lock from an independently spawned process."""
+    os.environ.pop("VLLM_NEURON_DISABLE_COMPILE_CACHE", None)
+    os.environ.pop("VLLM_NEURON_REMOTE_CACHE", None)
+    nki_cache._get_local_nki_cache_dir = lambda: cache_dir
+    start_event.wait(timeout=10)
+
+    def compile_once() -> NKICompileResult:
+        with open(compile_marker, "a", encoding="utf-8") as marker:
+            marker.write(f"{os.getpid()}\n")
+            marker.flush()
+        time.sleep(0.2)
+        return _cache_result()
+
+    result = nki_cache.compile_with_cache("shared-process-key", compile_once)
+    result_queue.put(result.dumped_config)
 
 
 def _backend_config(binary_path) -> str:
@@ -87,3 +125,79 @@ def test_nki_cache_rejects_missing_materialized_binary(monkeypatch, tmp_path):
     (cache_dir / "binaries" / "missing.json").unlink()
 
     assert nki_cache.get_nki_cache("missing") is None
+
+
+def test_compile_cache_hit_skips_recompilation_and_emits_events(
+    monkeypatch, tmp_path, caplog
+):
+    cache_dir = tmp_path / "compile-cache" / "nki"
+    monkeypatch.setattr(nki_cache, "_get_local_nki_cache_dir", lambda: str(cache_dir))
+    monkeypatch.setattr(nki_cache, "_fetch_from_remote", lambda _key: None)
+    compile_calls = 0
+
+    def compile_once() -> NKICompileResult:
+        nonlocal compile_calls
+        compile_calls += 1
+        return _cache_result()
+
+    caplog.set_level("DEBUG", logger="vllm_neuron.nki.nki_compile")
+    first = nki_cache.compile_with_cache("warm-key", compile_once)
+    second = nki_cache.compile_with_cache("warm-key", compile_once)
+
+    assert first == second
+    assert compile_calls == 1
+    events = [
+        json.loads(record.getMessage().split("NKI_COMPILE_EVENT ", 1)[1])
+        for record in caplog.records
+        if "NKI_COMPILE_EVENT " in record.getMessage()
+    ]
+    assert any(
+        event["event"] == "cache_lookup"
+        and event["stage"] == "initial"
+        and event["outcome"] == "miss"
+        for event in events
+    )
+    assert any(
+        event["event"] == "cache_write"
+        and event["outcome"] == "stored"
+        and event["cache_key"] == "warm-key"
+        for event in events
+    )
+    assert any(
+        event["event"] == "cache_lookup"
+        and event["stage"] == "initial"
+        and event["outcome"] == "hit"
+        for event in events
+    )
+    assert all(event["duration_ms"] >= 0 for event in events if "duration_ms" in event)
+
+
+def test_compile_cache_serializes_spawned_processes(tmp_path):
+    """Only the lock winner compiles; waiters consume its persisted result."""
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    cache_dir = tmp_path / "compile-cache" / "nki"
+    compile_marker = tmp_path / "compile-calls.txt"
+    processes = [
+        context.Process(
+            target=_compile_cache_process_worker,
+            args=(str(cache_dir), str(compile_marker), start_event, result_queue),
+        )
+        for _ in range(3)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+
+    assert not alive
+    assert [process.exitcode for process in processes] == [0, 0, 0]
+    assert len(compile_marker.read_text().splitlines()) == 1
+    results = [result_queue.get(timeout=5) for _ in processes]
+    assert results == [results[0]] * len(processes)

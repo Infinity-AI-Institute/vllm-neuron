@@ -5,16 +5,18 @@ Provides compile_nki() which compiles NKI kernels via CompileKernel
 and returns the fields the HOP infrastructure needs.
 """
 
+import json
 import logging
+import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-
+from nki.framework.compiled import CompileKernel
 from nki.language.buffers import shared_hbm
 from nki.language.tensor import NkiTensor
-from nki.framework.compiled import CompileKernel
 
 from vllm_neuron import envs
 
@@ -22,6 +24,32 @@ from ..compile.platform import get_platform_target
 from .nki_dtype import nki_dtype_to_torch, torch_to_nki_dtype
 
 logger = logging.getLogger(__name__)
+
+_NKI_EVENT_PREFIX = "NKI_COMPILE_EVENT "
+
+
+def _log_nki_event(
+    event: str,
+    *,
+    level: int = logging.INFO,
+    **fields: Any,
+) -> None:
+    """Emit one machine-readable NKI compile/cache event.
+
+    Parallel trace children already prefix log records with their actual trace
+    rank and lane. Keeping that existing mechanism avoids introducing a second
+    source of process context while the PID and cache key make standalone
+    records attributable outside the trace pool.
+    """
+    if not logger.isEnabledFor(level):
+        return
+    payload = {"event": event, "pid": os.getpid(), **fields}
+    logger.log(
+        level,
+        "%s%s",
+        _NKI_EVENT_PREFIX,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )
 
 
 @dataclass
@@ -75,11 +103,33 @@ def compile_nki(
                 frontend = active_kernel._frontend_cls(
                     enable_backend_opt=active_kernel._enable_backend_opt,
                 )
-            return active_kernel._cached_compile_to_bir(
-                frontend=frontend,
-                inputs=inputs,
-                compile_opts=compile_opts,
+            frontend_name = type(frontend).__name__
+            started = time.perf_counter()
+            try:
+                nir = active_kernel._cached_compile_to_bir(
+                    frontend=frontend,
+                    inputs=inputs,
+                    compile_opts=compile_opts,
+                )
+            except Exception as error:
+                _log_nki_event(
+                    "frontend_compile",
+                    level=logging.WARNING,
+                    cache_key=cache_key,
+                    frontend=frontend_name,
+                    outcome="error",
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    error_type=type(error).__name__,
+                )
+                raise
+            _log_nki_event(
+                "frontend_compile",
+                cache_key=cache_key,
+                frontend=frontend_name,
+                outcome="success",
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
             )
+            return nir
 
         try:
             nir = compile_to_nir(kernel)
@@ -92,11 +142,34 @@ def compile_nki(
                 raise
             from nki.compiler.frontend import TracerFrontend
 
+            fallback_reason = "parser_inner_function_definitions"
             logger.warning(
                 "NKI parser rejected helper functions; retrying with tracer frontend"
             )
             kernel = replace(kernel, _frontend_cls=TracerFrontend)
-            nir = compile_to_nir(kernel)
+            fallback_started = time.perf_counter()
+            try:
+                nir = compile_to_nir(kernel)
+            except Exception as fallback_error:
+                _log_nki_event(
+                    "tracer_fallback",
+                    level=logging.WARNING,
+                    cache_key=cache_key,
+                    reason=fallback_reason,
+                    outcome="error",
+                    duration_ms=round(
+                        (time.perf_counter() - fallback_started) * 1000, 3
+                    ),
+                    error_type=type(fallback_error).__name__,
+                )
+                raise
+            _log_nki_event(
+                "tracer_fallback",
+                cache_key=cache_key,
+                reason=fallback_reason,
+                outcome="success",
+                duration_ms=round((time.perf_counter() - fallback_started) * 1000, 3),
+            )
 
         config = nir.build_config()
 

@@ -16,19 +16,21 @@ import json
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable, Hashable
 from typing import Any, Optional
 
 from filelock import FileLock, Timeout
 
 from vllm_neuron import envs
+
 from ..compile.platform import (
     get_neuronxcc_version,
     get_nki_version,
     get_platform_target,
     get_torch_neuronx_version,
 )
-from .nki_compile import NKICompileResult
+from .nki_compile import NKICompileResult, _log_nki_event
 from .nki_dtype import str_to_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,7 @@ def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
 
     local_path = os.path.join(local_dir, f"{cache_key}.json")
     tmp_path = f"{local_path}.tmp.{os.getpid()}"
+    write_started = time.perf_counter()
     cached_result, kernel_binary = _persist_kernel_binary(cache_key, result, local_dir)
 
     data = {
@@ -134,8 +137,24 @@ def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
             f.flush()
         os.rename(tmp_path, local_path)
         logger.debug("NKI cache stored: %s", cache_key)
+        _log_nki_event(
+            "cache_write",
+            cache_key=cache_key,
+            outcome="stored",
+            duration_ms=round((time.perf_counter() - write_started) * 1000, 3),
+            kernel_binary_persisted=kernel_binary is not None,
+        )
     except OSError as e:
         logger.warning("Failed to write NKI cache entry %s: %s", cache_key, e)
+        _log_nki_event(
+            "cache_write",
+            level=logging.WARNING,
+            cache_key=cache_key,
+            outcome="error",
+            duration_ms=round((time.perf_counter() - write_started) * 1000, 3),
+            error_type=type(e).__name__,
+            kernel_binary_persisted=kernel_binary is not None,
+        )
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -156,10 +175,28 @@ def compile_with_cache(
         NKICompileResult from cache or fresh compilation.
     """
     if cache_key is None or envs.VLLM_NEURON_DISABLE_COMPILE_CACHE:
+        _log_nki_event(
+            "cache_lookup",
+            level=logging.DEBUG,
+            cache_key=cache_key,
+            stage="initial",
+            outcome="bypass",
+            reason=("no_cache_key" if cache_key is None else "compile_cache_disabled"),
+        )
         return compile_fn()
 
     # Fast path: lockless local read
+    lookup_started = time.perf_counter()
     cached = get_nki_cache(cache_key)
+    _log_nki_event(
+        "cache_lookup",
+        level=logging.DEBUG,
+        cache_key=cache_key,
+        stage="initial",
+        source="local",
+        outcome="hit" if cached is not None else "miss",
+        duration_ms=round((time.perf_counter() - lookup_started) * 1000, 3),
+    )
     if cached is not None:
         return cached
 
@@ -168,15 +205,45 @@ def compile_with_cache(
     os.makedirs(local_dir, exist_ok=True)
     lock_path = os.path.join(local_dir, f"{cache_key}.lock")
 
+    lock = FileLock(lock_path, timeout=_LOCK_TIMEOUT)
+    lock_started = time.perf_counter()
     try:
-        with FileLock(lock_path, timeout=_LOCK_TIMEOUT):
+        with lock:
+            lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 3)
+            _log_nki_event(
+                "lock_wait",
+                level=logging.INFO if lock_wait_ms >= 1000 else logging.DEBUG,
+                cache_key=cache_key,
+                outcome="acquired",
+                duration_ms=lock_wait_ms,
+            )
             # Double-check local after acquiring lock
+            lookup_started = time.perf_counter()
             cached = get_nki_cache(cache_key)
+            _log_nki_event(
+                "cache_lookup",
+                level=logging.DEBUG,
+                cache_key=cache_key,
+                stage="post_lock",
+                source="local",
+                outcome="hit" if cached is not None else "miss",
+                duration_ms=round((time.perf_counter() - lookup_started) * 1000, 3),
+            )
             if cached is not None:
                 return cached
 
             # Try remote fetch (only lock winner hits remote filesystem)
+            lookup_started = time.perf_counter()
             cached = _fetch_from_remote(cache_key)
+            _log_nki_event(
+                "cache_lookup",
+                level=logging.DEBUG,
+                cache_key=cache_key,
+                stage="post_lock",
+                source="remote",
+                outcome="hit" if cached is not None else "miss",
+                duration_ms=round((time.perf_counter() - lookup_started) * 1000, 3),
+            )
             if cached is not None:
                 return cached
 
@@ -184,6 +251,14 @@ def compile_with_cache(
             put_nki_cache(cache_key, result)
             return result
     except Timeout:
+        lock_wait_ms = round((time.perf_counter() - lock_started) * 1000, 3)
+        _log_nki_event(
+            "lock_wait",
+            level=logging.WARNING,
+            cache_key=cache_key,
+            outcome="timeout",
+            duration_ms=lock_wait_ms,
+        )
         logger.warning(
             "NKI cache lock timeout for %s, compiling without cache", cache_key
         )
