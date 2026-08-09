@@ -26,8 +26,18 @@ list is one prefill shape followed by one decode shape:
 ```bash
 export VLLM_NEURON_TRACE_PREFLIGHT_RANK=0
 export VLLM_NEURON_TRACE_PREFLIGHT_JOBS=2
+export VLLM_NEURON_TRACE_PREFLIGHT_TIMEOUT_SECONDS=14400
+export VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS=300
 export VLLM_NEURON_TRACE_MILESTONE_DIR=/scratch/trainium-logs/kimi-k3/$RUN_ID-trace
 ```
+
+The staging rendezvous uses a dedicated all-rank process group created before
+the representative starts tracing. Its four-hour default deadline applies only
+to this control-plane broadcast; the default process group and model
+collectives retain their existing timeout. Parked ranks emit
+`preflight_wait_heartbeat` every five minutes without resetting that deadline.
+The heartbeat must be shorter than the deadline, and both values are validated
+before tracing begins.
 
 Keep the existing `VLLM_NEURON_TRACE_RANK_CONCURRENCY` setting. The preflight
 child uses the same host slot protocol, so it cannot overlap the waiting ranks'
@@ -39,8 +49,9 @@ coverage.
 The files `rank-0.jsonl` through `rank-(world_size-1).jsonl` contain schema-v1
 records. Important events are:
 
-- `preflight_selected`, `preflight_waiting`, `preflight_failed`, and
-  `preflight_released`;
+- `preflight_selected`, `preflight_waiting`,
+  `preflight_control_group_ready`, `preflight_wait_heartbeat`,
+  `preflight_rendezvous_failed`, `preflight_failed`, and `preflight_released`;
 - `pool_started`, `host_slot_waiting`, `host_slot_acquired`, and
   `pool_completed` or `pool_failed`;
 - `meta_swap_started`, `meta_swap_completed`, `job_started`, `job_completed`,
@@ -58,8 +69,8 @@ intended boundary. Normal-stage events then locate later FX/HLO failures by job.
 
 The representative catches ordinary trace exceptions and broadcasts a bounded
 error payload. Waiting ranks raise before forking any normal trace children. A
-hard process death still relies on the process group's existing failure/timeout
-handling; this feature does not attempt to replace distributed supervision.
+hard process death is bounded by the preflight-only process group's deadline.
+Changing that deadline does not weaken ordinary collective timeout handling.
 
 Preflight success does not prove rank-specific graph correctness, FX-pass
 correctness, HLO equivalence, or compilation correctness. Those remain covered
