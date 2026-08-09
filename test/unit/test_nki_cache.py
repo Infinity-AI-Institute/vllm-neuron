@@ -1,10 +1,14 @@
 """Regression tests for portable NKI compile-cache records."""
 
 import base64
+import importlib.util
 import json
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_neuron.nki import nki_cache
@@ -27,6 +31,34 @@ def _backend_config(binary_path) -> str:
 def _binary_path(dumped_config: str) -> str:
     config = json.loads(base64.b64decode(dumped_config).decode("utf-8"))
     return config["klir_binary"]["binary"]
+
+
+@pytest.fixture
+def stable_key_environment(monkeypatch):
+    monkeypatch.setattr(nki_cache, "get_platform_target", lambda: "trn2")
+    monkeypatch.setattr(nki_cache, "get_nki_version", lambda: "nki-test")
+    monkeypatch.setattr(nki_cache, "get_neuronxcc_version", lambda: "cc-test")
+    monkeypatch.setattr(
+        nki_cache, "get_torch_neuronx_version", lambda: "torch-neuronx-test"
+    )
+    monkeypatch.setattr(nki_cache.envs, "VLLM_NEURON_KERNEL_DEVICE_DUMP", False)
+    monkeypatch.delenv("VLLM_NEURON_NKI_SOURCE_IDENTITY", raising=False)
+
+
+def _dynamic_kernel_namespace():
+    namespace = {"GLOBAL_SCALE": 2}
+    exec(
+        "def helper(value):\n"
+        "    return value + 1\n"
+        "def kernel(value):\n"
+        "    return helper(value) * GLOBAL_SCALE\n",
+        namespace,
+    )
+    return namespace
+
+
+def _key(kernel, value, grid=(2,)):
+    return nki_cache.create_nki_cache_key(kernel, {"value": value}, grid)
 
 
 def test_nki_cache_materializes_ephemeral_kernel_binary(monkeypatch, tmp_path):
@@ -309,3 +341,214 @@ def test_concurrent_same_key_compiles_once(monkeypatch, tmp_path):
 
     assert compile_calls == 1
     assert {result.dumped_config for result in results} == {"thread-safe"}
+
+
+def test_semantically_identical_kernel_invocations_hit_same_key(
+    stable_key_environment,
+):
+    namespace = _dynamic_kernel_namespace()
+    tensor = torch.empty((2, 3), dtype=torch.bfloat16)
+
+    first = _key(namespace["kernel"], tensor)
+    second = _key(namespace["kernel"], tensor)
+
+    assert first is not None
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (torch.empty((2, 3)), torch.empty((2, 4))),
+        (
+            torch.empty((2, 3), dtype=torch.float32),
+            torch.empty((2, 3), dtype=torch.bfloat16),
+        ),
+        (torch.empty((2, 3)), torch.empty((3, 2)).t()),
+        (
+            torch.empty(16).as_strided((2, 3), (3, 1), 0),
+            torch.empty(16).as_strided((2, 3), (3, 1), 1),
+        ),
+        (torch.empty((2, 3), device="cpu"), torch.empty((2, 3), device="meta")),
+    ],
+    ids=["shape", "dtype", "stride", "storage-offset", "device-role"],
+)
+def test_tensor_semantic_changes_miss(
+    stable_key_environment,
+    first,
+    second,
+):
+    kernel = _dynamic_kernel_namespace()["kernel"]
+
+    assert _key(kernel, first) != _key(kernel, second)
+
+
+def test_tensor_layout_change_misses(stable_key_environment):
+    kernel = _dynamic_kernel_namespace()["kernel"]
+
+    def descriptor(layout):
+        return SimpleNamespace(
+            shape=(2, 3),
+            dtype=torch.bfloat16,
+            layout=layout,
+            device=torch.device("meta"),
+            stride=lambda: (3, 1),
+            storage_offset=lambda: 0,
+        )
+
+    assert _key(kernel, descriptor("torch.strided")) != _key(
+        kernel, descriptor("torch.sparse_coo")
+    )
+
+
+def test_grid_change_misses(stable_key_environment):
+    namespace = _dynamic_kernel_namespace()
+    tensor = torch.empty((2, 3), device="meta")
+
+    assert _key(namespace["kernel"], tensor, (1,)) != _key(
+        namespace["kernel"], tensor, (2,)
+    )
+
+
+def test_transitive_helper_mutation_misses(stable_key_environment):
+    namespace = _dynamic_kernel_namespace()
+    tensor = torch.empty((2, 3), device="meta")
+    first = _key(namespace["kernel"], tensor)
+    exec("def helper(value):\n    return value + 2\n", namespace)
+
+    second = _key(namespace["kernel"], tensor)
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_specialization_global_mutation_misses(stable_key_environment):
+    namespace = _dynamic_kernel_namespace()
+    tensor = torch.empty((2, 3), device="meta")
+    first = _key(namespace["kernel"], tensor)
+    namespace["GLOBAL_SCALE"] = 3
+
+    second = _key(namespace["kernel"], tensor)
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_source_revision_change_misses(stable_key_environment, monkeypatch):
+    namespace = _dynamic_kernel_namespace()
+    tensor = torch.empty((2, 3), device="meta")
+    monkeypatch.setenv("VLLM_NEURON_NKI_SOURCE_IDENTITY", "revision-a")
+    first = _key(namespace["kernel"], tensor)
+    monkeypatch.setenv("VLLM_NEURON_NKI_SOURCE_IDENTITY", "revision-b")
+
+    second = _key(namespace["kernel"], tensor)
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_sealed_source_file_mutation_misses(stable_key_environment, tmp_path):
+    module_path = tmp_path / "kernel_source.py"
+    module_path.write_text("def kernel(value):\n    return value + 1\n")
+    spec = importlib.util.spec_from_file_location("cache_key_test_kernel", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    tensor = torch.empty((2, 3), device="meta")
+    first = _key(module.kernel, tensor)
+    module_path.write_text("def kernel(value):\n    return value + 1\n# revision two\n")
+
+    second = _key(module.kernel, tensor)
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_nondeterministic_specialization_value_fails_closed(
+    stable_key_environment,
+):
+    namespace = _dynamic_kernel_namespace()
+
+    assert _key(namespace["kernel"], object()) is None
+
+
+def test_nondeterministic_global_fails_closed(stable_key_environment):
+    namespace = _dynamic_kernel_namespace()
+    namespace["GLOBAL_SCALE"] = object()
+
+    assert _key(namespace["kernel"], torch.empty(1, device="meta")) is None
+
+
+def test_schema_v1_entry_is_not_reused(tmp_path):
+    cache_path = tmp_path / "legacy.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dumped_config": "legacy",
+                "return_types": [["torch.bfloat16", [1]]],
+                "operand_output_aliases": {},
+            }
+        )
+    )
+
+    assert nki_cache._read_cache_file(str(cache_path)) is None
+
+
+def test_pid_change_drops_inherited_process_cache(monkeypatch):
+    nki_cache.clear_nki_process_cache()
+    process_key = ("local", "remote", "pid-change")
+    result = NKICompileResult(
+        dumped_config="parent",
+        return_types=((torch.bfloat16, (1,)),),
+        operand_output_aliases={},
+    )
+    generation = nki_cache._PROCESS_CACHE_GENERATION
+    nki_cache._put_nki_process_cache(process_key, result, generation)
+    parent_pid = nki_cache._PROCESS_CACHE_PID
+
+    monkeypatch.setattr(nki_cache.os, "getpid", lambda: parent_pid + 1)
+
+    assert nki_cache.nki_process_cache_stats() == {
+        "entries": 0,
+        "hits": 0,
+        "misses": 0,
+    }
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_child_drops_inherited_process_cache():
+    nki_cache.clear_nki_process_cache()
+    process_key = ("local", "remote", "fork-key")
+    result = NKICompileResult(
+        dumped_config="fork-parent",
+        return_types=((torch.bfloat16, (1,)),),
+        operand_output_aliases={},
+    )
+    generation = nki_cache._PROCESS_CACHE_GENERATION
+    nki_cache._put_nki_process_cache(process_key, result, generation)
+    assert nki_cache.nki_process_cache_stats()["entries"] == 1
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            child_stats = nki_cache.nki_process_cache_stats()
+            os.write(write_fd, json.dumps(child_stats).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    child_payload = os.read(read_fd, 4096)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+
+    assert status == 0
+    assert json.loads(child_payload) == {"entries": 0, "hits": 0, "misses": 0}
+    assert nki_cache.nki_process_cache_stats()["entries"] == 1
