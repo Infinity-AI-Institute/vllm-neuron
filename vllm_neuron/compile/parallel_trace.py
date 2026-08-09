@@ -59,6 +59,9 @@ before capture imports or meta-swapping, minimizing additional copy-on-write
 memory. Unset preserves the existing behavior.
 """
 
+import dataclasses
+import functools
+import inspect
 import logging
 import os
 import shutil
@@ -67,6 +70,8 @@ import tempfile
 import threading
 import time
 import traceback
+import types
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
@@ -658,6 +663,14 @@ def _fork_child_main(
 
         os.environ["VLLM_NEURON_CPU_COMPILE"] = "1"
 
+        # A fork inherits Dynamo's process-local code/guard caches and any
+        # FakeTensorMode mappings populated by the parent.  Those mappings may
+        # retain the pre-swap device tensors even when every model attribute is
+        # subsequently replaced.  Reset before inspecting the callable roots
+        # or entering Dynamo so the audit describes the state this child will
+        # actually trace.
+        torch.compiler.reset()
+
         emit_trace_milestone(
             "meta_swap_started",
             parent_rank=parent_rank,
@@ -666,7 +679,7 @@ def _fork_child_main(
             jobs=len(jobs_slice),
         )
         _swap_unique_models_to_meta([model for model, _ in jobs_slice])
-        _validate_models_on_meta([model for model, _ in jobs_slice])
+        _audit_jobs_on_meta(jobs_slice)
         emit_trace_milestone(
             "meta_swap_completed",
             parent_rank=parent_rank,
@@ -802,6 +815,264 @@ def _walk_tensors_seen(obj: Any, path: str, seen: set[int]):
             yield from _walk_tensors_seen(v, f"{path}{sep}<{type_name}>.{k}", seen)
 
 
+@dataclasses.dataclass
+class _TensorAuditRecord:
+    """One tensor identity and every path by which the audit reached it."""
+
+    tensor: torch.Tensor
+    owner_paths: set[str] = dataclasses.field(default_factory=set)
+
+
+def _tensor_alias_root(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the root of PyTorch's explicit ``Tensor._base`` view chain."""
+    root = tensor
+    seen: set[int] = set()
+    while isinstance(getattr(root, "_base", None), torch.Tensor):
+        if id(root) in seen:
+            break
+        seen.add(id(root))
+        root = root._base
+    return root
+
+
+def _tensor_audit_metadata(tensor: torch.Tensor) -> str:
+    """Format metadata that is safe to query without executing the tensor."""
+    return (
+        f"device={tensor.device} shape={tuple(tensor.shape)} "
+        f"dtype={tensor.dtype} stride={tuple(tensor.stride())} "
+        f"storage_offset={tensor.storage_offset()} "
+        f"identity=0x{id(tensor):x} "
+        f"alias_root=0x{id(_tensor_alias_root(tensor)):x}"
+    )
+
+
+class _CallableTensorAudit:
+    """Collect tensors reachable from trace callables without executing code.
+
+    The traversal follows owned Python state and the exact callable references
+    that affect invocation.  In particular, a function contributes only the
+    globals/nonlocals named by its bytecode through ``inspect.getclosurevars``;
+    its entire ``__globals__`` namespace is never scanned.  Imported module
+    objects and classes are terminal leaves for the same reason.
+
+    Each object's relative tensor descendants are memoized.  Reusing those
+    suffixes under every incoming edge reports all finite alias paths without
+    repeatedly expanding a large ``OptimizedModule`` object graph.  ``_active``
+    terminates cycles; paths that repeatedly circle a cycle are intentionally
+    omitted because that set is infinite and adds no ownership information.
+    """
+
+    def __init__(self) -> None:
+        self.records: dict[int, _TensorAuditRecord] = {}
+        self._active: set[int] = set()
+        self._descendants: dict[
+            int,
+            tuple[Any, list[tuple[str, torch.Tensor]]],
+        ] = {}
+
+    def collect(self, obj: Any, path: str) -> None:
+        for suffix, tensor in self._scan(obj):
+            record = self.records.setdefault(id(tensor), _TensorAuditRecord(tensor))
+            record.owner_paths.add(f"{path}{suffix}")
+
+    def _scan(self, obj: Any) -> list[tuple[str, torch.Tensor]]:
+        if isinstance(obj, torch.Tensor):
+            return [("", obj)]
+        if obj is None or isinstance(
+            obj,
+            (str, bytes, bytearray, int, float, complex, bool, type),
+        ):
+            return []
+        # A module namespace can contain thousands of unrelated tensors and is
+        # not an ownership edge from the callable.  Referenced values selected
+        # by getclosurevars are inspected individually instead.
+        if isinstance(obj, types.ModuleType):
+            return []
+
+        obj_id = id(obj)
+        cached = self._descendants.get(obj_id)
+        if cached is not None:
+            return cached[1]
+        if obj_id in self._active:
+            return []
+        self._active.add(obj_id)
+        descendants: list[tuple[str, torch.Tensor]] = []
+        try:
+            if isinstance(obj, weakref.ReferenceType):
+                resolved = obj()
+                if resolved is not None:
+                    self._extend(descendants, "()", resolved)
+            elif isinstance(obj, functools.partial):
+                self._extend(descendants, ".func", obj.func)
+                self._extend(descendants, ".args", obj.args)
+                self._extend(descendants, ".keywords", obj.keywords or {})
+                self._scan_object_state(obj, descendants)
+            elif inspect.ismethod(obj):
+                self._extend(descendants, ".__self__", obj.__self__)
+                self._extend(descendants, ".__func__", obj.__func__)
+            elif inspect.isfunction(obj):
+                self._scan_function_state(obj, descendants)
+                self._scan_object_state(obj, descendants)
+            elif isinstance(obj, dict):
+                for index, (key, value) in enumerate(obj.items()):
+                    self._extend(descendants, f".keys[{index}]", key)
+                    self._extend(descendants, f"[{key!r}]", value)
+            elif isinstance(obj, (list, tuple)):
+                for index, value in enumerate(obj):
+                    self._extend(descendants, f"[{index}]", value)
+            elif isinstance(obj, (set, frozenset)):
+                for index, value in enumerate(obj):
+                    self._extend(descendants, f"[set:{index}]", value)
+            else:
+                # OptimizedModule owns the original nn.Module through _orig_mod.
+                # nn.Module stores it inside _modules, while lightweight wrappers
+                # may keep it directly in __dict__.  Visit either representation
+                # explicitly so the diagnostic has the stable public owner path.
+                object_state = getattr(obj, "__dict__", {})
+                registered_modules = object_state.get("_modules", {})
+                orig_mod = registered_modules.get("_orig_mod")
+                if orig_mod is None:
+                    orig_mod = inspect.getattr_static(obj, "_orig_mod", None)
+                if orig_mod is not None:
+                    self._extend(descendants, "._orig_mod", orig_mod)
+
+                self._scan_dataclass_fields(obj, descendants)
+                self._scan_object_state(
+                    obj,
+                    descendants,
+                    skip_names={"_orig_mod"},
+                )
+                self._scan_slots(obj, descendants)
+        finally:
+            self._active.remove(obj_id)
+
+        # Retain the object with the memo entry so a short-lived container's
+        # Python id cannot be reused for a different object during this audit.
+        self._descendants[obj_id] = (obj, descendants)
+        return descendants
+
+    def _extend(
+        self,
+        descendants: list[tuple[str, torch.Tensor]],
+        edge: str,
+        child: Any,
+    ) -> None:
+        descendants.extend(
+            (f"{edge}{suffix}", tensor) for suffix, tensor in self._scan(child)
+        )
+
+    def _scan_function_state(
+        self,
+        function: Any,
+        descendants: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        closure = function.__closure__ or ()
+        freevars = function.__code__.co_freevars
+        for name, cell in zip(freevars, closure, strict=True):
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            self._extend(descendants, f".__closure__[{name!r}]", value)
+
+        try:
+            closure_vars = inspect.getclosurevars(function)
+        except (TypeError, ValueError):
+            return
+        for name, value in closure_vars.nonlocals.items():
+            self._extend(descendants, f".nonlocals[{name!r}]", value)
+        for name, value in closure_vars.globals.items():
+            self._extend(descendants, f".globals[{name!r}]", value)
+
+    def _scan_dataclass_fields(
+        self,
+        obj: Any,
+        descendants: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
+            return
+        for field in dataclasses.fields(obj):
+            try:
+                value = getattr(obj, field.name)
+            except (AttributeError, RuntimeError):
+                continue
+            self._extend(descendants, f".{field.name}", value)
+
+    def _scan_object_state(
+        self,
+        obj: Any,
+        descendants: list[tuple[str, torch.Tensor]],
+        *,
+        skip_names: set[str] | None = None,
+    ) -> None:
+        try:
+            state = vars(obj)
+        except TypeError:
+            return
+        skipped = skip_names or set()
+        for name, value in state.items():
+            if name not in skipped:
+                self._extend(descendants, f".{name}", value)
+
+    def _scan_slots(
+        self,
+        obj: Any,
+        descendants: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        seen_names: set[str] = set()
+        for cls in type(obj).__mro__:
+            slots = cls.__dict__.get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for name in slots:
+                if name in seen_names or name in ("__dict__", "__weakref__"):
+                    continue
+                seen_names.add(name)
+                try:
+                    value = getattr(obj, name)
+                except (AttributeError, RuntimeError):
+                    continue
+                self._extend(descendants, f".{name}", value)
+
+
+def _collect_job_tensor_owners(jobs: list[Job]) -> list[_TensorAuditRecord]:
+    """Return tensor records reachable from every callable and kwarg root."""
+    audit = _CallableTensorAudit()
+    for job_index, (model, kwargs) in enumerate(jobs):
+        audit.collect(model, f"jobs[{job_index}].callable")
+        audit.collect(kwargs, f"jobs[{job_index}].kwargs")
+    return list(audit.records.values())
+
+
+def _audit_jobs_on_meta(jobs: list[Job]) -> None:
+    """Fail before Dynamo if any callable-owned tensor is not meta.
+
+    Unlike the parent-side kwargs validator, this child-side audit runs after
+    the model swap and includes wrappers, bound callables, closures, referenced
+    globals/nonlocals, partial arguments, dataclasses, slots, weak references,
+    and ordinary object state.  Every owner path for one tensor identity is
+    emitted together so a retained live alias can be fixed at its real source.
+    """
+    offenders = [
+        record
+        for record in _collect_job_tensor_owners(jobs)
+        if record.tensor.device.type != "meta"
+    ]
+    if not offenders:
+        return
+
+    lines = [
+        (
+            "parallel trace pre-Dynamo tensor audit found "
+            f"{len(offenders)} unexplained non-meta tensor identity(s):"
+        )
+    ]
+    for record in sorted(offenders, key=lambda item: id(item.tensor)):
+        lines.append(f"- {_tensor_audit_metadata(record.tensor)}")
+        lines.extend(f"  owner={owner}" for owner in sorted(record.owner_paths))
+    raise ValueError("\n".join(lines))
+
+
 def _validate_models_on_meta(models: list[Any]) -> None:
     """Reject live device tensors still reachable from trace models.
 
@@ -912,37 +1183,92 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
     stride / dtype. ``id_to_meta`` further dedupes by Python identity.
     """
     storage_to_meta: dict[int, torch.UntypedStorage] = {}
+    meta_storage_to_source: dict[int, int] = {}
     id_to_meta: dict[int, torch.Tensor] = {}
     container_to_meta: dict[int, Any] = {}
     containers_in_progress: set[int] = set()
-
-    def _alias_root_id(src: torch.Tensor) -> int:
-        root = src
-        seen: set[int] = set()
-        while isinstance(getattr(root, "_base", None), torch.Tensor):
-            if id(root) in seen:
-                break
-            seen.add(id(root))
-            root = root._base
-        return id(root)
 
     def _replacement_for(src: torch.Tensor) -> torch.Tensor:
         cached = id_to_meta.get(id(src))
         if cached is not None:
             return cached
-        storage_id = _alias_root_id(src)
+        storage_id = id(_tensor_alias_root(src))
+        source_storage_nbytes = src.untyped_storage().nbytes()
+        source_offset = src.storage_offset()
+        source_shape = tuple(src.shape)
+        source_stride = tuple(src.stride())
+        if any(stride < 0 for stride in source_stride):
+            raise ValueError(
+                "cannot reconstruct unsupported negative-stride tensor view: "
+                f"{_tensor_audit_metadata(src)}"
+            )
+        if src.numel() == 0:
+            if (
+                source_offset < 0
+                or source_offset * src.element_size() > source_storage_nbytes
+            ):
+                raise ValueError(
+                    "cannot reconstruct empty tensor view outside source storage: "
+                    f"{_tensor_audit_metadata(src)} "
+                    f"storage_nbytes={source_storage_nbytes}"
+                )
+        else:
+            minimum_index = source_offset + sum(
+                (size - 1) * min(stride, 0)
+                for size, stride in zip(source_shape, source_stride, strict=True)
+            )
+            maximum_index = source_offset + sum(
+                (size - 1) * max(stride, 0)
+                for size, stride in zip(source_shape, source_stride, strict=True)
+            )
+            if (
+                minimum_index < 0
+                or (maximum_index + 1) * src.element_size() > source_storage_nbytes
+            ):
+                raise ValueError(
+                    "cannot reconstruct tensor view outside source storage: "
+                    f"{_tensor_audit_metadata(src)} "
+                    f"storage_nbytes={source_storage_nbytes} "
+                    f"index_bounds=({minimum_index}, {maximum_index})"
+                )
         meta_storage = storage_to_meta.get(storage_id)
         if meta_storage is None:
-            meta_storage = torch.UntypedStorage(
-                src.untyped_storage().nbytes(), device="meta"
-            )
+            meta_storage = torch.UntypedStorage(source_storage_nbytes, device="meta")
             storage_to_meta[storage_id] = meta_storage
+            meta_storage_id = meta_storage._cdata
+            prior_source = meta_storage_to_source.setdefault(
+                meta_storage_id,
+                storage_id,
+            )
+            if prior_source != storage_id:
+                raise AssertionError(
+                    "independent source alias roots received one meta storage: "
+                    f"source_alias_root=0x{storage_id:x} "
+                    f"prior_alias_root=0x{prior_source:x} "
+                    f"meta_storage=0x{meta_storage_id:x}"
+                )
         repl = torch.empty(0, dtype=src.dtype, device="meta").set_(
             meta_storage,
-            src.storage_offset(),
-            src.shape,
-            src.stride(),
+            source_offset,
+            source_shape,
+            source_stride,
         )
+        parity = (
+            tuple(repl.shape) == source_shape
+            and repl.dtype == src.dtype
+            and tuple(repl.stride()) == source_stride
+            and repl.storage_offset() == source_offset
+            and repl.untyped_storage().nbytes() == source_storage_nbytes
+            and repl.untyped_storage()._cdata == meta_storage._cdata
+        )
+        if not parity:
+            raise AssertionError(
+                "meta tensor reconstruction changed view metadata: "
+                f"source=({_tensor_audit_metadata(src)}) "
+                f"replacement=({_tensor_audit_metadata(repl)}) "
+                f"source_storage_nbytes={source_storage_nbytes} "
+                f"replacement_storage_nbytes={repl.untyped_storage().nbytes()}"
+            )
         id_to_meta[id(src)] = repl
         # Hold a strong reference to the source so its storage survives
         # until child exit (no nrt_tensor_free calls).

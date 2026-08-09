@@ -119,6 +119,35 @@ def test_meta_swap_preserves_distinct_offset_views_of_one_cache(compile_modules)
     assert dupe_map == [0, 1]
 
 
+def test_meta_swap_preserves_noncontiguous_view_metadata_and_storage_bounds(
+    compile_modules,
+):
+    class CacheOwner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            source = torch.arange(60, dtype=torch.float32).view(3, 4, 5)
+            self.cache = source[1:, 1:, ::2].transpose(0, 2)
+
+    owner = CacheOwner()
+    source = owner.cache
+    expected = {
+        "shape": tuple(source.shape),
+        "dtype": source.dtype,
+        "stride": tuple(source.stride()),
+        "storage_offset": source.storage_offset(),
+        "storage_nbytes": source.untyped_storage().nbytes(),
+    }
+
+    compile_modules.parallel_trace._swap_to_meta_no_free(owner)
+
+    assert owner.cache.device.type == "meta"
+    assert tuple(owner.cache.shape) == expected["shape"]
+    assert owner.cache.dtype == expected["dtype"]
+    assert tuple(owner.cache.stride()) == expected["stride"]
+    assert owner.cache.storage_offset() == expected["storage_offset"]
+    assert owner.cache.untyped_storage().nbytes() == expected["storage_nbytes"]
+
+
 def test_meta_swap_replaces_tensors_nested_in_k3_cache_containers(
     compile_modules,
 ):
