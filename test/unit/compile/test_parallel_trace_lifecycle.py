@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -45,14 +46,21 @@ def test_sequential_mode_uses_one_fully_waited_pool_per_job(
     jobs = [_job(), _job()]
     calls = []
 
-    def fake_pool(pool_jobs, parent_rank, num_workers):
-        calls.append((pool_jobs, parent_rank, num_workers))
+    def fake_pool(
+        pool_jobs,
+        parent_rank,
+        num_workers,
+        trace_rank_concurrency=None,
+    ):
+        calls.append(
+            (pool_jobs, parent_rank, num_workers, trace_rank_concurrency)
+        )
 
     monkeypatch.setattr(parallel_trace_module, "_run_pool_fork", fake_pool)
 
     parallel_trace_module._run_fresh_children_sequentially(jobs, parent_rank=7)
 
-    assert calls == [([jobs[0]], 7, 1), ([jobs[1]], 7, 1)]
+    assert calls == [([jobs[0]], 7, 1, None), ([jobs[1]], 7, 1, None)]
 
 
 def test_sequential_mode_stops_after_indexed_child_failure(
@@ -62,8 +70,15 @@ def test_sequential_mode_stops_after_indexed_child_failure(
     jobs = [_job(), _job(), _job()]
     calls = []
 
-    def fake_pool(pool_jobs, parent_rank, num_workers):
-        calls.append((pool_jobs, parent_rank, num_workers))
+    def fake_pool(
+        pool_jobs,
+        parent_rank,
+        num_workers,
+        trace_rank_concurrency=None,
+    ):
+        calls.append(
+            (pool_jobs, parent_rank, num_workers, trace_rank_concurrency)
+        )
         if pool_jobs == [jobs[1]]:
             raise RuntimeError("child failed")
 
@@ -78,4 +93,43 @@ def test_sequential_mode_stops_after_indexed_child_failure(
             parent_rank=11,
         )
 
-    assert calls == [([jobs[0]], 11, 1), ([jobs[1]], 11, 1)]
+    assert calls == [
+        ([jobs[0]], 11, 1, None),
+        ([jobs[1]], 11, 1, None),
+    ]
+
+
+def test_throttle_is_acquired_before_child_graph_setup(
+    monkeypatch,
+    parallel_trace_module,
+):
+    events = []
+
+    @contextmanager
+    def fake_slot(limit, *, parent_rank, lane_idx):
+        events.append(("acquire", limit, parent_rank, lane_idx))
+        yield 0
+        events.append(("release",))
+
+    def fake_child(lane_idx, parent_rank, jobs_slice, result_path):
+        events.append(
+            ("graph", lane_idx, parent_rank, jobs_slice, result_path)
+        )
+
+    monkeypatch.setattr(parallel_trace_module, "host_trace_slot", fake_slot)
+    monkeypatch.setattr(parallel_trace_module, "_fork_child_main", fake_child)
+    jobs = [_job()]
+
+    parallel_trace_module._run_throttled_child(
+        2,
+        17,
+        jobs,
+        "/tmp/status",
+        8,
+    )
+
+    assert events == [
+        ("acquire", 8, 17, 2),
+        ("graph", 2, 17, jobs, "/tmp/status"),
+        ("release",),
+    ]

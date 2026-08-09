@@ -48,6 +48,15 @@ run jobs sequentially in the parent process. Setting
 ``VLLM_NEURON_PARALLEL_TRACE_WORKERS=1`` runs every job serially in a
 distinct, fully reaped child. This bounds peak trace memory to one graph
 shape without depending on process-global cache or allocator cleanup.
+
+Container-wide throttle
+-----------------------
+
+Set ``VLLM_NEURON_TRACE_RANK_CONCURRENCY=N`` to let all rank parents enter
+the trace pool while allowing at most N fork children in the container to
+construct graphs concurrently. Waiting children acquire a kernel-owned slot
+before capture imports or meta-swapping, minimizing additional copy-on-write
+memory. Unset preserves the existing behavior.
 """
 
 import logging
@@ -63,6 +72,7 @@ from typing import Any
 import torch
 
 from vllm_neuron import envs
+from vllm_neuron.compile.trace_throttle import host_trace_slot
 
 logger = logging.getLogger(__name__)
 
@@ -103,17 +113,23 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
     _validate_jobs_on_meta(jobs)
 
     num_workers = min(envs.VLLM_NEURON_PARALLEL_TRACE_WORKERS, len(jobs))
+    trace_rank_concurrency = envs.VLLM_NEURON_TRACE_RANK_CONCURRENCY
     logger.info(
-        "Parallel trace: jobs=%d, lanes=%d, parent_rank=%d",
+        "Parallel trace: jobs=%d, lanes=%d, parent_rank=%d, host_limit=%s",
         len(jobs),
         num_workers,
         parent_rank,
+        trace_rank_concurrency,
     )
     t0 = time.perf_counter()
     if num_workers == 1:
-        _run_fresh_children_sequentially(jobs, parent_rank)
+        _run_fresh_children_sequentially(
+            jobs, parent_rank, trace_rank_concurrency
+        )
     else:
-        _run_pool_fork(jobs, parent_rank, num_workers)
+        _run_pool_fork(
+            jobs, parent_rank, num_workers, trace_rank_concurrency
+        )
     elapsed = time.perf_counter() - t0
     logger.info(
         "Parallel trace finished: jobs=%d, lanes=%d, %.2fs",
@@ -123,7 +139,11 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
     )
 
 
-def _run_fresh_children_sequentially(jobs: list[Job], parent_rank: int) -> None:
+def _run_fresh_children_sequentially(
+    jobs: list[Job],
+    parent_rank: int,
+    trace_rank_concurrency: int | None = None,
+) -> None:
     """Run every trace job in a distinct, fully reaped child process.
 
     ``_run_pool_fork`` waits for and reaps its child before returning. Calling
@@ -138,7 +158,12 @@ def _run_fresh_children_sequentially(jobs: list[Job], parent_rank: int) -> None:
             parent_rank,
         )
         try:
-            _run_pool_fork([job], parent_rank, num_workers=1)
+            _run_pool_fork(
+                [job],
+                parent_rank,
+                num_workers=1,
+                trace_rank_concurrency=trace_rank_concurrency,
+            )
         except RuntimeError as exc:
             raise RuntimeError(
                 "Sequential fresh trace child failed: "
@@ -151,7 +176,12 @@ def _run_fresh_children_sequentially(jobs: list[Job], parent_rank: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
+def _run_pool_fork(
+    jobs: list[Job],
+    parent_rank: int,
+    num_workers: int,
+    trace_rank_concurrency: int | None = None,
+) -> None:
     """Fork one child per non-empty lane. Each child runs all jobs
     assigned to its lane (in order) and exits. Parent ``waitpid``s and
     reads each child's status file to detect failures.
@@ -178,7 +208,13 @@ def _run_pool_fork(jobs: list[Job], parent_rank: int, num_workers: int) -> None:
                 # atexit handlers (which would otherwise try to clean
                 # up parent state we still want).
                 try:
-                    _fork_child_main(lane_idx, parent_rank, lane_jobs, rp)
+                    _run_throttled_child(
+                        lane_idx,
+                        parent_rank,
+                        lane_jobs,
+                        rp,
+                        trace_rank_concurrency,
+                    )
                     os._exit(0)
                 except BaseException:
                     try:
@@ -316,6 +352,22 @@ def _partition_round_robin(items: list, n: int) -> list[list]:
 # ---------------------------------------------------------------------------
 # Per-lane child entrypoint + status I/O
 # ---------------------------------------------------------------------------
+
+
+def _run_throttled_child(
+    lane_idx: int,
+    parent_rank: int,
+    jobs_slice: list[Job],
+    result_path: str,
+    trace_rank_concurrency: int | None,
+) -> None:
+    """Acquire the host slot before importing or mutating trace state."""
+    with host_trace_slot(
+        trace_rank_concurrency,
+        parent_rank=parent_rank,
+        lane_idx=lane_idx,
+    ):
+        _fork_child_main(lane_idx, parent_rank, jobs_slice, result_path)
 
 
 def _fork_child_main(

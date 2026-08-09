@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     # TODO: Determine the optimal forks-per-worker automatically based on
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
+    VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
@@ -114,6 +115,28 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
+def maybe_convert_bounded_positive_int(
+    value: str | None,
+    *,
+    name: str,
+    maximum: int,
+) -> int | None:
+    """Parse an optional positive integer without treating invalid values as off."""
+    if value is None:
+        return None
+    try:
+        converted = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer in [1, {maximum}], got {value!r}"
+        ) from exc
+    if not 1 <= converted <= maximum:
+        raise ValueError(
+            f"{name} must be an integer in [1, {maximum}], got {value!r}"
+        )
+    return converted
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -161,6 +184,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # headroom, bucket count, and per-bucket trace cost.
     "VLLM_NEURON_PARALLEL_TRACE_WORKERS": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_PARALLEL_TRACE_WORKERS")) or 8
+    ),
+    # Optional container-wide cap on trace children actively constructing
+    # graphs. Unset preserves the existing unthrottled behavior. An explicit
+    # value must be in [1, 4096]; invalid values raise before trace children
+    # are forked instead of silently disabling the safety bound.
+    "VLLM_NEURON_TRACE_RANK_CONCURRENCY": lambda: (
+        maybe_convert_bounded_positive_int(
+            os.getenv("VLLM_NEURON_TRACE_RANK_CONCURRENCY"),
+            name="VLLM_NEURON_TRACE_RANK_CONCURRENCY",
+            maximum=4096,
+        )
     ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.
