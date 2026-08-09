@@ -45,9 +45,9 @@ Disable
 
 Set ``VLLM_NEURON_DISABLE_PARALLEL_TRACE=1`` to skip the fork pool and
 run jobs sequentially in the parent process. Setting
-``VLLM_NEURON_PARALLEL_TRACE_WORKERS=1`` is also honored — a
-single forked child runs all jobs, useful for matching the fork code
-path while disabling parallelism.
+``VLLM_NEURON_PARALLEL_TRACE_WORKERS=1`` runs every job serially in a
+distinct, fully reaped child. This bounds peak trace memory to one graph
+shape without depending on process-global cache or allocator cleanup.
 """
 
 import logging
@@ -87,8 +87,8 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
             and tag log records.
 
     The pool size is ``VLLM_NEURON_PARALLEL_TRACE_WORKERS``
-    (default ``8``), capped at ``len(jobs)``; setting it to 1 runs all
-    jobs in a single forked child. Set
+    (default ``8``), capped at ``len(jobs)``; setting it to 1 runs each
+    job in a distinct, fully reaped child. Set
     ``VLLM_NEURON_DISABLE_PARALLEL_TRACE=1`` to bypass the pool entirely
     and run jobs in the parent process.
 
@@ -110,7 +110,10 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
         parent_rank,
     )
     t0 = time.perf_counter()
-    _run_pool_fork(jobs, parent_rank, num_workers)
+    if num_workers == 1:
+        _run_fresh_children_sequentially(jobs, parent_rank)
+    else:
+        _run_pool_fork(jobs, parent_rank, num_workers)
     elapsed = time.perf_counter() - t0
     logger.info(
         "Parallel trace finished: jobs=%d, lanes=%d, %.2fs",
@@ -118,6 +121,29 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
         num_workers,
         elapsed,
     )
+
+
+def _run_fresh_children_sequentially(jobs: list[Job], parent_rank: int) -> None:
+    """Run every trace job in a distinct, fully reaped child process.
+
+    ``_run_pool_fork`` waits for and reaps its child before returning. Calling
+    it once per job establishes a strict process-lifetime boundary between
+    graph shapes, releasing Dynamo, FX, XLA, Python, and allocator state.
+    """
+    for job_idx, job in enumerate(jobs):
+        logger.info(
+            "Sequential fresh trace child: job=%d/%d parent_rank=%d",
+            job_idx + 1,
+            len(jobs),
+            parent_rank,
+        )
+        try:
+            _run_pool_fork([job], parent_rank, num_workers=1)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Sequential fresh trace child failed: "
+                f"job={job_idx + 1}/{len(jobs)} parent_rank={parent_rank}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
