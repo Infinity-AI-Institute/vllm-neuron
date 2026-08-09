@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
     VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
+    VLLM_NEURON_TRACE_LEADER_ONLY: bool = False
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     VLLM_NEURON_FAST_TRACE: bool = False
     VLLM_NEURON_TRACE_METRICS: bool = False
@@ -197,6 +198,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             name="VLLM_NEURON_TRACE_RANK_CONCURRENCY",
             maximum=4096,
         )
+    ),
+    # Opt-in only after a rank HLO census proves the model's capture is rank
+    # invariant. Rank 0 extracts each graph; every rank still participates in
+    # both barriers, compilation, NEFF loading, and warmup.
+    "VLLM_NEURON_TRACE_LEADER_ONLY": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_LEADER_ONLY")) or False
     ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.

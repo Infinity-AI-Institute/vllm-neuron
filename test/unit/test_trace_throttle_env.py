@@ -36,3 +36,11 @@ def test_trace_rank_concurrency_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("VLLM_NEURON_TRACE_RANK_CONCURRENCY", value)
     with pytest.raises(ValueError, match=r"must be an integer in \[1, 4096\]"):
         _ = _load_envs().VLLM_NEURON_TRACE_RANK_CONCURRENCY
+
+
+def test_trace_leader_only_is_opt_in(monkeypatch):
+    monkeypatch.delenv("VLLM_NEURON_TRACE_LEADER_ONLY", raising=False)
+    assert _load_envs().VLLM_NEURON_TRACE_LEADER_ONLY is False
+
+    monkeypatch.setenv("VLLM_NEURON_TRACE_LEADER_ONLY", "1")
+    assert _load_envs().VLLM_NEURON_TRACE_LEADER_ONLY is True

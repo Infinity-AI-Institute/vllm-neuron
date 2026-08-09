@@ -159,6 +159,7 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `VLLM_NEURON_PARALLEL_COMPILE_WORKERS` | int | -- | Number of parallel compilation workers. |
 | `VLLM_NEURON_PARALLEL_TRACE_WORKERS` | int | 8 | Maximum forked trace children per rank parent. Set to 1 to reap each graph shape in a fresh child before starting the next shape. |
 | `VLLM_NEURON_TRACE_RANK_CONCURRENCY` | int | unset | Opt-in container-wide cap (1-4096) on trace children actively constructing graphs. Waiting occurs before capture imports and model meta-swapping. Invalid values or a live conflicting limit fail closed. Kernel `flock` leases under `/dev/shm` are released on normal exit, exceptions, and fatal signals. |
+| `VLLM_NEURON_TRACE_LEADER_ONLY` | bool | 0 | Experimental rank-invariant capture. Rank 0 extracts graphs while every rank still participates in barriers, compilation, NEFF loading, and warmup. Enable only after a semantic HLO census proves every rank has identical graph hashes, shapes, constants, and normalized HLO for the exact model and compile shape. |
 | `VLLM_NEURON_FAST_TRACE` | bool | 0 | Opt in to suppressing successful FX graph text dumps. Ordinary failures still write one `fxgraph_failure.txt`; `MemoryError`, `KeyboardInterrupt`, and `SystemExit` never trigger graph rendering. No passes, recompiles, cache hashes, HLO/NEFF outputs, or cache metadata are skipped. |
 | `VLLM_NEURON_TRACE_METRICS` | bool | 0 | Write a fresh `trace_metrics.json` receipt for each FX-to-HLO pipeline without suppressing dumps. `VLLM_NEURON_FAST_TRACE=1` enables the same receipt automatically. RSS fields are per-process high-water marks, not aggregate host-memory measurements. |
 | `VLLM_NEURON_REMOTE_CACHE` | str | -- | Path to NFS/FSx mount for shared persistent cache across nodes. |
@@ -188,6 +189,25 @@ namespace. Waiting children retain the parent's inherited copy-on-write
 mappings, so the setting bounds active graph construction and dirty-memory
 growth rather than virtual-memory or RSS accounting. Slot selection does not
 promise fairness, and a lower cap can increase cold-start duration.
+
+#### Rank-invariant leader extraction
+
+Distributed compilation already compiles one rank directory for each graph
+hash. `VLLM_NEURON_TRACE_LEADER_ONLY=1` additionally avoids constructing the
+duplicate rank captures: rank 0 extracts the configured graph set and the other
+ranks wait at the existing pre-compile barrier. This can reduce a TP64 model
+from 64 copies of each trace job to one, but it is deliberately disabled by
+default because a rank-dependent constant, shape, collective, or graph hash
+would make the optimization invalid.
+
+Qualification must use artifacts from a normal all-rank capture of the same
+model revision, compile shape, source, and sampling path. Normalize only
+execution-irrelevant source-debug metadata; retain constants, partition/rank
+operations, collectives, replica groups, channel IDs, tensor types, and tensor
+dimensions. Do not enable leader-only capture when any graph is missing a rank
+or has more than one normalized semantic digest. The first leader-only run must
+also prove successful all-rank warmup and an output fingerprint identical to
+the all-rank-capture baseline.
 
 #### Safe fast trace
 

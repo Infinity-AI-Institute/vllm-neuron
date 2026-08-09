@@ -985,11 +985,28 @@ class NeuronWorker(WorkerBase):
                     "Skipping decode graph extraction (kv_role=%s, prefill-only server)",
                     kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
                 )
-            self._extract_graphs(
-                skip_prefill=skip_prefill_warmup,
-                skip_decode=skip_decode_warmup,
-                skip_vision=skip_vision_warmup,
+            from vllm_neuron.compile.rank_invariant_trace import (
+                should_extract_graphs,
             )
+
+            extract_on_this_rank = should_extract_graphs(
+                rank=self.rank,
+                leader_only=envs.VLLM_NEURON_TRACE_LEADER_ONLY,
+            )
+            if extract_on_this_rank:
+                self._extract_graphs(
+                    skip_prefill=skip_prefill_warmup,
+                    skip_decode=skip_decode_warmup,
+                    skip_vision=skip_vision_warmup,
+                )
+            else:
+                logger.warning(
+                    "Skipping graph extraction on rank %d because "
+                    "VLLM_NEURON_TRACE_LEADER_ONLY is enabled. This is valid "
+                    "only for a model/shape with a proven rank-invariant HLO "
+                    "census; rank 0 remains the extraction leader.",
+                    self.rank,
+                )
             logger.info("Barrier: waiting for all ranks to finish graph extraction")
             tp_barrier()
             self.model_runner.parallel_compile()
