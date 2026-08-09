@@ -159,6 +159,9 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `VLLM_NEURON_PARALLEL_COMPILE_WORKERS` | int | -- | Number of parallel compilation workers. |
 | `VLLM_NEURON_PARALLEL_TRACE_WORKERS` | int | 8 | Maximum forked trace children per rank parent. Set to 1 to reap each graph shape in a fresh child before starting the next shape. |
 | `VLLM_NEURON_TRACE_RANK_CONCURRENCY` | int | unset | Opt-in container-wide cap (1-4096) on trace children actively constructing graphs. Waiting occurs before capture imports and model meta-swapping. Invalid values or a live conflicting limit fail closed. Kernel `flock` leases under `/dev/shm` are released on normal exit, exceptions, and fatal signals. |
+| `VLLM_NEURON_TRACE_PREFLIGHT_RANK` | int | unset | Opt-in global rank (0-4095) that first validates Python/FakeTensor tracing in an isolated fork child. No preflight HLO or cache artifact is produced. Normal per-rank extraction begins only after its result is broadcast. |
+| `VLLM_NEURON_TRACE_PREFLIGHT_JOBS` | int | unset | Positive prefix length of the trace job list staged by the representative rank. Unset stages every job. This never reduces the subsequent normal job list. |
+| `VLLM_NEURON_TRACE_MILESTONE_DIR` | str | unset | Run-scoped local directory for one append-only `rank-N.jsonl` milestone stream per rank. Unset disables milestone I/O. |
 | `VLLM_NEURON_REMOTE_CACHE` | str | -- | Path to NFS/FSx mount for shared persistent cache across nodes. |
 | `VLLM_NEURON_DISABLE_COMPILE_CACHE` | bool | 0 | Disable compilation cache entirely. Forces recompilation on every startup. |
 | `VLLM_NEURON_COMPILATION_TIMEOUT` | int | -- | Timeout in seconds for individual NEFF compilation. |

@@ -16,7 +16,13 @@ def parallel_trace_module(monkeypatch):
     """Load the module without importing the vLLM platform plugin."""
     package = ModuleType("vllm_neuron")
     package.__path__ = [str(ROOT / "vllm_neuron")]
-    package.envs = SimpleNamespace(VLLM_NEURON_PARALLEL_TRACE_WORKERS=1)
+    package.envs = SimpleNamespace(
+        VLLM_NEURON_PARALLEL_TRACE_WORKERS=1,
+        VLLM_NEURON_TRACE_MILESTONE_DIR=None,
+        VLLM_NEURON_TRACE_PREFLIGHT_ONLY=False,
+        VLLM_NEURON_TRACE_PREFLIGHT_RANK=None,
+        VLLM_NEURON_TRACE_PREFLIGHT_JOBS=None,
+    )
     monkeypatch.setitem(sys.modules, "vllm_neuron", package)
 
     compile_package = ModuleType("vllm_neuron.compile")

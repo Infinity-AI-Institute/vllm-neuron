@@ -67,11 +67,13 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 
 from vllm_neuron import envs
+from vllm_neuron.compile.trace_milestones import emit_trace_milestone
 from vllm_neuron.compile.trace_throttle import host_trace_slot
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,112 @@ Job = tuple[Callable[..., Any], dict[str, Any]]
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+
+def parallel_trace_with_preflight(jobs: list[Job], parent_rank: int = 0) -> None:
+    """Optionally stage Python/FakeTensor tracing on one global rank.
+
+    The representative runs in the ordinary fork pool, but its capture backend
+    exits immediately after Dynamo produces the FX graph. No FX passes, HLO, or
+    cache write occurs. Its fork child is then reaped. A small CPU object
+    broadcast releases peers on success or propagates the captured failure.
+    Every rank, including the representative, subsequently executes the normal
+    trace path; no graph is shared or reused by this protocol.
+    """
+    representative = envs.VLLM_NEURON_TRACE_PREFLIGHT_RANK
+    if representative is None:
+        parallel_trace(jobs, parent_rank=parent_rank)
+        return
+
+    dist = torch.distributed
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else parent_rank
+    world_size = dist.get_world_size() if distributed else 1
+    if representative >= world_size:
+        raise ValueError(
+            "VLLM_NEURON_TRACE_PREFLIGHT_RANK is outside the distributed "
+            f"world: rank={representative}, world_size={world_size}"
+        )
+
+    limit = envs.VLLM_NEURON_TRACE_PREFLIGHT_JOBS
+    staged_jobs = jobs if limit is None else jobs[:limit]
+    payload: list[dict[str, Any] | None] = [None]
+    emit_trace_milestone(
+        "preflight_waiting" if rank != representative else "preflight_selected",
+        parent_rank=parent_rank,
+        stage="preflight",
+        representative_rank=representative,
+        staged_jobs=len(staged_jobs),
+        total_jobs=len(jobs),
+    )
+
+    if rank == representative:
+        try:
+            with _preflight_child_mode():
+                parallel_trace(staged_jobs, parent_rank=parent_rank)
+            payload[0] = {
+                "ok": True,
+                "representative_rank": representative,
+                "staged_jobs": len(staged_jobs),
+            }
+        except Exception as exc:
+            payload[0] = {
+                "ok": False,
+                "representative_rank": representative,
+                "staged_jobs": len(staged_jobs),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "traceback": traceback.format_exc()[-8192:],
+            }
+
+    if distributed:
+        dist.broadcast_object_list(
+            payload,
+            src=representative,
+            device=torch.device("cpu"),
+        )
+
+    result = payload[0]
+    if not isinstance(result, dict):
+        raise RuntimeError("Representative trace preflight returned no result")
+    if not result.get("ok"):
+        emit_trace_milestone(
+            "preflight_failed",
+            parent_rank=parent_rank,
+            stage="preflight",
+            representative_rank=representative,
+            error_type=result.get("error_type"),
+            error_message=result.get("error_message"),
+        )
+        raise RuntimeError(
+            "Representative trace preflight failed before all-rank extraction: "
+            f"rank={representative} type={result.get('error_type')} "
+            f"message={result.get('error_message')}\n{result.get('traceback', '')}"
+        )
+
+    emit_trace_milestone(
+        "preflight_released",
+        parent_rank=parent_rank,
+        stage="preflight",
+        representative_rank=representative,
+        staged_jobs=result.get("staged_jobs"),
+    )
+    parallel_trace(jobs, parent_rank=parent_rank)
+
+
+@contextmanager
+def _preflight_child_mode():
+    """Temporarily mark only fork descendants as backend-boundary probes."""
+    name = "VLLM_NEURON_TRACE_PREFLIGHT_ONLY"
+    previous = os.environ.get(name)
+    os.environ[name] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
@@ -114,6 +222,7 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
 
     num_workers = min(envs.VLLM_NEURON_PARALLEL_TRACE_WORKERS, len(jobs))
     trace_rank_concurrency = envs.VLLM_NEURON_TRACE_RANK_CONCURRENCY
+    stage = "preflight" if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY else "normal"
     logger.info(
         "Parallel trace: jobs=%d, lanes=%d, parent_rank=%d, host_limit=%s",
         len(jobs),
@@ -121,16 +230,43 @@ def parallel_trace(jobs: list[Job], parent_rank: int = 0) -> None:
         parent_rank,
         trace_rank_concurrency,
     )
+    emit_trace_milestone(
+        "pool_started",
+        parent_rank=parent_rank,
+        stage=stage,
+        jobs=len(jobs),
+        lanes=num_workers,
+        host_limit=trace_rank_concurrency,
+    )
     t0 = time.perf_counter()
-    if num_workers == 1:
-        _run_fresh_children_sequentially(
-            jobs, parent_rank, trace_rank_concurrency
+    try:
+        if num_workers == 1:
+            _run_fresh_children_sequentially(
+                jobs, parent_rank, trace_rank_concurrency
+            )
+        else:
+            _run_pool_fork(
+                jobs, parent_rank, num_workers, trace_rank_concurrency
+            )
+    except Exception as exc:
+        emit_trace_milestone(
+            "pool_failed",
+            parent_rank=parent_rank,
+            stage=stage,
+            elapsed_seconds=time.perf_counter() - t0,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
         )
-    else:
-        _run_pool_fork(
-            jobs, parent_rank, num_workers, trace_rank_concurrency
-        )
+        raise
     elapsed = time.perf_counter() - t0
+    emit_trace_milestone(
+        "pool_completed",
+        parent_rank=parent_rank,
+        stage=stage,
+        jobs=len(jobs),
+        lanes=num_workers,
+        elapsed_seconds=elapsed,
+    )
     logger.info(
         "Parallel trace finished: jobs=%d, lanes=%d, %.2fs",
         len(jobs),
@@ -362,12 +498,34 @@ def _run_throttled_child(
     trace_rank_concurrency: int | None,
 ) -> None:
     """Acquire the host slot before importing or mutating trace state."""
+    stage = "preflight" if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY else "normal"
+    emit_trace_milestone(
+        "host_slot_waiting",
+        parent_rank=parent_rank,
+        stage=stage,
+        lane=lane_idx,
+        host_limit=trace_rank_concurrency,
+    )
     with host_trace_slot(
         trace_rank_concurrency,
         parent_rank=parent_rank,
         lane_idx=lane_idx,
-    ):
+    ) as slot:
+        emit_trace_milestone(
+            "host_slot_acquired",
+            parent_rank=parent_rank,
+            stage=stage,
+            lane=lane_idx,
+            slot=slot,
+        )
         _fork_child_main(lane_idx, parent_rank, jobs_slice, result_path)
+    emit_trace_milestone(
+        "host_slot_released",
+        parent_rank=parent_rank,
+        stage=stage,
+        lane=lane_idx,
+        slot=slot,
+    )
 
 
 def _fork_child_main(
@@ -393,6 +551,7 @@ def _fork_child_main(
     status = "OK"
     err: str | None = None
     failing_job: int | None = None
+    stage = "preflight" if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY else "normal"
     try:
         prefix = f"[trace lane={lane_idx} rank={parent_rank}] "
 
@@ -408,19 +567,58 @@ def _fork_child_main(
 
         os.environ["VLLM_NEURON_CPU_COMPILE"] = "1"
 
+        emit_trace_milestone(
+            "meta_swap_started",
+            parent_rank=parent_rank,
+            stage=stage,
+            lane=lane_idx,
+            jobs=len(jobs_slice),
+        )
         _swap_unique_models_to_meta([model for model, _ in jobs_slice])
+        emit_trace_milestone(
+            "meta_swap_completed",
+            parent_rank=parent_rank,
+            stage=stage,
+            lane=lane_idx,
+            jobs=len(jobs_slice),
+        )
 
         for j_idx, (model, kwargs) in enumerate(jobs_slice):
             failing_job = j_idx
+            job_started = time.perf_counter()
+            emit_trace_milestone(
+                "job_started",
+                parent_rank=parent_rank,
+                stage=stage,
+                lane=lane_idx,
+                job_index=j_idx,
+            )
             try:
                 model(**kwargs)
             except CaptureComplete:
                 # Successful trace — capture backend signals "done"
                 # this way after writing the HLO.
                 pass
+            emit_trace_milestone(
+                "job_completed",
+                parent_rank=parent_rank,
+                stage=stage,
+                lane=lane_idx,
+                job_index=j_idx,
+                elapsed_seconds=time.perf_counter() - job_started,
+            )
         failing_job = None
     except BaseException as e:
         status = "ERROR"
+        emit_trace_milestone(
+            "job_failed" if failing_job is not None else "child_failed",
+            parent_rank=parent_rank,
+            stage=stage,
+            lane=lane_idx,
+            job_index=failing_job,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
         err = (
             f"job_index={failing_job}\n{e}\n{traceback.format_exc()}"
             if failing_job is not None

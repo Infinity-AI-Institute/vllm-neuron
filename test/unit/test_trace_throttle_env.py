@@ -36,3 +36,30 @@ def test_trace_rank_concurrency_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("VLLM_NEURON_TRACE_RANK_CONCURRENCY", value)
     with pytest.raises(ValueError, match=r"must be an integer in \[1, 4096\]"):
         _ = _load_envs().VLLM_NEURON_TRACE_RANK_CONCURRENCY
+
+
+def test_trace_preflight_is_disabled_only_when_rank_is_unset(monkeypatch):
+    monkeypatch.delenv("VLLM_NEURON_TRACE_PREFLIGHT_RANK", raising=False)
+    assert _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_RANK is None
+
+
+@pytest.mark.parametrize("value", ["0", "1", "4095"])
+def test_trace_preflight_rank_accepts_bounded_nonnegative_values(
+    monkeypatch, value
+):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_RANK", value)
+    assert _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_RANK == int(value)
+
+
+@pytest.mark.parametrize("value", ["", "-1", "4096", "1.5", "no"])
+def test_trace_preflight_rank_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_RANK", value)
+    with pytest.raises(ValueError, match=r"must be an integer in \[0, 4095\]"):
+        _ = _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_RANK
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "4097", "all"])
+def test_trace_preflight_job_limit_fails_closed(monkeypatch, value):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_PREFLIGHT_JOBS", value)
+    with pytest.raises(ValueError, match=r"must be an integer in \[1, 4096\]"):
+        _ = _load_envs().VLLM_NEURON_TRACE_PREFLIGHT_JOBS

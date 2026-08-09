@@ -37,6 +37,10 @@ if TYPE_CHECKING:
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
     VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
+    VLLM_NEURON_TRACE_PREFLIGHT_RANK: int | None = None
+    VLLM_NEURON_TRACE_PREFLIGHT_JOBS: int | None = None
+    VLLM_NEURON_TRACE_MILESTONE_DIR: str | None = None
+    VLLM_NEURON_TRACE_PREFLIGHT_ONLY: bool = False
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
@@ -137,6 +141,28 @@ def maybe_convert_bounded_positive_int(
     return converted
 
 
+def maybe_convert_bounded_nonnegative_int(
+    value: str | None,
+    *,
+    name: str,
+    maximum: int,
+) -> int | None:
+    """Parse an optional non-negative integer without conflating zero with off."""
+    if value is None:
+        return None
+    try:
+        converted = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer in [0, {maximum}], got {value!r}"
+        ) from exc
+    if not 0 <= converted <= maximum:
+        raise ValueError(
+            f"{name} must be an integer in [0, {maximum}], got {value!r}"
+        )
+    return converted
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -195,6 +221,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
             name="VLLM_NEURON_TRACE_RANK_CONCURRENCY",
             maximum=4096,
         )
+    ),
+    # Optional global rank that first traces the configured jobs only as far as
+    # the graph-capture backend boundary. The resulting Dynamo state lives in a
+    # fork child and no HLO/cache artifact is written or reused. All ranks run
+    # ordinary extraction after the representative succeeds.
+    "VLLM_NEURON_TRACE_PREFLIGHT_RANK": lambda: (
+        maybe_convert_bounded_nonnegative_int(
+            os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_RANK"),
+            name="VLLM_NEURON_TRACE_PREFLIGHT_RANK",
+            maximum=4095,
+        )
+    ),
+    # Optional prefix length of the trace job list to stage. Unset means every
+    # job. This is useful when the first shape exercises a model-wide failure
+    # and successful cold-start latency matters more than shape coverage.
+    "VLLM_NEURON_TRACE_PREFLIGHT_JOBS": lambda: (
+        maybe_convert_bounded_positive_int(
+            os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_JOBS"),
+            name="VLLM_NEURON_TRACE_PREFLIGHT_JOBS",
+            maximum=4096,
+        )
+    ),
+    # Run-scoped local directory for per-rank JSONL trace milestones. Unset
+    # keeps ordinary startup free of observability I/O.
+    "VLLM_NEURON_TRACE_MILESTONE_DIR": lambda: (
+        os.getenv("VLLM_NEURON_TRACE_MILESTONE_DIR") or None
+    ),
+    # Internal child-only switch used by representative-rank staging. Users
+    # should enable TRACE_PREFLIGHT_RANK rather than setting this directly.
+    "VLLM_NEURON_TRACE_PREFLIGHT_ONLY": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_ONLY")) or False
     ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.

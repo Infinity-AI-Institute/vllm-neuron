@@ -113,17 +113,33 @@ def capture(gm, example_inputs, options={}):
         raise RuntimeError(
             "Capture backend is not compatible with VLLM_NEURON_CPU_MODE."
         )
-    from vllm_neuron.compile import cache
-
     gm, example_inputs = preprocess_and_validate_inputs(gm, example_inputs)
-
-    # Mirror the injection the main compile() path does before hashing, so
-    # capture and forward agree on the cache key.
-    options = _apply_platform_compiler_args(options)
 
     # Return no-op
     def bail(*args, **kwargs):
         raise CaptureComplete()
+
+    # Representative-rank staging validates the expensive Python/FakeTensor
+    # trace only. Reaching this backend proves Dynamo produced an FX graph. The
+    # fork child exits after ``bail`` and therefore cannot leak Dynamo state,
+    # HLO, or cache artifacts into the subsequent normal all-rank extraction.
+    if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY:
+        from vllm_neuron.compile.trace_milestones import emit_trace_milestone
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        emit_trace_milestone(
+            "capture_backend_reached",
+            parent_rank=rank,
+            stage="preflight",
+            fx_nodes=sum(1 for _ in gm.graph.nodes),
+        )
+        return bail
+
+    from vllm_neuron.compile import cache
+
+    # Mirror the injection the main compile() path does before hashing, so
+    # capture and forward agree on the cache key.
+    options = _apply_platform_compiler_args(options)
 
     # FX→HLO (reuse existing pipeline)
     workdir, hash_key, base_workdir = setup_workdir_common(

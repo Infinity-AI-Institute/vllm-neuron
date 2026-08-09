@@ -1186,11 +1186,11 @@ class NeuronWorker(WorkerBase):
         ``VLLM_NEURON_DISABLE_PARALLEL_TRACE`` (caller falls back to
         the in-process sequential path).
         """
-        from vllm_neuron.compile.parallel_trace import parallel_trace
+        from vllm_neuron.compile.parallel_trace import parallel_trace_with_preflight
 
         if envs.VLLM_NEURON_DISABLE_PARALLEL_TRACE:
             return False
-        parallel_trace(jobs=jobs, parent_rank=self.rank)
+        parallel_trace_with_preflight(jobs=jobs, parent_rank=self.rank)
         return True
 
     def _prefill_compile_targets(self) -> list[tuple[int, int]]:
