@@ -1359,7 +1359,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         # We should fail explicitly for graph cuts (unless debug mode is enabled).
         # Note: When eager mode is enabled, torch compile becomes a no op.
-        from vllm_neuron.envs import get_compile_backend_name
+        from vllm_neuron.envs import (
+            get_compile_backend_name,
+            get_graph_capture_backend,
+        )
 
         # Tensor capture: split modules into text and vision.
         if capture_config:
@@ -1426,7 +1429,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.capture_backend_model = torch.compile(
                 self.model,
-                backend="vllm_neuron_graph_capture",
+                backend=get_graph_capture_backend(),
                 fullgraph=fullgraph_enabled,
                 options=self.compile_options,
             )
@@ -1459,7 +1462,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             else:
                 self.vision_capture_backend = torch.compile(
                     inner_model.visual,
-                    backend="vllm_neuron_graph_capture",
+                    backend=get_graph_capture_backend(),
                     fullgraph=fullgraph_enabled,
                     options=self.compile_options,
                 )

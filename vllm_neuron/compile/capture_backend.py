@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
+import inspect
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 
 from vllm_neuron import envs
 from vllm_neuron.compile.backend import (
@@ -27,6 +29,79 @@ class CaptureComplete(Exception):
     """
 
     pass
+
+
+def _attest_capture_backend(backend, *, expected_module: str, kind: str) -> dict:
+    """Fail closed on backend identity and emit a compact provenance record."""
+    module = getattr(backend, "__module__", None)
+    if module != expected_module:
+        raise RuntimeError(
+            f"Unexpected {kind} capture backend module: {module!r}; "
+            f"expected {expected_module!r}"
+        )
+    source = inspect.getsourcefile(backend) or inspect.getfile(backend)
+    if not source:
+        raise RuntimeError(f"Unable to resolve {kind} capture backend source")
+    path = Path(source).resolve(strict=True)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if kind == "native":
+        expected_digest = envs.VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256
+        if expected_digest is not None and digest != expected_digest:
+            raise RuntimeError(
+                "Native capture backend digest mismatch: "
+                f"sha256={digest}, expected={expected_digest}, path={path}"
+            )
+
+    from vllm_neuron.compile.trace_milestones import emit_trace_milestone
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    identity = {
+        "backend_kind": kind,
+        "backend_module": module,
+        "backend_file": str(path),
+        "backend_sha256": digest,
+    }
+    emit_trace_milestone(
+        "capture_backend_selected",
+        parent_rank=rank,
+        stage="backend_selection",
+        **identity,
+    )
+    logger.info(
+        "Selected %s capture backend module=%s file=%s sha256=%s",
+        kind,
+        module,
+        path,
+        digest,
+    )
+    return identity
+
+
+def select_native_capture_backend():
+    """Select and attest the exact callable used by ``torch.compile``.
+
+    Representative preflight intentionally selects the source-owned early
+    boundary. Normal native extraction delegates directly to the installed
+    DLC callable, preserving its cache and HLO ABI without relying on the
+    process-global backend registry name.
+    """
+    if envs.VLLM_NEURON_TRACE_PREFLIGHT_ONLY:
+        backend = capture
+        _attest_capture_backend(
+            backend,
+            expected_module="vllm_neuron.compile.capture_backend",
+            kind="source_preflight",
+        )
+        return backend
+
+    from libtorch_neuronx_lite.compile.capture_backend import capture as backend
+
+    _attest_capture_backend(
+        backend,
+        expected_module="libtorch_neuronx_lite.compile.capture_backend",
+        kind="native",
+    )
+    return backend
 
 
 def setup_workdir_common(

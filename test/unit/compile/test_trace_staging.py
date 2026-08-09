@@ -325,13 +325,14 @@ def test_wait_heartbeat_reports_elapsed_time_without_extending_deadline(
     assert fields["elapsed_seconds"] >= 0
 
 
-def test_capture_preflight_stops_before_cache_or_hlo(monkeypatch):
+def test_native_capture_preflight_stops_before_dlc_cache_or_hlo(monkeypatch):
     package = ModuleType("vllm_neuron")
     package.__path__ = [str(ROOT / "vllm_neuron")]
     package.envs = SimpleNamespace(
         VLLM_NEURON_CPU_MODE=False,
         VLLM_NEURON_TRACE_PREFLIGHT_ONLY=True,
         VLLM_NEURON_TRACE_MILESTONE_DIR=None,
+        VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256=None,
     )
     monkeypatch.setitem(sys.modules, "vllm_neuron", package)
 
@@ -362,11 +363,117 @@ def test_capture_preflight_stops_before_cache_or_hlo(monkeypatch):
         ROOT / "vllm_neuron/compile/capture_backend.py",
     )
     gm = torch.fx.symbolic_trace(torch.nn.Identity())
-    bail = capture.capture(gm, [torch.ones(1)], {})
+    monkeypatch.setattr(capture, "_attest_capture_backend", lambda *args, **kwargs: {})
+    backend = capture.select_native_capture_backend()
+    bail = backend(gm, [torch.ones(1)], {})
 
     with pytest.raises(capture.CaptureComplete):
         bail()
     assert "vllm_neuron.compile.cache" not in sys.modules
+    assert "libtorch_neuronx_lite.compile.capture_backend" not in sys.modules
+
+
+def test_native_capture_selection_uses_installed_callable_not_registry(monkeypatch):
+    package = ModuleType("vllm_neuron")
+    package.__path__ = [str(ROOT / "vllm_neuron")]
+    package.envs = SimpleNamespace(
+        VLLM_NEURON_CPU_MODE=False,
+        VLLM_NEURON_TRACE_PREFLIGHT_ONLY=False,
+        VLLM_NEURON_TRACE_MILESTONE_DIR=None,
+        VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256=None,
+    )
+    monkeypatch.setitem(sys.modules, "vllm_neuron", package)
+
+    compile_package = ModuleType("vllm_neuron.compile")
+    compile_package.__path__ = [str(ROOT / "vllm_neuron/compile")]
+    monkeypatch.setitem(sys.modules, "vllm_neuron.compile", compile_package)
+    backend = ModuleType("vllm_neuron.compile.backend")
+    backend.preprocess_and_validate_inputs = lambda gm, inputs: (gm, inputs)
+    backend._apply_platform_compiler_args = lambda options: options
+    monkeypatch.setitem(sys.modules, "vllm_neuron.compile.backend", backend)
+    fx_passes = ModuleType("vllm_neuron.fx_passes")
+    fx_passes.get_default_pass_manager = lambda: None
+    monkeypatch.setitem(sys.modules, "vllm_neuron.fx_passes", fx_passes)
+    pass_manager = ModuleType("vllm_neuron.fx_passes.pass_manager")
+    pass_manager._format_replica_groups_header = lambda gm: ""
+    monkeypatch.setitem(sys.modules, "vllm_neuron.fx_passes.pass_manager", pass_manager)
+    timer = ModuleType("vllm_neuron.utils.timer")
+    timer.timer = lambda: None
+    monkeypatch.setitem(sys.modules, "vllm_neuron.utils.timer", timer)
+
+    native_module = ModuleType("libtorch_neuronx_lite.compile.capture_backend")
+
+    def native_capture(gm, inputs, options):
+        return "native-result"
+
+    native_capture.__module__ = native_module.__name__
+    native_module.capture = native_capture
+    monkeypatch.setitem(sys.modules, native_module.__name__, native_module)
+
+    capture = _load(
+        monkeypatch,
+        "vllm_neuron.compile.capture_backend",
+        ROOT / "vllm_neuron/compile/capture_backend.py",
+    )
+    seen = []
+    monkeypatch.setattr(
+        capture,
+        "_attest_capture_backend",
+        lambda selected, **fields: seen.append((selected, fields)),
+    )
+
+    selected = capture.select_native_capture_backend()
+
+    assert selected is native_capture
+    assert seen == [
+        (
+            native_capture,
+            {
+                "expected_module": "libtorch_neuronx_lite.compile.capture_backend",
+                "kind": "native",
+            },
+        )
+    ]
+
+
+def test_capture_backend_attestation_rejects_digest_mismatch(monkeypatch):
+    package = ModuleType("vllm_neuron")
+    package.__path__ = [str(ROOT / "vllm_neuron")]
+    package.envs = SimpleNamespace(
+        VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256="0" * 64,
+    )
+    monkeypatch.setitem(sys.modules, "vllm_neuron", package)
+    backend = ModuleType("vllm_neuron.compile.backend")
+    backend.preprocess_and_validate_inputs = lambda gm, inputs: (gm, inputs)
+    backend._apply_platform_compiler_args = lambda options: options
+    monkeypatch.setitem(sys.modules, "vllm_neuron.compile.backend", backend)
+    fx_passes = ModuleType("vllm_neuron.fx_passes")
+    fx_passes.get_default_pass_manager = lambda: None
+    monkeypatch.setitem(sys.modules, "vllm_neuron.fx_passes", fx_passes)
+    pass_manager = ModuleType("vllm_neuron.fx_passes.pass_manager")
+    pass_manager._format_replica_groups_header = lambda gm: ""
+    monkeypatch.setitem(sys.modules, "vllm_neuron.fx_passes.pass_manager", pass_manager)
+    timer = ModuleType("vllm_neuron.utils.timer")
+    timer.timer = lambda: None
+    monkeypatch.setitem(sys.modules, "vllm_neuron.utils.timer", timer)
+    capture = _load(
+        monkeypatch,
+        "vllm_neuron.compile.capture_backend",
+        ROOT / "vllm_neuron/compile/capture_backend.py",
+    )
+
+    def native_capture():
+        pass
+
+    native_capture.__module__ = "libtorch_neuronx_lite.compile.capture_backend"
+    monkeypatch.setattr(capture.inspect, "getsourcefile", lambda _: __file__)
+
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        capture._attest_capture_backend(
+            native_capture,
+            expected_module="libtorch_neuronx_lite.compile.capture_backend",
+            kind="native",
+        )
 
 
 def test_milestones_are_one_json_record_per_line(monkeypatch, tmp_path):

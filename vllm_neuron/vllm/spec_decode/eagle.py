@@ -401,7 +401,7 @@ class EagleProposer:
         else:
             self.capture_backend_model = torch.compile(
                 self.model,
-                backend="vllm_neuron_graph_capture",
+                backend=envs.get_graph_capture_backend(),
                 fullgraph=fullgraph_enabled,
             )
 

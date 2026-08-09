@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_TRACE_PREFLIGHT_HEARTBEAT_SECONDS: int = 300
     VLLM_NEURON_TRACE_MILESTONE_DIR: str | None = None
     VLLM_NEURON_TRACE_PREFLIGHT_ONLY: bool = False
+    VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256: str | None = None
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
@@ -274,6 +275,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_TRACE_PREFLIGHT_ONLY": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_TRACE_PREFLIGHT_ONLY")) or False
     ),
+    # Optional fail-closed pin for the installed native graph-capture backend.
+    # Model launchers that require a reproducible DLC should set this value.
+    "VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256": lambda: (
+        os.getenv("VLLM_NEURON_EXPECTED_NATIVE_CAPTURE_SHA256") or None
+    ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
@@ -443,6 +449,20 @@ def is_native_backend() -> bool:
 def get_compile_backend_name() -> str:
     """Return the torch.compile backend registered by the selected runtime."""
     return "neuron_libtorch" if is_native_backend() else "vllm_neuron"
+
+
+def get_graph_capture_backend():
+    """Return an unshadowable callable for native graph capture.
+
+    The native DLC registers the same string name as the source backend.  A
+    callable makes the selected implementation explicit and lets selection
+    attest its module, file and digest before the expensive Dynamo trace.
+    """
+    if is_native_backend():
+        from vllm_neuron.compile.capture_backend import select_native_capture_backend
+
+        return select_native_capture_backend()
+    return "vllm_neuron_graph_capture"
 
 
 def get_dist_backend() -> str:
