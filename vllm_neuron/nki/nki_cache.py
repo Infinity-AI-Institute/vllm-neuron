@@ -18,11 +18,13 @@ import os
 import shutil
 import threading
 from collections.abc import Callable, Hashable
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from filelock import FileLock, Timeout
 
 from vllm_neuron import envs
+
 from ..compile.platform import (
     get_neuronxcc_version,
     get_nki_version,
@@ -43,14 +45,25 @@ _LOCK_TIMEOUT = 300  # seconds
 # kernel configurations.  The persistent cache prevents recompilation, but a
 # hit still opens and parses the same JSON record (and validates its binary)
 # for every FX node.  Keep successful results in the tracing process after the
-# first persistent lookup.  This is deliberately below create_nki_cache_key():
-# source, shape, dtype, constants, grid, platform, versions, and device-dump
-# mode therefore retain exactly the same invalidation contract as the disk
-# cache.
-_PROCESS_CACHE: dict[str, NKICompileResult] = {}
+# first persistent lookup. Source, shape, dtype, constants, grid, platform,
+# versions, and device-dump mode retain the disk cache's invalidation contract.
+# Local and remote roots are additional process-local namespace components
+# because dumped_config embeds the resolved path to the materialized binary.
+_ProcessCacheKey = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class _ProcessCacheEntry:
+    result: NKICompileResult
+    binary_path: Optional[str]
+
+
+_PROCESS_CACHE: dict[_ProcessCacheKey, _ProcessCacheEntry] = {}
 _PROCESS_CACHE_LOCK = threading.Lock()
 _PROCESS_CACHE_HITS = 0
 _PROCESS_CACHE_MISSES = 0
+_PROCESS_CACHE_DISABLED: Optional[bool] = None
+_PROCESS_CACHE_GENERATION = 0
 
 
 def clear_nki_process_cache() -> None:
@@ -60,11 +73,14 @@ def clear_nki_process_cache() -> None:
     long-lived tooling that intentionally changes cache roots or kernel state.
     """
 
+    global _PROCESS_CACHE_DISABLED, _PROCESS_CACHE_GENERATION
     global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES
     with _PROCESS_CACHE_LOCK:
         _PROCESS_CACHE.clear()
         _PROCESS_CACHE_HITS = 0
         _PROCESS_CACHE_MISSES = 0
+        _PROCESS_CACHE_DISABLED = None
+        _PROCESS_CACHE_GENERATION += 1
 
 
 def nki_process_cache_stats() -> dict[str, int]:
@@ -78,24 +94,78 @@ def nki_process_cache_stats() -> dict[str, int]:
         }
 
 
-def _get_nki_process_cache(cache_key: str) -> Optional[NKICompileResult]:
+def _sync_nki_process_cache_mode(disabled: bool) -> int:
+    """Discard entries whenever compile-cache bypass mode changes."""
+
+    global _PROCESS_CACHE_DISABLED, _PROCESS_CACHE_GENERATION
+    with _PROCESS_CACHE_LOCK:
+        if _PROCESS_CACHE_DISABLED is None:
+            _PROCESS_CACHE_DISABLED = disabled
+        elif _PROCESS_CACHE_DISABLED != disabled:
+            _PROCESS_CACHE.clear()
+            _PROCESS_CACHE_DISABLED = disabled
+            _PROCESS_CACHE_GENERATION += 1
+        return _PROCESS_CACHE_GENERATION
+
+
+def _get_nki_process_cache(
+    process_key: _ProcessCacheKey,
+) -> Optional[NKICompileResult]:
     global _PROCESS_CACHE_HITS, _PROCESS_CACHE_MISSES
     with _PROCESS_CACHE_LOCK:
-        cached = _PROCESS_CACHE.get(cache_key)
-        if cached is None:
+        entry = _PROCESS_CACHE.get(process_key)
+        if entry is None:
             _PROCESS_CACHE_MISSES += 1
-        else:
-            _PROCESS_CACHE_HITS += 1
-        return cached
+            return None
+
+        # Persistent reads fail closed when the materialized BIR/KLIR file is
+        # removed. Preserve that contract while still avoiding JSON I/O and
+        # repeated backend-config decoding on every FX node.
+        if entry.binary_path is not None and not os.path.isfile(entry.binary_path):
+            _PROCESS_CACHE.pop(process_key, None)
+            _PROCESS_CACHE_MISSES += 1
+            return None
+
+        _PROCESS_CACHE_HITS += 1
+        return entry.result
 
 
 def _put_nki_process_cache(
-    cache_key: str, result: NKICompileResult
+    process_key: _ProcessCacheKey,
+    result: NKICompileResult,
+    generation: int,
 ) -> NKICompileResult:
+    entry = _ProcessCacheEntry(
+        result=result,
+        binary_path=_kernel_binary_path(result.dumped_config),
+    )
     with _PROCESS_CACHE_LOCK:
+        # A clear or cache-mode transition may have occurred while this caller
+        # compiled or waited on the file lock. Do not resurrect an entry from
+        # the previous generation.
+        if generation != _PROCESS_CACHE_GENERATION:
+            return result
         # Preserve the first complete result if concurrent tracing lanes ever
         # share a process.  The persistent key guarantees equivalence.
-        return _PROCESS_CACHE.setdefault(cache_key, result)
+        return _PROCESS_CACHE.setdefault(process_key, entry).result
+
+
+def _normalize_cache_root(path: Optional[str]) -> str:
+    if path is None:
+        return ""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _nki_process_cache_key(
+    cache_key: str,
+    local_dir: str,
+    remote_dir: Optional[str],
+) -> _ProcessCacheKey:
+    return (
+        _normalize_cache_root(local_dir),
+        _normalize_cache_root(remote_dir),
+        cache_key,
+    )
 
 
 def create_nki_cache_key(
@@ -151,7 +221,12 @@ def get_nki_cache(cache_key: str) -> Optional[NKICompileResult]:
     Returns None on miss. Does not check remote — use
     ``_fetch_from_remote`` inside a locked block for that.
     """
-    local_dir = _get_local_nki_cache_dir()
+    return _get_nki_cache_from_dir(cache_key, _get_local_nki_cache_dir())
+
+
+def _get_nki_cache_from_dir(
+    cache_key: str, local_dir: str
+) -> Optional[NKICompileResult]:
     local_path = os.path.join(local_dir, f"{cache_key}.json")
 
     result = _read_cache_file(local_path)
@@ -165,9 +240,16 @@ def get_nki_cache(cache_key: str) -> Optional[NKICompileResult]:
 def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
     """Store an NKICompileResult to the local disk cache.
 
-    Uses atomic write (tmp file + rename) for safety.
+    Uses atomic write (tmp file + replace) for safety.
     """
-    local_dir = _get_local_nki_cache_dir()
+    _put_nki_cache_in_dir(cache_key, result, _get_local_nki_cache_dir())
+
+
+def _put_nki_cache_in_dir(
+    cache_key: str,
+    result: NKICompileResult,
+    local_dir: str,
+) -> NKICompileResult:
     os.makedirs(local_dir, exist_ok=True)
 
     local_path = os.path.join(local_dir, f"{cache_key}.json")
@@ -191,7 +273,7 @@ def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
         with open(tmp_path, "w") as f:
             json.dump(data, f, sort_keys=True, separators=(",", ":"))
             f.flush()
-        os.rename(tmp_path, local_path)
+        os.replace(tmp_path, local_path)
         logger.debug("NKI cache stored: %s", cache_key)
     except OSError as e:
         logger.warning("Failed to write NKI cache entry %s: %s", cache_key, e)
@@ -199,6 +281,7 @@ def put_nki_cache(cache_key: str, result: NKICompileResult) -> None:
             os.unlink(tmp_path)
         except OSError:
             pass
+    return cached_result
 
 
 def compile_with_cache(
@@ -214,43 +297,50 @@ def compile_with_cache(
     Returns:
         NKICompileResult from cache or fresh compilation.
     """
-    if cache_key is None or envs.VLLM_NEURON_DISABLE_COMPILE_CACHE:
+    cache_disabled = envs.VLLM_NEURON_DISABLE_COMPILE_CACHE
+    process_generation = _sync_nki_process_cache_mode(cache_disabled)
+    if cache_key is None or cache_disabled:
         return compile_fn()
 
-    cached = _get_nki_process_cache(cache_key)
+    # Snapshot roots once so an environment mutation cannot mix namespaces,
+    # lock files, reads, and writes from different cache roots in one call.
+    local_dir = _get_local_nki_cache_dir()
+    remote_dir = _get_remote_nki_cache_dir()
+    process_key = _nki_process_cache_key(cache_key, local_dir, remote_dir)
+
+    cached = _get_nki_process_cache(process_key)
     if cached is not None:
         return cached
 
     # Fast path: lockless local read
-    cached = get_nki_cache(cache_key)
+    cached = _get_nki_cache_from_dir(cache_key, local_dir)
     if cached is not None:
-        return _put_nki_process_cache(cache_key, cached)
+        return _put_nki_process_cache(process_key, cached, process_generation)
 
     # Slow path: acquire lock, try remote fetch, then compile
-    local_dir = _get_local_nki_cache_dir()
     os.makedirs(local_dir, exist_ok=True)
     lock_path = os.path.join(local_dir, f"{cache_key}.lock")
 
     try:
         with FileLock(lock_path, timeout=_LOCK_TIMEOUT):
             # Double-check local after acquiring lock
-            cached = get_nki_cache(cache_key)
+            cached = _get_nki_cache_from_dir(cache_key, local_dir)
             if cached is not None:
-                return _put_nki_process_cache(cache_key, cached)
+                return _put_nki_process_cache(process_key, cached, process_generation)
 
             # Try remote fetch (only lock winner hits remote filesystem)
-            cached = _fetch_from_remote(cache_key)
+            cached = _fetch_from_remote_dirs(cache_key, local_dir, remote_dir)
             if cached is not None:
-                return _put_nki_process_cache(cache_key, cached)
+                return _put_nki_process_cache(process_key, cached, process_generation)
 
             result = compile_fn()
-            put_nki_cache(cache_key, result)
-            return _put_nki_process_cache(cache_key, result)
+            persisted = _put_nki_cache_in_dir(cache_key, result, local_dir)
+            return _put_nki_process_cache(process_key, persisted, process_generation)
     except Timeout:
         logger.warning(
             "NKI cache lock timeout for %s, compiling without cache", cache_key
         )
-        return _put_nki_process_cache(cache_key, compile_fn())
+        return _put_nki_process_cache(process_key, compile_fn(), process_generation)
 
 
 def save_nki_cache_to_remote(
@@ -330,7 +420,18 @@ def _fetch_from_remote(cache_key: str) -> Optional[NKICompileResult]:
     Returns the deserialized result on hit, None on miss. Copies the
     remote file to the local cache for future fast-path hits.
     """
-    remote_dir = _get_remote_nki_cache_dir()
+    return _fetch_from_remote_dirs(
+        cache_key,
+        _get_local_nki_cache_dir(),
+        _get_remote_nki_cache_dir(),
+    )
+
+
+def _fetch_from_remote_dirs(
+    cache_key: str,
+    local_dir: str,
+    remote_dir: Optional[str],
+) -> Optional[NKICompileResult]:
     if not remote_dir:
         return None
 
@@ -338,10 +439,21 @@ def _fetch_from_remote(cache_key: str) -> Optional[NKICompileResult]:
     result = _read_cache_file(remote_path)
     if result is not None:
         logger.debug("NKI cache hit (remote): %s", cache_key)
-        local_dir = _get_local_nki_cache_dir()
         local_path = os.path.join(local_dir, f"{cache_key}.json")
+        remote_binary = _kernel_binary_path(result.dumped_config)
+        if remote_binary is not None:
+            relative_binary = os.path.relpath(remote_binary, remote_dir)
+            if not os.path.isabs(relative_binary) and not (
+                relative_binary == os.pardir
+                or relative_binary.startswith(os.pardir + os.sep)
+            ):
+                _copy_to_local(
+                    remote_binary,
+                    os.path.join(local_dir, relative_binary),
+                )
         _copy_to_local(remote_path, local_path)
-        return result
+        local_result = _read_cache_file(local_path)
+        return local_result if local_result is not None else result
 
     return None
 
@@ -541,6 +653,6 @@ def _copy_to_local(remote_path: str, local_path: str) -> None:
         os.makedirs(local_dir, exist_ok=True)
         tmp_path = f"{local_path}.tmp.{os.getpid()}"
         shutil.copy2(remote_path, tmp_path)
-        os.rename(tmp_path, local_path)
+        os.replace(tmp_path, local_path)
     except OSError as e:
         logger.debug("Failed to copy NKI cache entry to local: %s", e)
