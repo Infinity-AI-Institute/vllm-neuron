@@ -14,9 +14,12 @@ KIMI_K3_FACTORY = (
 BASE_MODELS = (
     "LlamaForCausalLM",
     "GptOssForCausalLM",
-    "GlmMoeDsaForCausalLM",
     "Eagle3LlamaForCausalLM",
     "Qwen3VLForConditionalGeneration",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "InklingForConditionalGeneration",
+    "InklingForCausalLM",
 )
 
 
@@ -30,8 +33,9 @@ def registry(monkeypatch):
     dependencies = {
         "llama3": ("LlamaForCausalLM", "Eagle3LlamaForCausalLM"),
         "gpt_oss": ("GptOssForCausalLM",),
-        "glm52_moe_dsa.factory": ("GlmMoeDsaForCausalLM",),
         "qwen3_vl": ("Qwen3VLForConditionalGeneration",),
+        "gemma4": ("Gemma4ForCausalLM",),
+        "inkling": ("InklingForConditionalGeneration",),
     }
     for relative_name, class_names in dependencies.items():
         module_name = f"{package}.{relative_name}"
