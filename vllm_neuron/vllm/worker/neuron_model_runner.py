@@ -222,7 +222,9 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # drain the queue grows by one per segment and a prompt
                     # longer than kv_segment_size * NRT_queue_cap overflows it
                     # ("Execution queue full").
-                    sampled_token_ids.cpu()
+                    self._model_runner._materialize_on_device_sampling_output(
+                        sampled_token_ids
+                    )
                     sampled_token_ids = [
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
@@ -230,13 +232,18 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
+                sampled_token_ids_cpu = (
+                    self._model_runner._materialize_on_device_sampling_output(
+                        sampled_token_ids
+                    )
+                )
                 if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] > 1:
                     # Spec decode: rejection sampler output [bs, num_spec+1]
                     # with -1 padding for rejected positions. Strip -1s to
                     # produce variable-length list[list[int]].
                     sampled_token_ids = (
                         self._model_runner._parse_rejection_sampling_output(
-                            sampled_token_ids,
+                            sampled_token_ids_cpu,
                             self._model_runner.input_batch.vocab_size,
                         )
                     )
@@ -255,7 +262,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                             )
                 else:
                     # Non-spec: [bs] of sampled tokens.
-                    sampled_token_ids = [[x] for x in sampled_token_ids.cpu().tolist()]
+                    sampled_token_ids = [[x] for x in sampled_token_ids_cpu.tolist()]
                 self._discard_partial_prefill_samples(sampled_token_ids)
                 # If this output was marked for skip-emit (e.g. the last
                 # spec step's bonus will be re-emitted by the following
@@ -446,6 +453,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # Current: No validation, will fail silently or cause incorrect behavior
         # Target: Raise NotImplementedError if cache_config.enable_prefix_caching is True with clear error message
         self.model: Any | None = None
+        # Optional host-side validator supplied by a model/factory.  Keep the
+        # bound method captured before torch.compile wraps the model so custom
+        # sampling ABIs can validate device-produced token IDs at readback.
+        self._sampling_output_validator: Any | None = None
         self._is_synthetic_model: bool = False
         self._tensor_capture_model = None
         self._capture_registry = None
@@ -1208,6 +1219,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_cls.from_configs(
                 self.vllm_config.model_config.hf_config,
             )
+            self._sampling_output_validator = getattr(
+                self.model, "validate_sampling_output", None
+            )
             logger.info(
                 "SyntheticNeuronModel — skipping weight loading and compilation"
             )
@@ -1229,6 +1243,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     self.vllm_config.model_config.hf_config,
                     self.neuron_config,
                 )
+
+        self._sampling_output_validator = getattr(
+            self.model, "validate_sampling_output", None
+        )
 
         self._kda_slot_table = getattr(self.model, "slot_table", None)
         if self._kda_slot_table is not None:
@@ -1552,6 +1570,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if self.model is None:
             raise ValueError("Cannot get model before model has been initialized")
         return self.model
+
+    def _validate_on_device_sampling_output(
+        self, sampled_token_ids_cpu: torch.Tensor
+    ) -> None:
+        """Run a model-provided validator at the device/host boundary.
+
+        Models whose on-device sampling ABI can encode an error sentinel may
+        expose ``validate_sampling_output(token_ids)``.  The runner calls that
+        hook only for on-device sampling, after the raw token-ID tensor has
+        reached CPU and before parsing it or mutating request/output state.
+        Ordinary models and the full-logit host-sampling path are unchanged.
+        """
+        if not getattr(self, "on_device_sampling", False):
+            return
+
+        validator = getattr(self, "_sampling_output_validator", None)
+        if validator is None:
+            # Preserve the optional protocol for lightweight/test runners that
+            # install a model directly rather than going through load_model().
+            validator = getattr(
+                getattr(self, "model", None), "validate_sampling_output", None
+            )
+        if validator is not None:
+            validator(sampled_token_ids_cpu)
+
+    def _materialize_on_device_sampling_output(
+        self, sampled_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Copy sampled IDs to CPU and validate them before any mutation."""
+        sampled_token_ids_cpu = sampled_token_ids.cpu()
+        self._validate_on_device_sampling_output(sampled_token_ids_cpu)
+        return sampled_token_ids_cpu
 
     def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
         """Reorder batch to match scheduler output order if needed.
@@ -7702,7 +7752,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     sampling_metadata=sampling_metadata_cpu,
                 )
             else:
-                output_token_ids = [[x] for x in model_output_tensor.tolist()]
+                sampled_token_ids_cpu = self._materialize_on_device_sampling_output(
+                    model_output_tensor
+                )
+                output_token_ids = [[x] for x in sampled_token_ids_cpu.tolist()]
                 # Use gathered logits to compute logprobs via vLLM Sampler
                 logprobs = None
                 if (
@@ -7725,8 +7778,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 # Model already performed rejection sampling on-device
                 # model_output_tensor: [batch_size, max_spec_len+1] with -1 padding
                 # Parse to list[list[int]] format expected by vLLM
+                sampled_token_ids_cpu = self._materialize_on_device_sampling_output(
+                    model_output_tensor
+                )
                 output_token_ids = self._parse_rejection_sampling_output(
-                    model_output_tensor,
+                    sampled_token_ids_cpu,
                     self.input_batch.vocab_size,
                 )
                 sampler_output = SamplerOutput(output_token_ids, None)
