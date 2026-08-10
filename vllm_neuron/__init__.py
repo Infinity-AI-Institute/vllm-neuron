@@ -82,6 +82,18 @@ def _init_backend():
         # plugin, so complete the native initialization explicitly.
         libtorch_neuronx_lite._register_compile_backends()
 
+        # ``_register_compile_backends`` registers the installed lite capture
+        # backend under the compatibility name used by NeuronModelRunner.  The
+        # source overlay owns the graph-affecting FX passes, so bind that live
+        # backend to the source pass manager as well.  Without this bridge a
+        # source pass fix can pass direct tests while production capture keeps
+        # executing the older image-bundled pass implementation.
+        from vllm_neuron.compile.native_capture_bridge import (
+            bind_source_pass_manager_to_native_capture,
+        )
+
+        bind_source_pass_manager_to_native_capture()
+
         return
 
     # In CPU mode, the NKI CPU simulator is OFF by default.
