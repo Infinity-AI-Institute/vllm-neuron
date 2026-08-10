@@ -84,10 +84,10 @@ def _init_backend():
 
         # ``_register_compile_backends`` registers the installed lite capture
         # backend under the compatibility name used by NeuronModelRunner.  The
-        # source overlay owns the graph-affecting FX passes, so bind that live
-        # backend to the source pass manager as well.  Without this bridge a
-        # source pass fix can pass direct tests while production capture keeps
-        # executing the older image-bundled pass implementation.
+        # source overlay owns the graph-affecting FX passes and FX-to-HLO
+        # lifecycle fixes, so bind both into that live backend.  Without this
+        # bridge a source fix can pass direct tests while production capture
+        # keeps executing the older image-bundled implementation.
         from vllm_neuron.compile.native_capture_bridge import (
             bind_source_pass_manager_to_native_capture,
         )
