@@ -36,6 +36,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.core.sched.output import GrammarOutput
 
 from vllm_neuron import envs
+from vllm_neuron.compile.trace_throttle import host_trace_slot
 from vllm_neuron.metrics import STARTUP_TIME
 from vllm_neuron.model.interfaces import SupportsVisionWarmup
 from vllm_neuron.utils.hardware_config import (
@@ -1292,7 +1293,14 @@ class NeuronWorker(WorkerBase):
                 kv_seg_size,
             )
             try:
-                self.model_runner.extract_prefill_graphs(bucket_size, kv_seg_size)
+                with host_trace_slot(
+                    envs.VLLM_NEURON_TRACE_RANK_CONCURRENCY,
+                    parent_rank=self.rank,
+                    lane_idx=i - 1,
+                ):
+                    self.model_runner.extract_prefill_graphs(
+                        bucket_size, kv_seg_size
+                    )
                 logger.info(
                     "  Successfully extracted graph for prefill bucket %s "
                     "with kv_segment_size %s",
@@ -1385,7 +1393,12 @@ class NeuronWorker(WorkerBase):
                 num_blocks, dtype=torch.int64, device=meta
             )
             try:
-                capture_backend(**vision_inputs)
+                with host_trace_slot(
+                    envs.VLLM_NEURON_TRACE_RANK_CONCURRENCY,
+                    parent_rank=self.rank,
+                    lane_idx=i - 1,
+                ):
+                    capture_backend(**vision_inputs)
             except CaptureComplete:
                 pass
             logger.info(
@@ -1483,9 +1496,14 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                self.model_runner.extract_decode_graphs(
-                    batch_size, ctx_bucket=ctx_bucket
-                )
+                with host_trace_slot(
+                    envs.VLLM_NEURON_TRACE_RANK_CONCURRENCY,
+                    parent_rank=self.rank,
+                    lane_idx=i - 1,
+                ):
+                    self.model_runner.extract_decode_graphs(
+                        batch_size, ctx_bucket=ctx_bucket
+                    )
                 logger.info(
                     "  Extracted graph for decode (batch=%s, seq=%s)",
                     batch_size,

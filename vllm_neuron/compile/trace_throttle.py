@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Container-wide concurrency throttle for forked graph-trace children."""
+"""Container-wide concurrency throttle for graph extraction."""
 
 import logging
 import os
@@ -99,9 +99,9 @@ def host_trace_slot(
     """Lease one container-wide graph-construction slot.
 
     When ``limit`` is ``None`` this is a no-op. Otherwise every cooperating
-    child uses one of ``limit`` advisory ``flock`` leases under ``/dev/shm``.
-    Waiting happens before graph-related imports or model mutation. Closing the
-    descriptor releases the lease, including on process exit or fatal signal.
+    process uses one of ``limit`` advisory ``flock`` leases under ``/dev/shm``.
+    Closing the descriptor releases the lease, including on process exit or
+    fatal signal.
     """
     if limit is None:
         yield None
