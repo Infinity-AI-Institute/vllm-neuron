@@ -421,10 +421,71 @@ class InPlaceToOutOfPlacePass(FXPass):
         """
         nontrivial = self._resolve_tuple_index(idx)
 
-        # Tuple contains an FX Node (tensor/bool mask) -- fall back to index_put
+        # Tuple contains an FX Node (tensor/bool mask).  A dynamic index may
+        # be mixed with fixed integer dimensions, as in paged MLA writes:
+        # ``state[(blocks, 0, offsets, :)] = values``.  Passing only the
+        # dynamic nodes to index_put would silently change their dimensions
+        # (and the Neuron pass rejects the original mixed tuple).  Select the
+        # fixed dimensions first, update the resulting view, then reconstruct
+        # the original tensor with select_scatter.
         if any(isinstance(s, torch.fx.Node) for _, s in nontrivial):
-            indices = tuple(s for _, s in nontrivial if isinstance(s, torch.fx.Node))
-            return gm.graph.call_method("index_put", args=(buf, indices, value))
+            dynamic = [
+                (dim, s)
+                for dim, s in nontrivial
+                if isinstance(s, torch.fx.Node)
+            ]
+            static = [
+                (dim, s)
+                for dim, s in nontrivial
+                if not isinstance(s, torch.fx.Node)
+            ]
+
+            # The safe lowering below handles fixed integer dimensions.  A
+            # non-trivial static slice needs a different view/scatter plan;
+            # fail explicitly instead of dropping it and risking a silent
+            # write to the wrong axes.
+            if any(not isinstance(s, int) for _, s in static):
+                raise NotImplementedError(
+                    "mixed dynamic indices with non-trivial static slices "
+                    "are not supported by the FX lowering"
+                )
+
+            # Work from the highest dimension down so original dimension
+            # numbers remain valid while selecting fixed axes.  Keep each
+            # parent so the updated view can be scattered back in reverse.
+            parents: list[tuple[torch.fx.Node | object, int, int]] = []
+            current = buf
+            selected_dims = sorted(static, key=lambda item: item[0], reverse=True)
+            for dim, fixed_index in selected_dims:
+                if dim < 0:
+                    example = current.meta.get("example_value", None)
+                    if example is None:
+                        raise ValueError(
+                            "cannot normalize a negative mixed-index dimension "
+                            "without example shape metadata"
+                        )
+                    dim += len(example.shape)
+                parents.append((current, dim, fixed_index))
+                current = gm.graph.call_function(
+                    torch.select, args=(current, dim, fixed_index)
+                )
+
+            # Selecting a fixed dimension shifts every later dynamic axis down
+            # by one.  The tensors themselves are unchanged; only the number
+            # of dimensions addressed by index_put needs this adjustment.
+            # K3's paged write has dynamic dimensions 0 and 2, fixed dim 1,
+            # and therefore becomes dimensions 0 and 1 on the selected view.
+            value = self._ensure_tensor_node(gm, value, current)
+            updated = gm.graph.call_method(
+                "index_put",
+                args=(current, tuple(s for _, s in dynamic), value),
+            )
+            for parent, dim, fixed_index in reversed(parents):
+                updated = gm.graph.call_function(
+                    torch.select_scatter,
+                    args=(parent, updated, dim, fixed_index),
+                )
+            return updated
 
         if not nontrivial:
             return gm.graph.call_function(
