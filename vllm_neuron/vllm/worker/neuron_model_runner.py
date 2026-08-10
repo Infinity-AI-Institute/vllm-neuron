@@ -91,6 +91,16 @@ NULL_BLOCK_ID = 0
 # used for block kv and slot mapping padding
 PAD_SLOT_ID = -1
 
+_KIMI_K3_ARCHITECTURE = "KimiK3ForCausalLM"
+_KIMI_K3_MODEL_MODULE = (
+    "neuronx_distributed_inference.models.kimi_k3.serving.model"
+)
+_KIMI_K3_MODEL_CLASS = "KimiK3HybridForCausalLM"
+_KIMI_K3_MLA_CACHE_NAMES = tuple(
+    f"kimi_k3.mla_cache.{pair}" for pair in range(12)
+)
+_KIMI_K3_MLA_HEAD_SIZE = 576
+
 
 def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
     """Remap vLLM's null-block (0) in an int32 block table to -1 so the
@@ -8109,6 +8119,158 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
 
+    def _kimi_k3_mla_sink_plan(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[int, int]:
+        """Return ``raw-allocation id -> one paired-MLA page in bytes``.
+
+        K3 uses negative slot IDs for padded tokens. Its static-shape cache
+        writer redirects those rows to block ``N``, so each authoritative MLA
+        allocation must contain ``N + 1`` physical blocks while vLLM continues
+        to schedule and report exactly ``N`` blocks. This method recognizes the
+        frozen K3 cache ABI and fails closed if any part of that identity or
+        shape contract changes.
+
+        The returned plan is deliberately keyed by ``id(KVCacheTensor)``. A
+        physical tensor can have aliases in ``shared_by``; it must receive one
+        sink page per allocation, never one per alias.
+        """
+        architecture = self.vllm_config.model_config.architecture
+        if architecture != _KIMI_K3_ARCHITECTURE:
+            return {}
+
+        model_type = type(self.model)
+        if (
+            model_type.__module__ != _KIMI_K3_MODEL_MODULE
+            or model_type.__name__ != _KIMI_K3_MODEL_CLASS
+        ):
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink requires the frozen NDI model; got "
+                f"{model_type.__module__}.{model_type.__name__}"
+            )
+
+        groups = kv_cache_config.kv_cache_groups
+        if len(groups) != 1:
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink requires one uniform cache group; "
+                f"got {len(groups)}"
+            )
+        group = groups[0]
+        spec = group.kv_cache_spec
+        expected_names = set(_KIMI_K3_MLA_CACHE_NAMES)
+        actual_names = set(group.layer_names)
+        if (
+            len(group.layer_names) != len(expected_names)
+            or actual_names != expected_names
+        ):
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink cache identity mismatch: expected "
+                f"{sorted(expected_names)}, got {sorted(group.layer_names)}"
+            )
+        if not isinstance(spec, FullAttentionSpec):
+            raise TypeError(
+                "Kimi K3 MLA padding sink requires FullAttentionSpec, got "
+                f"{type(spec).__name__}"
+            )
+        if (
+            spec.num_kv_heads != 1
+            or spec.head_size != _KIMI_K3_MLA_HEAD_SIZE
+            or spec.dtype != torch.bfloat16
+            or spec.block_size <= 0
+        ):
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink shape mismatch: expected "
+                "heads=1, head_size=576, dtype=bfloat16, positive block_size; "
+                f"got heads={spec.num_kv_heads}, head_size={spec.head_size}, "
+                f"dtype={spec.dtype}, block_size={spec.block_size}"
+            )
+
+        page_size_bytes = spec.page_size_bytes
+        expected_page_size = (
+            2
+            * spec.num_kv_heads
+            * spec.block_size
+            * spec.head_size
+            * spec.dtype.itemsize
+        )
+        if page_size_bytes != expected_page_size:
+            raise RuntimeError(
+                "Kimi K3 paired MLA page size mismatch: expected "
+                f"{expected_page_size} bytes, got {page_size_bytes}"
+            )
+
+        scheduler_blocks = kv_cache_config.num_blocks
+        if not isinstance(scheduler_blocks, int) or scheduler_blocks <= 0:
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink requires a positive integer "
+                f"scheduler block count, got {scheduler_blocks!r}"
+            )
+
+        tensors = kv_cache_config.kv_cache_tensors
+        if len(tensors) != len(expected_names):
+            raise RuntimeError(
+                "Kimi K3 MLA padding sink requires one authoritative allocation "
+                f"per paired cache; expected {len(expected_names)}, got {len(tensors)}"
+            )
+
+        plan: dict[int, int] = {}
+        allocated_names: set[str] = set()
+        expected_bytes = scheduler_blocks * page_size_bytes
+        for tensor in tensors:
+            shared_by = tuple(tensor.shared_by)
+            if len(shared_by) != 1 or shared_by[0] not in expected_names:
+                raise RuntimeError(
+                    "Kimi K3 MLA padding sink requires singleton authoritative "
+                    f"cache allocations, got shared_by={shared_by}"
+                )
+            if shared_by[0] in allocated_names:
+                raise RuntimeError(
+                    "Kimi K3 MLA padding sink found duplicate allocation for "
+                    f"{shared_by[0]}"
+                )
+            if tensor.size != expected_bytes:
+                raise RuntimeError(
+                    "Kimi K3 MLA allocation size mismatch for "
+                    f"{shared_by[0]}: expected {scheduler_blocks} scheduler "
+                    f"blocks / {expected_bytes} bytes, got {tensor.size} bytes"
+                )
+            allocated_names.add(shared_by[0])
+            plan[id(tensor)] = page_size_bytes
+
+        if allocated_names != expected_names:
+            missing = sorted(expected_names - allocated_names)
+            raise RuntimeError(
+                f"Kimi K3 MLA padding sink is missing allocations: {missing}"
+            )
+        return plan
+
+    def _allocate_kv_cache_raw_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor]:
+        """Allocate authoritative byte roots, adding only K3's hidden sink."""
+        sink_plan = self._kimi_k3_mla_sink_plan(kv_cache_config)
+        raw_tensors: dict[str, torch.Tensor] = {}
+        for tensor in kv_cache_config.kv_cache_tensors:
+            sink_page_bytes = sink_plan.get(id(tensor), 0)
+            raw_tensor = torch.zeros(
+                tensor.size + sink_page_bytes,
+                dtype=torch.int8,
+                device=self.device,
+            )
+            for layer_name in tensor.shared_by:
+                raw_tensors[layer_name] = raw_tensor
+
+        if sink_plan:
+            logger.info(
+                "Kimi K3 MLA cache: scheduler_blocks=%d, physical_blocks=%d, "
+                "hidden_padding_sink_block=%d, paired_allocations=%d",
+                kv_cache_config.num_blocks,
+                kv_cache_config.num_blocks + 1,
+                kv_cache_config.num_blocks,
+                len(sink_plan),
+            )
+        return raw_tensors
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -8160,12 +8322,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Initialize the KV Cache tensors
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
-            # Case where the KV cache is shared across layers
-            for layer_name in tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = raw_tensor
+        kv_cache_raw_tensors = self._allocate_kv_cache_raw_tensors(kv_cache_config)
         # A dtype-changing view creates a new PyTorch ``_base`` even when two
         # views originate from the same raw allocation. Construct it exactly
         # once per allocation/dtype so hybrid-cache sharing remains explicit
