@@ -202,3 +202,15 @@ def test_k3_architecture_rejects_an_unrecognized_model_implementation():
 
     with pytest.raises(RuntimeError, match="requires the frozen NDI model"):
         runner._allocate_kv_cache_raw_tensors(_config())
+
+
+def test_k3_allocator_unwraps_torch_compile_model_wrapper():
+    original = _k3_model()
+    compiled = SimpleNamespace(_orig_mod=original)
+    runner = _runner(model=compiled)
+
+    roots = runner._allocate_kv_cache_raw_tensors(_config(num_blocks=3))
+
+    assert len(roots) == 12
+    page_size = _config(num_blocks=3).kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    assert all(root.numel() == 4 * page_size for root in roots.values())

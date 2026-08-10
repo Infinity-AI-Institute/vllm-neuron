@@ -8139,7 +8139,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if architecture != _KIMI_K3_ARCHITECTURE:
             return {}
 
-        model_type = type(self.model)
+        # KV-cache initialization runs after the model has been wrapped by
+        # torch.compile.  Keep the strict frozen-model contract, but inspect
+        # the model owner rather than the public OptimizedModule wrapper.
+        model = self.model
+        for _ in range(8):
+            if type(model).__name__ == "TensorCaptureModel":
+                inner = getattr(model, "model", None)
+            else:
+                inner = getattr(model, "_orig_mod", None)
+            if inner is None or inner is model:
+                break
+            model = inner
+        model_type = type(model)
         if (
             model_type.__module__ != _KIMI_K3_MODEL_MODULE
             or model_type.__name__ != _KIMI_K3_MODEL_CLASS
