@@ -88,7 +88,11 @@ def run_fx_to_hlo_pipeline(
 
     fast_trace = envs.VLLM_NEURON_FAST_TRACE
     trace_metrics = None
-    if fast_trace or envs.VLLM_NEURON_TRACE_METRICS:
+    if (
+        fast_trace
+        or envs.VLLM_NEURON_TRACE_METRICS
+        or os.environ.get("VLLM_NEURON_TRACE_EVENTS") == "1"
+    ):
         # Deliberately fresh for every graph. Compilation options are caller
         # owned and may be reused across graphs, so metrics never live there.
         trace_metrics = TraceMetrics(fast_trace=fast_trace)
@@ -99,10 +103,12 @@ def run_fx_to_hlo_pipeline(
         _setup_compilation_logging(
             gm, example_inputs, workdir, trace_metrics=trace_metrics
         )
+        trace_metrics.begin_phase(workdir, "fx_passes")
         processed_gm, io_map, output_count = _run_fx_passes(
             gm, options, workdir, trace_metrics=trace_metrics
         )
 
+        trace_metrics.begin_phase(workdir, "fx_to_hlo")
         with timer() as fx_timer:
             hlo_module, unused_input_indices, has_rng_seed_parameter = (
                 convert_fx_to_hlo(

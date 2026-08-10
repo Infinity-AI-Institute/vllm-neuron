@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -215,6 +216,24 @@ def test_fast_pipeline_writes_one_failure_diagnostic_and_keeps_options_clean(
     assert '"graph_string_renders": 1' in receipt
     assert '"graph_code_renders": 1' in receipt
     assert '"success": false' in receipt
+
+
+def test_opt_in_trace_events_report_phase_heartbeats(modules, monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_NEURON_TRACE_EVENTS", "1")
+    monkeypatch.setenv("VLLM_NEURON_TRACE_RUN_ID", "test-run")
+    monkeypatch.setenv("VLLM_NEURON_TRACE_EVENT_INTERVAL_SECONDS", "1")
+    gm = _graph_module()
+    modules.capture.run_fx_to_hlo_pipeline(
+        gm, [torch.tensor([1.0])], {}, str(tmp_path)
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "trace_events.jsonl").read_text().splitlines()
+    ]
+    assert rows
+    assert {row["run_id"] for row in rows} == {"test-run"}
+    assert {row["phase"] for row in rows} >= {"fx_passes", "fx_to_hlo"}
+    assert rows[-1]["event"] == "phase_finished"
 
 
 @pytest.mark.parametrize(
