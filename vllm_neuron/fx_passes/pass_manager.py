@@ -71,7 +71,8 @@ class FXPassManager:
                 current_gm, pass_metadata = pass_obj.run(
                     current_gm, **kwargs, **all_metadata
                 )
-                current_gm.recompile()
+                if not pass_obj.recompiles_graph:
+                    current_gm.recompile()
                 elapsed_time = time.perf_counter() - start_time
                 if trace_metrics is not None:
                     trace_metrics.pass_wall_seconds[pass_obj.name] = elapsed_time

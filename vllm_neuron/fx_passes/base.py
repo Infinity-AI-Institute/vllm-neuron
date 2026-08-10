@@ -12,6 +12,11 @@ class FXPass(ABC):
     All FX passes must implement this interface to be used in the pass manager.
     """
 
+    @property
+    def recompiles_graph(self) -> bool:
+        """Whether ``run`` recompiles the returned graph module itself."""
+        return False
+
     @abstractmethod
     def run(
         self, gm: torch.fx.GraphModule, **kwargs
