@@ -234,12 +234,30 @@ def _run_pool_fork(
 
         def _reap(lane_idx: int, pid: int, status_word: int) -> None:
             nonlocal first_failure
-            exit_code = os.WEXITSTATUS(status_word) if os.WIFEXITED(status_word) else -1
+            if os.WIFEXITED(status_word):
+                exit_code = os.WEXITSTATUS(status_word)
+                termination = f"exit({exit_code})"
+            elif os.WIFSIGNALED(status_word):
+                signal_number = os.WTERMSIG(status_word)
+                signal_name = signal.Signals(signal_number).name
+                core_dumped = (
+                    os.WCOREDUMP(status_word)
+                    if hasattr(os, "WCOREDUMP")
+                    else False
+                )
+                exit_code = -signal_number
+                termination = (
+                    f"signal({signal_number}:{signal_name},core={core_dumped})"
+                )
+            else:
+                exit_code = -1
+                termination = f"wait_status({status_word})"
             completed[lane_idx] = (pid, exit_code)
             child_status, child_err = _read_status_file(result_paths[lane_idx])
             if exit_code != 0 or child_status != "OK":
                 msg = (
                     f"lane={lane_idx} pid={pid} exit_code={exit_code} "
+                    f"termination={termination} "
                     f"status={child_status} err={child_err}"
                 )
                 if first_failure is None:

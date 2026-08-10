@@ -1,6 +1,8 @@
 """Trace-pool process-lifetime regression tests."""
 
+import ast
 import importlib.util
+import signal
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +39,32 @@ def parallel_trace_module(monkeypatch):
 
 def _job() -> tuple[object, dict[str, object]]:
     return (object(), {})
+
+
+def test_hlo_capture_clears_inherited_ir_before_first_sync():
+    """A fork child must never execute the parent's lazy XLA graph."""
+    tree = ast.parse((ROOT / "vllm_neuron/compile/hlo.py").read_text())
+    convert = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "convert_fx_to_hlo"
+    )
+    calls = [node for node in ast.walk(convert) if isinstance(node, ast.Call)]
+    clear_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_clear_pending_irs"
+    )
+    sync_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "sync"
+    )
+
+    assert clear_line < sync_line
 
 
 def test_sequential_mode_uses_one_fully_waited_pool_per_job(
@@ -133,3 +161,66 @@ def test_throttle_is_acquired_before_child_graph_setup(
         ("graph", 2, 17, jobs, "/tmp/status"),
         ("release",),
     ]
+
+
+def test_reap_reports_native_signal_instead_of_ambiguous_minus_one(
+    monkeypatch,
+    parallel_trace_module,
+    tmp_path,
+):
+    status_path = tmp_path / "lane0.status"
+    monkeypatch.setattr(
+        parallel_trace_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os, "fork", lambda: 4321, raising=False
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os, "WNOHANG", 1, raising=False
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os,
+        "WIFEXITED",
+        lambda _status: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os,
+        "WIFSIGNALED",
+        lambda _status: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os,
+        "WTERMSIG",
+        lambda _status: signal.SIGSEGV,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        parallel_trace_module.os,
+        "WCOREDUMP",
+        lambda _status: False,
+        raising=False,
+    )
+
+    waits = iter([(4321, signal.SIGSEGV)])
+    monkeypatch.setattr(
+        parallel_trace_module.os,
+        "waitpid",
+        lambda *_args: next(waits),
+        raising=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"exit_code=-11 termination=signal\(11:SIGSEGV,core=False\)",
+    ):
+        parallel_trace_module._run_pool_fork(
+            [_job()],
+            parent_rank=3,
+            num_workers=1,
+        )
+
+    assert not status_path.exists()

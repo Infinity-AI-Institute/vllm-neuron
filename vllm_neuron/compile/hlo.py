@@ -150,10 +150,16 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
     """
     os.environ["PJRT_DEVICE"] = "CPU"
 
-    # clean xla graph before creating placeholders
-    torch_xla.sync(wait=True, reset_scope=True)
+    # A trace child is forked from a worker that can still have lazy XLA IR
+    # attached to its thread-local scope.  sync() executes that inherited IR;
+    # doing so after fork is both unnecessary for capture and unsafe for the
+    # inherited PJRT client.  Drop it before the first synchronization so the
+    # sync below only resets an empty scope.
     xla_device = torch_xla.core.xla_model.xla_device()
+    logger.info("FX-to-HLO reset: clearing inherited XLA IR on %s", xla_device)
     torch_xla._XLAC._clear_pending_irs(f"{xla_device.type}:{xla_device.index}")
+    torch_xla.sync(wait=True, reset_scope=True)
+    logger.info("FX-to-HLO reset complete: inherited XLA IR was not executed")
 
     # create_placeholder_tensor loses unsigned dtypes (uint16 → int16).
     # Use BitcastConvert + .to() to restore the correct HLO type and PyTorch
@@ -181,9 +187,12 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
     tensors, identifiers = zip(*uniques.items(), strict=True)
 
     # Lower the HLO graph
+    logger.info("FX-to-HLO lowering: creating LoweringContext")
     context = torch_xla._XLAC.lowering.LoweringContext()
+    logger.info("FX-to-HLO lowering: building %d output tensor(s)", len(tensors))
     context.build(tensors)
 
+    logger.info("FX-to-HLO lowering: serializing HLO")
     hlo = context.hlo()
     hlo_module = hlo_pb2.HloModuleProto()
     hlo_module.ParseFromString(hlo)
