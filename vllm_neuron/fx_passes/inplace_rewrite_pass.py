@@ -25,6 +25,15 @@ class InPlaceToOutOfPlacePass(FXPass):
     def name(self) -> str:
         return "inplace_to_outofplace"
 
+    @property
+    def recompiles_graph(self) -> bool:
+        """Tell the pass manager that this pass leaves ``gm`` recompiled.
+
+        ``run`` remains safe to call directly, while the manager can avoid its
+        otherwise redundant second recompile.
+        """
+        return True
+
     def run(
         self, gm: torch.fx.GraphModule, **kwargs
     ) -> tuple[torch.fx.GraphModule, dict]:
@@ -72,11 +81,15 @@ class InPlaceToOutOfPlacePass(FXPass):
         Args:
             gm: The FX GraphModule whose graph will be mutated in place.
         """
-        # Snapshot the node list: we mutate the graph (erase/insert) during
-        # iteration, so iterating over a live view would skip or revisit nodes.
-        for node in list(gm.graph.nodes):
+        # Snapshot once: we mutate the graph during iteration, and the stable
+        # ordinal lets downstream rewrites use the FX user graph without an
+        # O(N) list construction/scan for every in-place operation.
+        nodes = list(gm.graph.nodes)
+        node_order = {node: index for index, node in enumerate(nodes)}
+        for node in nodes:
+            mutation_index = node_order[node]
             if node.op == "call_function" and node.target == operator.setitem:
-                self._convert_setitem(gm, node)
+                self._convert_setitem(gm, node, mutation_index, node_order)
                 continue
 
             # Only target single-trailing-underscore methods (e.g. add_, copy_).
@@ -108,7 +121,9 @@ class InPlaceToOutOfPlacePass(FXPass):
                     slice_scatter.name = f"{original_input.name}_modified"
                 node.replace_all_uses_with(slice_scatter)
                 gm.graph.erase_node(node)
-                self._update_subsequent_ops(gm, slice_scatter, original_input)
+                self._update_subsequent_ops(
+                    slice_scatter, original_input, mutation_index, node_order
+                )
                 continue
             else:
                 # General case: swap the in-place target for its out-of-place
@@ -129,13 +144,21 @@ class InPlaceToOutOfPlacePass(FXPass):
 
             # Rewrite all downstream references from the original input to
             # the new out-of-place result so the SSA form stays valid.
-            self._update_subsequent_ops(gm, node, original_input)
+            self._update_subsequent_ops(
+                node, original_input, mutation_index, node_order
+            )
 
     # =========================================================================
     # setitem conversion
     # =========================================================================
 
-    def _convert_setitem(self, gm: torch.fx.GraphModule, node: torch.fx.Node) -> None:
+    def _convert_setitem(
+        self,
+        gm: torch.fx.GraphModule,
+        node: torch.fx.Node,
+        mutation_index: int,
+        node_order: dict[torch.fx.Node, int],
+    ) -> None:
         """Convert ``operator.setitem(buf, idx, value)`` to scatter ops.
 
         Args:
@@ -151,14 +174,16 @@ class InPlaceToOutOfPlacePass(FXPass):
             # Unsupported — just rewrite subsequent refs and keep the setitem.
             if hasattr(buf, "name"):
                 node.name = f"{node.meta.get('root_input', buf.name)}_modified"
-            self._update_subsequent_ops(gm, node, buf)
+            self._update_subsequent_ops(node, buf, mutation_index, node_order)
             return
 
         if hasattr(buf, "name"):
             scatter_node.name = f"{node.meta.get('root_input', buf.name)}_modified"
         node.replace_all_uses_with(scatter_node)
         gm.graph.erase_node(node)
-        self._update_subsequent_ops(gm, scatter_node, buf)
+        self._update_subsequent_ops(
+            scatter_node, buf, mutation_index, node_order
+        )
 
     def _ensure_tensor_node(
         self, gm: torch.fx.GraphModule, value, buf
@@ -567,58 +592,28 @@ class InPlaceToOutOfPlacePass(FXPass):
 
     def _update_subsequent_ops(
         self,
-        gm: torch.fx.GraphModule,
         modified_node: torch.fx.Node,
         original_input: torch.fx.Node,
+        mutation_index: int,
+        node_order: dict[torch.fx.Node, int],
     ) -> None:
         """Rewrite later nodes that reference *original_input* to use
         *modified_node* instead.
 
         Args:
-            gm: The FX GraphModule whose graph will be mutated.
             modified_node: The replacement node.
             original_input: The node whose references should be replaced.
+            mutation_index: Stable ordinal of the original mutation node.
+            node_order: Stable ordinals for nodes present before conversion.
         """
-        nodes_list = list(gm.graph.nodes)
-        # Only rewrite nodes that appear *after* modified_node in the graph
-        # to preserve SSA dominance: every use must be dominated by its def.
-        start_idx = nodes_list.index(modified_node) + 1
-
-        for later_node in nodes_list[start_idx:]:
-            if later_node.op in ("call_method", "call_function", "output"):
-                later_node.args = self._replace_in_structure(
-                    later_node.args, original_input, modified_node
-                )
-                later_node.kwargs = self._replace_in_structure(
-                    later_node.kwargs, original_input, modified_node
-                )
-
-    def _replace_in_structure(self, structure, old_node, new_node):
-        """Recursively replace *old_node* with *new_node* in a nested structure.
-
-        Args:
-            structure: A nested combination of tuples, lists, and dicts.
-            old_node: The node to find and replace.
-            new_node: The replacement node.
-
-        Returns:
-            The structure with all occurrences of *old_node* replaced.
-        """
-        if structure is old_node:
-            return new_node
-        if isinstance(structure, tuple):
-            return tuple(
-                self._replace_in_structure(item, old_node, new_node)
-                for item in structure
-            )
-        if isinstance(structure, list):
-            return [
-                self._replace_in_structure(item, old_node, new_node)
-                for item in structure
-            ]
-        if isinstance(structure, dict):
-            return {
-                k: self._replace_in_structure(v, old_node, new_node)
-                for k, v in structure.items()
-            }
-        return structure
+        # ``Node.users`` already identifies every args/kwargs structure that
+        # contains original_input.  Snapshot it because replace_input_with
+        # updates the user sets as it rewrites.  Nodes inserted for the current
+        # lowering are intentionally absent from node_order and therefore
+        # cannot be rewritten into a self-cycle.
+        for later_node in tuple(original_input.users):
+            if (
+                node_order.get(later_node, -1) > mutation_index
+                and later_node.op in ("call_method", "call_function", "output")
+            ):
+                later_node.replace_input_with(original_input, modified_node)
