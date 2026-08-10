@@ -1,20 +1,216 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
+import hashlib
+import json
 import logging
+import os
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Dict
 
 import torch
-import torch_xla
-from torch_xla.core import xla_builder
 import torch_neuronx
+import torch_xla
 from torch_neuronx.pyhlo import hlo_pb2, xla_data_pb2
 from torch_neuronx.xla_impl import structure
 from torch_neuronx.xla_impl.xla_hlo_tools.xla_primitive_enum_utils import (
     XlaPrimitiveProperties,
 )
+from torch_xla.core import xla_builder
 
 logger = logging.getLogger(__name__)
+
+_FORWARD_DIAGNOSTICS_ENV = "VLLM_NEURON_HLO_FORWARD_DIAGNOSTICS"
+_FORWARD_DIAGNOSTICS_DIR = "fx_forward_diagnostics"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
+_TEXT_CHUNK_SIZE = 1024 * 1024
+
+
+def _forward_diagnostics_enabled() -> bool:
+    """Return whether the fail-closed FX-forward diagnostic is enabled."""
+    value = os.environ.get(_FORWARD_DIAGNOSTICS_ENV)
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in _TRUE_ENV_VALUES:
+        return True
+    if normalized in _FALSE_ENV_VALUES:
+        return False
+    raise ValueError(
+        f"{_FORWARD_DIAGNOSTICS_ENV} must be one of 1/true/yes/on or 0/false/no/off"
+    )
+
+
+def _safe_target_name(target) -> str:
+    """Describe an FX target without serializing bound state or tensor values."""
+    if isinstance(target, str):
+        return target
+    if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
+        return str(target)
+    module = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None) or getattr(
+        target, "__name__", None
+    )
+    if module and qualname:
+        return f"{module}.{qualname}"
+    return type(target).__name__
+
+
+def _shape_dimension(dimension):
+    try:
+        return int(dimension)
+    except (TypeError, ValueError):
+        return str(dimension)
+
+
+def _input_spec(value):
+    """Describe input structure, shapes, and dtypes without recording values."""
+    if isinstance(value, torch.Tensor):
+        return {
+            "kind": "tensor",
+            "shape": [_shape_dimension(dimension) for dimension in value.shape],
+            "dtype": str(value.dtype),
+        }
+    if isinstance(value, tuple):
+        return {"kind": "tuple", "items": [_input_spec(item) for item in value]}
+    if isinstance(value, list):
+        return {"kind": "list", "items": [_input_spec(item) for item in value]}
+    if isinstance(value, dict):
+        # Keys can contain request data, so preserve only deterministic positions.
+        return {
+            "kind": "dict",
+            "items": [_input_spec(item) for item in value.values()],
+        }
+    return {"kind": "opaque", "type": type(value).__name__}
+
+
+def _write_text(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for offset in range(0, len(content), _TEXT_CHUNK_SIZE):
+            handle.write(content[offset : offset + _TEXT_CHUNK_SIZE])
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_json(path: Path, payload) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sha256_text(content: str) -> str:
+    digest = hashlib.sha256()
+    for offset in range(0, len(content), _TEXT_CHUNK_SIZE):
+        digest.update(content[offset : offset + _TEXT_CHUNK_SIZE].encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _persist_forward_diagnostics(gm, example_inputs, log_path: str) -> Path:
+    """Atomically publish graph-neutral metadata before FX forward execution.
+
+    The line map is JSONL so a K3-sized graph can be written incrementally. Each
+    node records only immediate FX parents; complete ancestry can be reconstructed
+    from those edges without materializing a quadratic transitive-closure receipt.
+    """
+    root = Path(log_path)
+    destination = root / _FORWARD_DIAGNOSTICS_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{_FORWARD_DIAGNOSTICS_DIR}.", dir=root))
+    try:
+        python_code = gm.graph.python_code("self")
+        code = python_code.src
+        nodes = list(gm.graph.nodes)
+        node_indices = {node: index for index, node in enumerate(nodes)}
+        line_to_node = getattr(python_code, "_lineno_map", None)
+        if line_to_node is None:
+            raise RuntimeError("FX generated code does not expose _lineno_map")
+
+        code_path = temporary / "gm.code.py"
+        _write_text(code_path, code)
+
+        mapping_path = temporary / "generated_line_to_fx_node.jsonl"
+        with mapping_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for generated_line, node_index in sorted(line_to_node.items()):
+                if not isinstance(node_index, int) or not 0 <= node_index < len(nodes):
+                    raise RuntimeError(
+                        "FX generated line map references an invalid node index: "
+                        f"line={generated_line!r} node_index={node_index!r}"
+                    )
+                node = nodes[node_index]
+                record = {
+                    "generated_line": int(generated_line),
+                    "node_index": node_index,
+                    "node_name": node.name,
+                    "op": node.op,
+                    "target": _safe_target_name(node.target),
+                    "parents": [
+                        {
+                            "node_index": node_indices[parent],
+                            "node_name": parent.name,
+                        }
+                        for parent in node.all_input_nodes
+                    ],
+                    "source_frames": [
+                        {"file": file_name, "line": int(line_number)}
+                        for file_name, line_number in _FRAME_RE.findall(
+                            node.stack_trace or ""
+                        )
+                    ],
+                }
+                json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        graph_sha256 = _sha256_text(code)
+        manifest = {
+            "schema_version": 1,
+            "graph": {
+                "code_file": code_path.name,
+                "code_sha256": graph_sha256,
+                "graph_sha256": graph_sha256,
+                "generated_line_map_file": mapping_path.name,
+                "generated_line_map_entries": len(line_to_node),
+                "node_count": len(nodes),
+            },
+            "inputs": [_input_spec(value) for value in example_inputs],
+            "privacy": {
+                "raw_tensor_values_recorded": False,
+                "non_tensor_input_values_recorded": False,
+            },
+        }
+        _write_json(temporary / "manifest.json", manifest)
+
+        if destination.exists():
+            raise FileExistsError(
+                f"FX-forward diagnostic receipt already exists: {destination}"
+            )
+        os.replace(temporary, destination)
+        return destination
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _prepare_forward_diagnostics(enabled, gm, example_inputs, log_path):
+    if not enabled:
+        return None
+    try:
+        return _persist_forward_diagnostics(gm, example_inputs, log_path)
+    except Exception as error:
+        raise RuntimeError(
+            "FX-forward diagnostics were explicitly enabled but the atomic "
+            "pre-execution receipt could not be written"
+        ) from error
+
+
+def _forward_diagnostic_marker(enabled: bool, phase: str) -> None:
+    if enabled:
+        logger.info("FX-forward diagnostic marker: %s", phase)
 
 
 def load_hlo_module(hlo_path: str) -> hlo_pb2.HloModuleProto:
@@ -148,6 +344,7 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
     Returns:
         hlo_pb2.HloModuleProto: The processed HLO module
     """
+    diagnostics_enabled = _forward_diagnostics_enabled()
     os.environ["PJRT_DEVICE"] = "CPU"
 
     # A trace child is forked from a worker that can still have lazy XLA IR
@@ -184,10 +381,20 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
                 )
         xla_placeholders.append(placeholder)
 
+    receipt_path = _prepare_forward_diagnostics(
+        diagnostics_enabled, gm, example_inputs, log_path
+    )
+    if receipt_path is not None:
+        logger.info("FX-forward diagnostic receipt: %s", receipt_path)
+
+    _forward_diagnostic_marker(diagnostics_enabled, "before gm execution")
     with torch_neuronx.contexts.lowering():
         outputs = gm(*xla_placeholders)
+    _forward_diagnostic_marker(diagnostics_enabled, "after gm execution")
 
+    _forward_diagnostic_marker(diagnostics_enabled, "before structure.extract")
     layout, uniques, constants = structure.extract(outputs)
+    _forward_diagnostic_marker(diagnostics_enabled, "after structure.extract")
     if not uniques:
         raise ValueError("Cannot compile a module that has no output")
     tensors, identifiers = zip(*uniques.items(), strict=True)
@@ -196,10 +403,14 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
     logger.info("FX-to-HLO lowering: creating LoweringContext")
     context = torch_xla._XLAC.lowering.LoweringContext()
     logger.info("FX-to-HLO lowering: building %d output tensor(s)", len(tensors))
+    _forward_diagnostic_marker(diagnostics_enabled, "before LoweringContext.build")
     context.build(tensors)
+    _forward_diagnostic_marker(diagnostics_enabled, "after LoweringContext.build")
 
     logger.info("FX-to-HLO lowering: serializing HLO")
+    _forward_diagnostic_marker(diagnostics_enabled, "before LoweringContext.serialize")
     hlo = context.hlo()
+    _forward_diagnostic_marker(diagnostics_enabled, "after LoweringContext.serialize")
     hlo_module = hlo_pb2.HloModuleProto()
     hlo_module.ParseFromString(hlo)
 
