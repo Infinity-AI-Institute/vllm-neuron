@@ -155,7 +155,13 @@ def convert_fx_to_hlo(gm, example_inputs, log_path, aliasing_map=None):
     # doing so after fork is both unnecessary for capture and unsafe for the
     # inherited PJRT client.  Drop it before the first synchronization so the
     # sync below only resets an empty scope.
-    xla_device = torch_xla.core.xla_model.xla_device()
+    # Do not query torch_xla for its default device before clearing.  In a
+    # forked trace child, _xla_get_default_device() can touch the inherited
+    # PJRT client and execute the parent's pending graph before this function
+    # gets a chance to discard it.  PJRT CPU capture has one local XLA device,
+    # so constructing the torch.device value is side-effect free and sufficient
+    # for _clear_pending_irs().
+    xla_device = torch.device("xla", 0)
     logger.info("FX-to-HLO reset: clearing inherited XLA IR on %s", xla_device)
     torch_xla._XLAC._clear_pending_irs(f"{xla_device.type}:{xla_device.index}")
     torch_xla.sync(wait=True, reset_scope=True)

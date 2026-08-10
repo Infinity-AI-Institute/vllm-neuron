@@ -41,8 +41,8 @@ def _job() -> tuple[object, dict[str, object]]:
     return (object(), {})
 
 
-def test_hlo_capture_clears_inherited_ir_before_first_sync():
-    """A fork child must never execute the parent's lazy XLA graph."""
+def test_hlo_capture_clears_inherited_ir_before_any_xla_runtime_call():
+    """A fork child must not query inherited PJRT state before clearing it."""
     tree = ast.parse((ROOT / "vllm_neuron/compile/hlo.py").read_text())
     convert = next(
         node
@@ -64,7 +64,22 @@ def test_hlo_capture_clears_inherited_ir_before_first_sync():
         and node.func.attr == "sync"
     )
 
+    runtime_device_queries = [
+        node.lineno
+        for node in calls
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in {
+                "xla_device",
+                "device",
+                "_xla_get_default_device",
+            }
+            and "torch_xla" in ast.unparse(node.func)
+        )
+    ]
+
     assert clear_line < sync_line
+    assert not runtime_device_queries or clear_line < min(runtime_device_queries)
 
 
 def test_sequential_mode_uses_one_fully_waited_pool_per_job(
