@@ -76,6 +76,8 @@ class DeviceRewriterPass(FXPass):
                             f"'{current_device_type}' that was not rewritten. This should not "
                             f"happen in the device rewriter"
                         )
+                elif self._rewrite_positional_tensor_to_device(node, target_device):
+                    rewrite_count += 1
 
             # Recompile the graph module after modifications
             gm.recompile()
@@ -89,7 +91,7 @@ class DeviceRewriterPass(FXPass):
 
             return gm, metadata
         except Exception as e:
-            raise RuntimeError(f"Device rewriting failed: {str(e)}") from e
+            raise RuntimeError(f"Device rewriting failed: {e!s}") from e
 
     def _rewrite_device_in_kwargs(self, node: Node, target_device: str) -> bool:
         """Rewrite device metadata in node kwargs by creating a new node copy.
@@ -136,3 +138,47 @@ class DeviceRewriterPass(FXPass):
             return True
 
         return False
+
+    def _rewrite_positional_tensor_to_device(
+        self, node: Node, target_device: str
+    ) -> bool:
+        """Rewrite the positional device overload of ``Tensor.to``.
+
+        ``Tensor.to`` also has dtype-only and tensor-to-tensor overloads. Restrict
+        this rewrite to a string or ``torch.device`` in the first argument after
+        the receiver so those overloads, and all remaining arguments, retain
+        their original semantics.
+
+        Args:
+            node: The FX node to inspect and possibly modify.
+            target_device: Target device type.
+
+        Returns:
+            bool: True when the node uses the positional device overload, whether
+            or not its device already matches the target; otherwise False.
+        """
+        if node.op != "call_method" or node.target != "to" or len(node.args) < 2:
+            return False
+
+        current_device = node.args[1]
+        if not isinstance(current_device, (str, torch.device)):
+            return False
+
+        current_device_type = self._get_device_type(current_device)
+        if current_device_type == target_device:
+            return True
+
+        new_args = list(node.args)
+        if isinstance(current_device, str):
+            new_args[1] = target_device
+        else:
+            new_args[1] = torch.device(target_device, index=0)
+        node.args = tuple(new_args)
+
+        self.logger.debug(
+            "Rewrote positional device for %s from %s to %s",
+            node.target,
+            current_device,
+            target_device,
+        )
+        return True
