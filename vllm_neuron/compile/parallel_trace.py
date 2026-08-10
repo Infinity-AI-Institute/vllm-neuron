@@ -624,7 +624,13 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
             cached = tuple_replacements.get(id(value))
             if cached is not None:
                 return cached
-            replacement = tuple(_replace_nested(nested) for nested in value)
+            nested_values = tuple(_replace_nested(nested) for nested in value)
+            if all(
+                replaced is original for replaced, original in zip(nested_values, value)
+            ):
+                replacement = value
+            else:
+                replacement = nested_values
             tuple_replacements[id(value)] = replacement
             return replacement
         return value
