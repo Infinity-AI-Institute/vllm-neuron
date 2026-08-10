@@ -598,6 +598,37 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
         _META_PARAM_KEEPALIVE.append(src)
         return repl
 
+    seen_containers: set[int] = set()
+    tuple_replacements: dict[int, tuple[Any, ...]] = {}
+
+    def _replace_nested(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            if value.device.type == "meta":
+                return value
+            return _replacement_for(value)
+        if isinstance(value, dict):
+            if id(value) in seen_containers:
+                return value
+            seen_containers.add(id(value))
+            for key, nested in list(value.items()):
+                value[key] = _replace_nested(nested)
+            return value
+        if isinstance(value, list):
+            if id(value) in seen_containers:
+                return value
+            seen_containers.add(id(value))
+            for index, nested in enumerate(value):
+                value[index] = _replace_nested(nested)
+            return value
+        if isinstance(value, tuple):
+            cached = tuple_replacements.get(id(value))
+            if cached is not None:
+                return cached
+            replacement = tuple(_replace_nested(nested) for nested in value)
+            tuple_replacements[id(value)] = replacement
+            return replacement
+        return value
+
     for submod in module.modules():
         for name, param in list(submod._parameters.items()):
             if param is None or param.device.type == "meta":
@@ -611,16 +642,13 @@ def _swap_to_meta_no_free(module: torch.nn.Module) -> None:
                 continue
             submod._buffers[name] = _replacement_for(buf)
         # Plain tensor attributes (e.g. k_cache / v_cache bound after
-        # initialize_kv_cache). Skip the special _parameters / _buffers
-        # / _modules dicts — already handled above.
+        # initialize_kv_cache), including tensors nested in ordinary
+        # dict/list/tuple attributes. Skip the special _parameters /
+        # _buffers / _modules dicts — already handled above.
         for name, val in list(submod.__dict__.items()):
             if name in ("_parameters", "_buffers", "_modules"):
                 continue
-            if not isinstance(val, torch.Tensor):
-                continue
-            if val.device.type == "meta":
-                continue
-            submod.__dict__[name] = _replacement_for(val)
+            submod.__dict__[name] = _replace_nested(val)
 
 
 _META_PARAM_KEEPALIVE: list = []
