@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     # underlying CPU, number of ranks, and buckets being compiled.
     VLLM_NEURON_PARALLEL_TRACE_WORKERS: int = 8
     VLLM_NEURON_TRACE_RANK_CONCURRENCY: int | None = None
+    VLLM_NEURON_COMPILE_MAX_GLOBAL: int | None = None
+    VLLM_NEURON_COMPILE_SEM_DIR: Optional[str] = None
+    VLLM_NEURON_COMPILE_SEM_TIMEOUT: int = 0
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     VLLM_NEURON_FAST_TRACE: bool = False
     VLLM_NEURON_TRACE_METRICS: bool = False
@@ -139,6 +142,27 @@ def maybe_convert_bounded_positive_int(
     return converted
 
 
+def maybe_convert_compile_max_global(value: str | None) -> int | None:
+    """Parse VLLM_NEURON_COMPILE_MAX_GLOBAL: 0/unset disables, else [16, 24]."""
+    if value is None or value == "":
+        return None
+    try:
+        converted = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_NEURON_COMPILE_MAX_GLOBAL must be 0 (disabled) or an "
+            f"integer in [16, 24], got {value!r}"
+        ) from exc
+    if converted == 0:
+        return None
+    if not 16 <= converted <= 24:
+        raise ValueError(
+            "VLLM_NEURON_COMPILE_MAX_GLOBAL must be 0 (disabled) or an "
+            f"integer in [16, 24], got {value!r}"
+        )
+    return converted
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -197,6 +221,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             name="VLLM_NEURON_TRACE_RANK_CONCURRENCY",
             maximum=4096,
         )
+    ),
+    # Optional host-wide cap on concurrently live neuronx-cc compiler
+    # processes, enforced across ranks/containers via flock token files under
+    # VLLM_NEURON_COMPILE_SEM_DIR. Unset or 0 preserves the existing
+    # per-rank-only behavior exactly; an enabled value must be in [16, 24].
+    "VLLM_NEURON_COMPILE_MAX_GLOBAL": lambda: (
+        maybe_convert_compile_max_global(os.getenv("VLLM_NEURON_COMPILE_MAX_GLOBAL"))
+    ),
+    # Shared directory for the global compile semaphore slot files. Fallback:
+    # $NEURON_COMPILED_ARTIFACTS/compile-sem, then the system temp dir with a
+    # loud warning (temp dirs are usually not shared across containers).
+    "VLLM_NEURON_COMPILE_SEM_DIR": lambda: (
+        os.getenv("VLLM_NEURON_COMPILE_SEM_DIR") or None
+    ),
+    # Seconds to wait for a global compile slot before raising TimeoutError.
+    # 0 (default) waits forever; wait heartbeats are logged every ~60s either
+    # way so a stalled compile phase is observable.
+    "VLLM_NEURON_COMPILE_SEM_TIMEOUT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_COMPILE_SEM_TIMEOUT")) or 0
     ),
     # When True, disable the parallel-trace fork pool entirely and run
     # graph extraction sequentially in the parent process.

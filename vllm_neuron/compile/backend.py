@@ -19,6 +19,7 @@ import torch.fx
 
 from vllm_neuron import envs
 from vllm_neuron.compile.cache import get_neff_filename
+from vllm_neuron.compile.compile_throttle import global_compile_slot
 from vllm_neuron.utils.timer import timer
 
 
@@ -440,7 +441,12 @@ def neuroncc_compile(hlo, compiler_workdir, compiler_args=None):
 
     logger.info("Compiling...")
     start_time = time.time()
-    status = subprocess.run(command, stdout=subprocess.DEVNULL).returncode
+    # Bound the GLOBAL number of live neuronx-cc processes across all ranks
+    # (no-op unless VLLM_NEURON_COMPILE_MAX_GLOBAL is set). The lease fd is
+    # O_CLOEXEC and closed when the context exits, so the slot is released on
+    # compiler exit, exception, or holder death.
+    with global_compile_slot():
+        status = subprocess.run(command, stdout=subprocess.DEVNULL).returncode
     elapsed_time = time.time() - start_time
 
     if status != 0:
