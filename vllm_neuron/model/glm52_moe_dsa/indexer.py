@@ -166,28 +166,20 @@ class Glm52FullIndexer(nn.Module):
             self.config.index_n_heads,
             self.config.index_head_dim,
         )
-        q_rot, q_pass = torch.split(
-            query,
-            [
-                self.config.qk_rope_head_dim,
-                self.config.index_head_dim - self.config.qk_rope_head_dim,
-            ],
-            dim=-1,
-        )
+        # PR #13 fix: Tensor.split([list], dim=-1) returns wrong data by up to 6.0
+        # on trn2 (see device_split_repro on deepseek-v4-flash-base). Use slicing.
+        _rope = self.config.qk_rope_head_dim
+        q_rot = query[..., :_rope]
+        q_pass = query[..., _rope:]
 
         key = F.linear(
             hidden_states.to(self.wk.weight.dtype),
             self.wk.weight,
         )
         key = self.k_norm(key)
-        k_rot, k_pass = torch.split(
-            key,
-            [
-                self.config.qk_rope_head_dim,
-                self.config.index_head_dim - self.config.qk_rope_head_dim,
-            ],
-            dim=-1,
-        )
+        # PR #13 fix: same split-list-overload trn2 miscompile — use slicing.
+        k_rot = key[..., :_rope]
+        k_pass = key[..., _rope:]
 
         q_rot, k_rot = apply_glm52_interleaved_rope(
             q_rot,
@@ -251,7 +243,10 @@ class Glm52FullIndexer(nn.Module):
             )
         else:
             _, indices = torch.topk(masked_scores, selected, dim=-1)
-        return indices.to(torch.int32)
+        # PR #13 fix: torch.topk index override returns unsigned int32 on trn2;
+        # any -1 sentinel wraps to 4294967295 sending scatter_ oob (nrta status=1006).
+        # Cast to int64 before any sentinel comparison downstream.
+        return indices.to(torch.int64)
 
     def forward_dense(
         self,
