@@ -97,7 +97,10 @@ def glm52_index_topk(
         attention_mask=attention_mask,
     )
     selected = min(top_k, index_scores.shape[-1])
-    return masked_scores.topk(selected, dim=-1).indices.to(torch.int32)
+    # PR #13 double-fix: (1) bound-method .topk() still emits unsupported HLO sort
+    # on trn2 — only module-level torch.topk is rebound by AwsNeuronCustomLoweringType;
+    # (2) int32 sentinel wrap: -1 → 4294967295 → scatter_ oob (nrta status=1006).
+    return torch.topk(masked_scores, selected, dim=-1).indices.to(torch.int64)
 
 
 def glm52_mask_index_scores(
