@@ -1504,6 +1504,9 @@ def _convert_sliding_only_block(
     )
 
 
+FFN_NORM_KEY = "ffn_norm.weight"
+
+
 def _convert_dsv4_checkpoint(
     state_dict: dict[str, Any],
     src: DeepseekV4FlashInferenceConfig,
@@ -1512,30 +1515,25 @@ def _convert_dsv4_checkpoint(
 ) -> dict[str, Any]:
     """Map HF names onto the wrapper's module tree.
 
-    NOT YET IMPLEMENTED for the per-layer path — this scaffold routes
-    the top-level embed/lm_head/final_norm tensors so a 1-layer synthetic
-    smoke can walk the code without hitting the per-layer stubs; per-
-    layer conversion is gated behind Round 2.  Every HF -> wrapper key
-    decision lands in a dedicated ``_convert_*_layer`` helper matching
-    the GLM-5.3-Flash structure at
-    ``vllm_neuron/model/glm53_flash/checkpoint_convert.py:415-593``.
+    Round 8: per-layer dispatch loop landed.  For each of the 43 hidden
+    layers, the loop reads ``src.layer_types[i]`` /
+    ``src.mlp_layer_types[i]`` and calls the corresponding per-layer
+    helper.  No fallthrough — an unknown ``layer_type`` /
+    ``mlp_layer_type`` raises loudly rather than silently dropping the
+    layer.  Also emits the per-layer ``ffn_norm.weight`` sibling (the
+    ``_convert_mqa_block`` helper already emits ``attn_norm.weight``;
+    the two together are the decoder-layer RMSNorm gains that
+    ``DeepseekV4FlashLayer`` owns).
 
     Structural decisions (each with a top-of-file citation):
       * Layer 43 (MTP) and all ``dspark_*`` tensors dropped explicitly.
       * Non-expert FP8 weights dequantized to bf16 here (UE8M0 scale).
-      * Routed-expert FP4 weights dequantized to bf16 here (UE8M0 scale)
-        AFTER the packing layout is verified byte-clean against a real
-        routed-expert shard (Round-2 pre-req; see 1-tensor smoke).
-      * Grouped output projection: ``wo_a.weight`` is a 3-D tensor
-        ``[o_groups, num_heads * head_dim, o_lora_rank]`` before flattening
-        into NxDI's ColumnParallel primitive; the group axis is treated
-        as an extra head-count axis with ``o_groups * o_lora_rank`` as
-        the output dim of ``o_b``.  Confirmed against transformers
-        5.15.1 ``DeepseekV4GroupedLinear`` (paper §2.3.1).
-      * Hash-MoE bootstrap: the frozen ``tid2eid[input_ids]`` lookup
-        table sits alongside the routed-expert weights in the checkpoint
-        as ``layers.<0..2>.mlp.hash_table`` int32 buffer.  Copied through
-        as an ``nn.Parameter(requires_grad=False)`` in the wrapper.
+      * Routed-expert FP4 weights dequantized to bf16 here (UE8M0 scale).
+      * Grouped output projection weight layout matches
+        ``DeepseekV4GroupedLinear`` byte-for-byte (paper §2.3.1).
+      * Hash-MoE bootstrap: the frozen ``tid2eid`` lookup lands under
+        ``layers.<0..2>.mlp.tid2eid`` as int32
+        ``nn.Parameter(requires_grad=False)`` in the wrapper.
     """
     if tp_degree <= 0:
         raise ValueError(f"tp_degree must be positive; got {tp_degree}")
@@ -1564,32 +1562,123 @@ def _convert_dsv4_checkpoint(
             f"missing {LM_HEAD_KEY!r} in state_dict and tie_word_embeddings=False"
         )
 
-    # ---- per-layer conversion (Round 2 lands the block helpers) ----
+    # ---- per-layer conversion (Round 8: real dispatch loop) ----
+    per_layer_report: dict[int, dict[str, Any]] = {}
+    hidden = int(src.hidden_size)
     for layer_idx in range(num_layers):
-        raise NotImplementedError(
-            f"per-layer conversion is Round 2 — layer {layer_idx} would dispatch on "
-            f"layer_types[{layer_idx}]={src.layer_types[layer_idx]!r} + "
-            f"mlp_layer_types[{layer_idx}]={src.mlp_layer_types[layer_idx]!r}. "
-            "See checkpoint_convert.py top-of-file for the structural decision list."
+        layer_type = src.layer_types[layer_idx]
+        mlp_type = src.mlp_layer_types[layer_idx]
+
+        # Attention subtree — one of three families.  Each helper also
+        # emits the sibling `attn_norm.weight` (pre-attention RMSNorm).
+        # No default catch — an unknown layer_type is a fail-loud.
+        if layer_type == "sliding_attention":
+            attn_converted = _convert_sliding_only_block(
+                state_dict, layer_idx, src, dtype=dtype
+            )
+            attn_key_count = 8
+        elif layer_type == "compressed_sparse_attention":
+            attn_converted = _convert_csa_block(
+                state_dict, layer_idx, src, dtype=dtype
+            )
+            attn_key_count = 18
+        elif layer_type == "heavily_compressed_attention":
+            attn_converted = _convert_hca_block(
+                state_dict, layer_idx, src, dtype=dtype
+            )
+            attn_key_count = 12
+        else:
+            raise ValueError(
+                f"unsupported layer_type {layer_type!r} at index "
+                f"{layer_idx} — refusing to silently drop or default a "
+                "layer family the converter has not qualified."
+            )
+        converted.update(attn_converted)
+
+        # Sibling pre-MLP RMSNorm (`ffn_norm.weight`).  MoE converters
+        # don't own this — it lives at the decoder-layer level with
+        # `attn_norm.weight`.
+        ffn_norm_hf = f"layers.{layer_idx}.{FFN_NORM_KEY}"
+        ffn_norm_raw = state_dict.get(ffn_norm_hf)
+        if ffn_norm_raw is None:
+            raise KeyError(
+                f"missing pre-MLP RMSNorm {ffn_norm_hf!r} for layer "
+                f"{layer_idx} — refusing to substitute an identity gain."
+            )
+        if tuple(ffn_norm_raw.shape) != (hidden,):
+            raise ValueError(
+                f"{ffn_norm_hf!r} shape {tuple(ffn_norm_raw.shape)} != "
+                f"({hidden},)"
+            )
+        converted[f"layers.{layer_idx}.ffn_norm.weight"] = (
+            ffn_norm_raw.to(dtype)
         )
 
-    # ---- dropped-tensor bookkeeping (unreachable until per-layer lands) ----
-    for key in state_dict.keys():  # pragma: no cover - unreachable in Round 1
+        # MLP subtree — hash-MoE for the bootstrap layers, routed-MoE
+        # for the rest.  Both helpers emit 7 wrapper-tree keys.
+        if mlp_type == "hash_moe":
+            _convert_hash_moe_block(
+                state_dict, converted, layer_idx, src, dtype=dtype
+            )
+            mlp_key_count = 7
+        elif mlp_type == "moe":
+            _convert_routed_moe_layer(
+                state_dict, converted, layer_idx, src, dtype=dtype
+            )
+            mlp_key_count = 7
+        else:
+            raise ValueError(
+                f"unsupported mlp_type {mlp_type!r} at index "
+                f"{layer_idx} — refusing to silently drop or default an "
+                "MLP family the converter has not qualified."
+            )
+
+        per_layer_report[layer_idx] = {
+            "layer_type": layer_type,
+            "mlp_type": mlp_type,
+            "attn_key_count": attn_key_count,
+            "mlp_key_count": mlp_key_count,
+            # attn_key_count already includes the 8/12/18 attention keys;
+            # +1 for the sibling attn_norm from the attention converter,
+            # +1 for ffn_norm added here, +7 for the MLP subtree.
+            "total_layer_key_count": attn_key_count + 1 + 1 + mlp_key_count,
+        }
+
+    # ---- dropped-tensor bookkeeping ----
+    for key in state_dict.keys():
         if is_mtp_key(key):
             dropped_mtp.append(key)
         elif is_dspark_key(key):
             dropped_dspark.append(key)
 
+    # Sanity: converted keys should be exactly 1024 for the full-shape
+    # frozen schedule (3 top-level + 1021 per-layer).  A caller running
+    # on `allow_reduced_shapes=True` fixtures skips this check.
+    non_report_keys = [
+        k for k in converted.keys() if not k.startswith("_")
+    ]
+    if not getattr(src, "allow_reduced_shapes", False):
+        expected_total = 3 + sum(
+            r["total_layer_key_count"] for r in per_layer_report.values()
+        )
+        if len(non_report_keys) != expected_total:
+            raise RuntimeError(
+                f"converted wrapper-tree key count {len(non_report_keys)} "
+                f"disagrees with expected {expected_total} — per-layer "
+                "helper leaked or duplicated a key."
+            )
+
     converted["_conversion_report"] = {
         "input_tensor_count": len(state_dict),
         "expected_input_tensor_count": EXPECTED_HF_TENSOR_COUNT,
-        "converted_tensor_count": len(converted) - 1,
+        "converted_tensor_count": len(non_report_keys),
         "dropped_mtp_tensors": len(dropped_mtp),
         "dropped_dspark_tensors": len(dropped_dspark),
         "block_size": block_size,
         "hf_snapshot_sha": HF_SNAPSHOT_SHA,
         "tp_degree": tp_degree,
         "mtp_layer_excluded_from": src.num_hidden_layers,
+        "per_layer_report": per_layer_report,
     }
     return converted
 
@@ -1603,6 +1692,7 @@ __all__ = [
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
     "EXPECTED_HF_TOTAL_SIZE_BYTES",
+    "FFN_NORM_KEY",
     "FFN_PREFIX",
     "FINAL_NORM_KEY",
     "HASH_TID2EID_KEY",
