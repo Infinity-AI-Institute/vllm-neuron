@@ -1279,6 +1279,17 @@ class _HCABlock(nn.Module):
     block_bias).
     """
 
+    # State-dict spelling under this module.  Round 8: promoted to a
+    # class attribute so the per-layer dispatch loop can enumerate the
+    # HCA block's owned params without instantiating it:
+    #   * 8 MQA params under `mqa.*`
+    #   * 4 HCA compressor params under `compressor.*`
+    #   * 12 total
+    PARAM_KEYS: tuple[str, ...] = (
+        tuple(f"mqa.{k}" for k in _MQABlock.PARAM_KEYS)
+        + tuple(f"compressor.{k}" for k in _HCACompressor.PARAM_KEYS)
+    )
+
     def __init__(
         self,
         config: Any,
@@ -1925,6 +1936,23 @@ class _CSABlock(nn.Module):
         ``layers.<i>.attn_norm.weight`` owned at the decoder-layer level).
     """
 
+    # State-dict spelling under this module.  Round 8: promoted to a
+    # class attribute so the per-layer dispatch loop can enumerate the
+    # CSA block's owned params without instantiating it:
+    #   * 8 MQA params under `mqa.*`
+    #   * 4 CSA compressor params under `compressor.*`
+    #   * 4 indexer inner-compressor params under `indexer.compressor.*`
+    #   * 2 indexer projection params under `indexer.*`
+    #   * 18 total
+    PARAM_KEYS: tuple[str, ...] = (
+        tuple(f"mqa.{k}" for k in _MQABlock.PARAM_KEYS)
+        + tuple(f"compressor.{k}" for k in _CSAOverlapCompressor.PARAM_KEYS)
+        + tuple(
+            f"indexer.compressor.{k}" for k in _CSAOverlapCompressor.PARAM_KEYS
+        )
+        + ("indexer.wq_b.weight", "indexer.weights_proj.weight")
+    )
+
     def __init__(
         self,
         config: Any,
@@ -2240,6 +2268,14 @@ class _SlidingOnlyAttentionBlock(nn.Module):
         level — NOT owned by this block, same convention as _HCABlock
         and _CSABlock.)
     """
+
+    # State-dict spelling under this module.  Round 8: promoted to a
+    # class attribute so the per-layer dispatch loop can enumerate the
+    # sliding-only block's owned params without instantiating it (the
+    # 8 MQA params under `mqa.*`, no compressor, no indexer).
+    PARAM_KEYS: tuple[str, ...] = tuple(
+        f"mqa.{k}" for k in _MQABlock.PARAM_KEYS
+    )
 
     def __init__(self, config: Any, *, layer_idx: int) -> None:
         super().__init__()
@@ -2926,25 +2962,13 @@ if _NXDI_AVAILABLE:
                 ) from exc
             return x
 
-    class _HashMoEBlock(nn.Module):
-        """Hash-MoE bootstrap for layers 0..num_hash_layers-1 (paper §2.1).
-
-        Frozen ``tid2eid[input_ids]`` lookup selects experts; learned gate
-        weights weight the selected experts.  Requires the input-id side
-        channel through the decoder forward — NxDI's stock
-        ``DecoderModelInstance.forward`` hands each layer only the hidden
-        state, so ``input_ids`` must be threaded via a second graph input
-        that survives lowering.
-        """
-
-        def __init__(self, config: Any, *, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_idx = layer_idx
-            self._config = config
-            raise NotImplementedError(
-                "_HashMoEBlock is Round 2.  Blocker for first NEFF fire: input-id "
-                "side channel through decoder forward (see enablement-draft §3-6)."
-            )
+    # Round 8: the CPU-portable `_HashMoEBlock` at module level (see
+    # class definition around line 2566) is the real Round-7 landed
+    # block — the earlier NxDI-only Round-2 stub that raised
+    # NotImplementedError has been removed.  Python's `if` does not
+    # introduce a new scope, so the module-level class is visible here
+    # and gets picked up by `DeepseekV4FlashLayer` when it dispatches on
+    # `mlp_layer_types[i] == "hash_moe"`.
 
     class _MoESharedExpert(nn.Module):
         """Shared-expert branch of the DSv4-Flash sparse MoE.
@@ -3035,6 +3059,22 @@ if _NXDI_AVAILABLE:
           * ``logical_nc_config=2`` (LNC=1 raises
             ``"LNC_1 kernels not available in nkilib"``).
         """
+
+        # State-dict spelling under this module.  Round 8: promoted to a
+        # class attribute so the per-layer dispatch loop can enumerate the
+        # routed-MoE block's owned params without instantiating it.  Same
+        # 7-key layout as `_HashMoEBlock` with `e_score_correction_bias`
+        # replacing `tid2eid` (the only structural difference at the
+        # state-dict level between the two MoE families in this port).
+        PARAM_KEYS: tuple[str, ...] = (
+            "router.weight",
+            "e_score_correction_bias",
+            "shared_expert.gate_proj.weight",
+            "shared_expert.up_proj.weight",
+            "shared_expert.down_proj.weight",
+            "expert_mlps.mlp_op.gate_up_proj.weight",
+            "expert_mlps.mlp_op.down_proj.weight",
+        )
 
         def __init__(
             self,
@@ -3172,31 +3212,551 @@ if _NXDI_AVAILABLE:
     # Backwards-compat alias so existing references keep resolving.
     _MoEBlock = _RoutedMoEBlock
 
-    class _NeuronDeepseekV4FlashModel(NeuronBaseModel):
-        """NxDI base model — Round-1 skeleton, forward stubbed."""
+    def _rms_norm_weight(hidden: int, dtype: torch.dtype) -> nn.Parameter:
+        """Round 8: a plain replicated RMSNorm gain declared as an
+        `nn.Parameter`.  Small (`[hidden_size]`), so we do not TP-shard
+        it; every rank holds the same tensor.  Same convention GLM-5.3
+        Flash uses at ``glm53_flash/neuron_wrapper.py::_rms_norm_weight``.
+        """
+        return nn.Parameter(torch.ones(hidden, dtype=dtype), requires_grad=False)
 
-        def init_model(self, config: DeepseekV4FlashNeuronInferenceConfig) -> None:
-            raise NotImplementedError(
-                "DeepSeek-V4-Flash init_model is Round 2.  Blockers listed in "
-                "the enablement draft ENABLEMENT-DRAFT-2026-08-28.md §3."
+    class DeepseekV4FlashLayer(nn.Module):
+        """One DeepSeek-V4-Flash decoder layer with per-layer dispatch.
+
+        Round 8: composes the 6 landed block classes into the per-layer
+        schedule pinned by
+        ``DeepseekV4FlashInferenceConfig.layer_types[layer_idx]`` and
+        ``mlp_layer_types[layer_idx]``.  Owns two RMSNorm gains
+        (``attn_norm.weight`` / ``ffn_norm.weight``) at the decoder-layer
+        level, mirroring the HF state-dict spelling verbatim.  The block
+        class dispatched to is one of:
+
+          * attention: ``_SlidingOnlyAttentionBlock`` (layer_type
+            "sliding_attention") / ``_CSABlock``
+            ("compressed_sparse_attention") / ``_HCABlock``
+            ("heavily_compressed_attention").
+          * MLP: ``_HashMoEBlock`` (mlp_layer_type "hash_moe", layers
+            0..num_hash_layers-1) / ``_RoutedMoEBlock`` (mlp_layer_type
+            "moe", every other layer).
+
+        Wrapper-tree keys per layer (nested naming via block-class
+        ``PARAM_KEYS``):
+
+          Sliding attn:  8 (``attn.mqa.*``)
+          HCA attn:     12 (8 + 4 ``attn.compressor.*``)
+          CSA attn:     18 (8 + 4 + 4 + 2 indexer projs)
+          Hash-MoE:      7 (``mlp.router.weight``, ``mlp.tid2eid``,
+                             3 shared_expert, 2 stacked-expert leaves)
+          Routed MoE:    7 (same layout, ``mlp.e_score_correction_bias``
+                             replacing ``mlp.tid2eid``)
+          Plus per layer: 2 (``attn_norm.weight``, ``ffn_norm.weight``).
+
+        Full total (43 layers, per the frozen schedule):
+          * 2 sliding + hash_moe  →  2 × (8 + 7 + 2) = 34
+          * 1 CSA + hash_moe      →  1 × (18 + 7 + 2) = 27
+          * 20 CSA + routed_moe   → 20 × (18 + 7 + 2) = 540
+          * 20 HCA + routed_moe   → 20 × (12 + 7 + 2) = 420
+          Sum per-layer =         1021
+
+        Plus 3 top-level (embed_tokens, final_norm, lm_head) = 1024
+        wrapper-tree parameter names on the full compile.
+
+        ``input_ids`` is threaded here as a real graph input (see the
+        module-level docstring above ``_HashMoEBlock``).  Hash-MoE
+        layers route each token to ``tid2eid[input_ids]``; routed-MoE
+        layers ignore it.  This is a real graph input, NOT a Python
+        attribute stash — an attribute stash would not survive
+        ``torch.export``/``torch_xla`` lowering.
+        """
+
+        def __init__(
+            self,
+            config: DeepseekV4FlashNeuronInferenceConfig,
+            *,
+            layer_idx: int,
+        ) -> None:
+            super().__init__()
+            src = getattr(config, "source_config", None)
+            if src is None:
+                raise RuntimeError(
+                    "DeepseekV4FlashLayer requires config.source_config to "
+                    "carry the frozen DeepseekV4FlashInferenceConfig."
+                )
+            self.layer_idx = int(layer_idx)
+            self.rms_eps = float(src.rms_norm_eps)
+            dtype = config.neuron_config.torch_dtype
+
+            # Per-layer RMSNorm gains at the decoder-layer level.  HF
+            # spellings verbatim: `layers.<i>.attn_norm.weight` and
+            # `layers.<i>.ffn_norm.weight` (see the DSv4-Flash HF
+            # snapshot's `model.safetensors.index.json`).
+            self.attn_norm = _MQANormParam(src.hidden_size, dtype)
+            self.ffn_norm = _MQANormParam(src.hidden_size, dtype)
+
+            layer_type = src.layer_types[layer_idx]
+            if layer_type == "sliding_attention":
+                self.attn_kind = "sliding"
+                self.attn = _SlidingOnlyAttentionBlock(
+                    config, layer_idx=layer_idx
+                )
+            elif layer_type == "compressed_sparse_attention":
+                self.attn_kind = "csa"
+                self.attn = _CSABlock(config, layer_idx=layer_idx)
+            elif layer_type == "heavily_compressed_attention":
+                self.attn_kind = "hca"
+                self.attn = _HCABlock(config, layer_idx=layer_idx)
+            else:
+                # No default catch-all — every layer_type MUST match one
+                # of the three families above.  A silent fallthrough
+                # would compose the wrong block class for a novel
+                # layer_type string.
+                raise ValueError(
+                    f"unsupported layer_type {layer_type!r} at index "
+                    f"{layer_idx} — refusing to dispatch a layer "
+                    "family the wrapper has not qualified."
+                )
+
+            mlp_type = src.mlp_layer_types[layer_idx]
+            if mlp_type == "hash_moe":
+                self.mlp_kind = "hash_moe"
+                self.mlp = _HashMoEBlock(config, layer_idx=layer_idx)
+            elif mlp_type == "moe":
+                self.mlp_kind = "moe"
+                self.mlp = _RoutedMoEBlock(config, layer_idx=layer_idx)
+            else:
+                raise ValueError(
+                    f"unsupported mlp_type {mlp_type!r} at index "
+                    f"{layer_idx} — refusing to dispatch an MLP family "
+                    "the wrapper has not qualified."
+                )
+
+        def state_cache_specs(
+            self, batch: int, seq_len: int
+        ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+            """Aliased state this layer's attention block owns.
+
+            CSA layers own 4 aliased pairs (compressor Ca/gate at
+            ``head_dim=512`` + indexer Ca/gate at ``index_head_dim=128``);
+            HCA and sliding-only layers own no aliased state.  Same
+            per-layer alias-list convention GLM-5.3-Flash Round 4 uses
+            (see ``glm53_flash/neuron_wrapper.py::Glm53FlashLayer``).
+            """
+            if hasattr(self.attn, "state_cache_specs"):
+                return list(self.attn.state_cache_specs(batch, seq_len))
+            return []
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,        # [B, S, hidden]
+            position_ids: torch.Tensor,          # [B, S]
+            caches: tuple[torch.Tensor, ...],    # this layer's aliased slice
+            input_ids: torch.Tensor,             # [B, S] — hash-MoE side channel
+            *,
+            cos_main: torch.Tensor,
+            sin_main: torch.Tensor,
+            cos_compress: torch.Tensor,
+            sin_compress: torch.Tensor,
+            cos_win: torch.Tensor,
+            sin_win: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+            """One decoder-layer body: pre-attn norm → dispatched attn →
+            residual → pre-mlp norm → dispatched mlp → residual.
+
+            ``caches`` is this layer's slice of the model's aliased
+            parameter list — an empty tuple for sliding/HCA, 4 tensors
+            for CSA (compressor Ca/gate + indexer Ca/gate).  The second
+            return value is the updated slice, in the same order.  The
+            model returns them all after the logits so NxDI's
+            ``input_output_aliases`` map turns each into an on-device
+            read-modify-write.
+
+            ``input_ids`` is threaded here as a real graph input; it is
+            routed only to hash-MoE MLPs (layers 0..num_hash_layers-1),
+            routed-MoE MLPs ignore it.  This is the load-bearing
+            input-id side channel discussed in the module-level
+            docstring above ``_HashMoEBlock``.
+            """
+            # 1. Pre-attention norm.
+            norm_a = _weighted_rms_norm(
+                hidden_states, self.attn_norm.weight, self.rms_eps
+            )
+
+            # 2. Dispatched attention forward.
+            new_caches: tuple[torch.Tensor, ...]
+            if self.attn_kind == "sliding":
+                attn_out = self.attn(
+                    norm_a,
+                    cos_main,
+                    sin_main,
+                    position_ids,
+                    attention_mask=attention_mask,
+                )
+                new_caches = ()
+            elif self.attn_kind == "hca":
+                attn_out = self.attn(
+                    norm_a,
+                    cos_compress,
+                    sin_compress,
+                    cos_win,
+                    sin_win,
+                    position_ids,
+                    attention_mask=attention_mask,
+                )
+                new_caches = ()
+            elif self.attn_kind == "csa":
+                # Pack the four aliased tensors back into the dict the
+                # CSA block's forward expects.  Order matches
+                # `_CSABlock.state_cache_specs`.
+                names = (
+                    "compressor_overlap_kv",
+                    "compressor_overlap_gate",
+                    "indexer_overlap_kv",
+                    "indexer_overlap_gate",
+                )
+                if len(caches) != len(names):
+                    raise RuntimeError(
+                        f"CSA layer {self.layer_idx} received "
+                        f"{len(caches)} aliased state tensors but expects "
+                        f"{len(names)} (order: {names})."
+                    )
+                overlap_in: dict[str, torch.Tensor | None] = dict(
+                    zip(names, caches)
+                )
+                attn_out, new_state = self.attn(
+                    norm_a,
+                    cos_compress,
+                    sin_compress,
+                    cos_win,
+                    sin_win,
+                    position_ids,
+                    attention_mask=attention_mask,
+                    overlap_state=overlap_in,
+                )
+                new_caches = tuple(new_state[name] for name in names)
+            else:  # pragma: no cover - guarded at __init__
+                raise RuntimeError(
+                    f"unreachable attn_kind {self.attn_kind!r}"
+                )
+
+            # 3. Residual add + pre-MLP norm.
+            hidden_states = hidden_states + attn_out.to(hidden_states.dtype)
+            norm_m = _weighted_rms_norm(
+                hidden_states, self.ffn_norm.weight, self.rms_eps
+            )
+
+            # 4. Dispatched MLP forward.  Hash-MoE reads input_ids as
+            # its second positional arg; routed-MoE does not accept
+            # input_ids and would raise TypeError if we passed it.
+            if self.mlp_kind == "hash_moe":
+                mlp_out = self.mlp(norm_m, input_ids)
+            else:
+                mlp_out = self.mlp(norm_m)
+
+            hidden_states = hidden_states + mlp_out.to(hidden_states.dtype)
+            return hidden_states, new_caches
+
+    class _NeuronDeepseekV4FlashModel(NeuronBaseModel):
+        """Real per-layer NxDI-primitive DeepSeek-V4-Flash graph.
+
+        Round 8: replaces the Round-1 stub with
+        ``ParallelEmbedding + 43 x DeepseekV4FlashLayer + norm +
+        ColumnParallelLinear LM head``.  Layer dispatch honours
+        ``src.layer_types`` and ``src.mlp_layer_types`` per the frozen
+        DSv4-Flash schedule (see
+        ``config.py::_DSV4_LAYER_TYPES``).  Every layer's state cache
+        contribution is aggregated in ``init_inference_optimization``.
+
+        forward() thread contract: NxDI hands us
+        ``(input_ids, attention_mask, position_ids, seq_ids,
+        sampling_params, *tail, **kwargs)``; we pass ``input_ids`` down
+        into each layer's forward as the real graph input the hash-MoE
+        block reads (see the module-level docstring above
+        ``_HashMoEBlock``).  ``torch.export`` traces the same
+        positional-arg contract as GLM-5.3-Flash Round 4.
+        """
+
+        def setup_attr_for_model(self, config: Any) -> None:
+            self.on_device_sampling = (
+                config.neuron_config.on_device_sampling_config is not None
+            )
+            self.tp_degree = config.neuron_config.tp_degree
+            self.hidden_size = config.hidden_size
+            self.num_attention_heads = config.num_attention_heads
+            self.num_key_value_heads = config.num_key_value_heads
+            self.max_batch_size = config.neuron_config.max_batch_size
+            self.buckets = config.neuron_config.buckets
+
+        def init_model(
+            self, config: DeepseekV4FlashNeuronInferenceConfig
+        ) -> None:
+            src = getattr(config, "source_config", None)
+            if src is None:
+                raise RuntimeError(
+                    "_NeuronDeepseekV4FlashModel requires config."
+                    "source_config to be a DeepseekV4FlashInferenceConfig."
+                )
+            self.padding_idx = getattr(config, "pad_token_id", 0) or 0
+            self.vocab_size = int(config.vocab_size)
+            self.num_hidden_layers = int(src.num_hidden_layers)
+            self.rope_theta = float(src.rope_theta)
+            self.compress_rope_theta = float(src.compress_rope_theta)
+            self.qk_rope_head_dim = int(src.qk_rope_head_dim)
+            self.sliding_window = int(src.sliding_window)
+            self.rms_eps = float(src.rms_norm_eps)
+            self.layer_types = tuple(src.layer_types)
+            self.mlp_layer_types = tuple(src.mlp_layer_types)
+            self.embed_tokens = _NxdParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                self.padding_idx,
+                dtype=config.neuron_config.torch_dtype,
+                shard_across_embedding=True,
+                pad=True,
+                sequence_parallel_enabled=(
+                    config.neuron_config.sequence_parallel_enabled
+                ),
+            )
+            # Real per-layer schedule — 43 dispatched blocks, no
+            # fallthrough or default-catch.
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekV4FlashLayer(config, layer_idx=layer_idx)
+                    for layer_idx in range(self.num_hidden_layers)
+                ]
+            )
+            self.final_norm_weight = _rms_norm_weight(
+                config.hidden_size, config.neuron_config.torch_dtype
+            )
+            self.lm_head = _NxdColumnParallelLinear(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                pad=True,
+                gather_output=not self.on_device_sampling,
+                dtype=config.neuron_config.torch_dtype,
             )
 
         def init_inference_optimization(
             self, config: DeepseekV4FlashNeuronInferenceConfig
         ) -> None:
-            # Deliberately empty — this wrapper does NOT use NxDI's
-            # KVCacheManager (see FORBIDDEN_FP8_KV_KEYS docstring).  Round 2
-            # lands the per-attention-type state cache here.
+            """Replace NxDI's KV-cache manager with DSv4-Flash's
+            per-attention-type state cache.
+
+            Only CSA layers own state (4 aliased pairs each — compressor
+            Ca/gate at ``head_dim=512`` and indexer Ca/gate at
+            ``index_head_dim=128``); HCA / sliding-only layers own no
+            cache buffer at all.  Mirrors ``glm53_flash/neuron_wrapper.py``'s
+            Round 4 ``init_inference_optimization`` verbatim.
+            """
+            super().init_inference_optimization(config)
+            neuron_config = config.neuron_config
+            if getattr(neuron_config, "is_prefix_caching", False):
+                raise NotImplementedError(
+                    "DSv4-Flash state aliasing assumes a context-encoding "
+                    "graph starts a fresh sequence at position 0. Prefix "
+                    "caching breaks that assumption; refusing rather than "
+                    "writing the CSA compressor overlap state at the wrong "
+                    "offsets."
+                )
+            if getattr(neuron_config, "is_block_kv_layout", False):
+                raise NotImplementedError(
+                    "DSv4-Flash does not implement a paged/block KV layout; "
+                    "its CSA overlap state is per-slot and not per-block."
+                )
             self.kv_mgr = None
 
-    class NeuronDeepseekV4FlashForCausalLM(NeuronBaseForCausalLM):
-        """Public NxDI wrapper class.
+            batch = int(
+                getattr(neuron_config, "kv_cache_batch_size", None)
+                or neuron_config.max_batch_size
+            )
+            seq_len = int(neuron_config.seq_len)
+            self.state_cache_batch = batch
+            self.state_cache_seq_len = seq_len
 
-        Round 1: init raises NotImplementedError.  Round 2 wires the
-        block scaffold above through ``_NeuronDeepseekV4FlashModel``.
+            specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+            self.layer_cache_slices: list[tuple[int, int]] = []
+            for layer_idx, layer in enumerate(self.layers):
+                layer_specs = layer.state_cache_specs(batch, seq_len)
+                start = len(specs)
+                specs.extend(
+                    (f"layer{layer_idx}.{name}", shape, dtype)
+                    for name, shape, dtype in layer_specs
+                )
+                self.layer_cache_slices.append((start, len(specs)))
+            self.state_cache_names = [name for name, _, _ in specs]
+            self.past_key_values = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.zeros(shape, dtype=dtype), requires_grad=False
+                    )
+                    for _, shape, dtype in specs
+                ]
+            )
+
+        def forward(
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            seq_ids: torch.Tensor | None = None,
+            sampling_params: torch.Tensor | None = None,
+            *args: Any,
+            **kwargs: Any,
+        ) -> torch.Tensor:
+            """Match ``NeuronBaseModel.forward``'s positional contract.
+
+            NxDI's tracer calls the model with its full positional input
+            list (input_ids, attention_mask, position_ids, seq_ids,
+            sampling_params, then a long optional tail).  Trailing
+            ``*args`` absorbs the optional tail (slot_mapping, block
+            tables, tile indices, …) that this graph does not consume.
+
+            Round 8: embed → 43 dispatched-layer bodies → final RMSNorm
+            → LM head.  Every layer receives ``input_ids`` as a real
+            graph input (see the module-level docstring above
+            ``_HashMoEBlock``), and CSA layers additionally receive
+            their aliased overlap-state slice.  The RoPE tables and
+            attention mask are pre-computed at model level and handed
+            to each layer.
+            """
+            hidden_states = self.embed_tokens(input_ids)
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+            batch, length, _ = hidden_states.shape
+            if position_ids is None:
+                position_ids = torch.arange(
+                    length, dtype=torch.int64, device=hidden_states.device
+                ).unsqueeze(0).expand(batch, -1)
+            if position_ids.ndim == 1:
+                position_ids = position_ids.expand(batch, -1)
+            position_ids = position_ids.to(torch.int64)
+            # Normalise input_ids shape so hash-MoE layers see [B, L]
+            # parallel to hidden_states.
+            input_ids_2d = input_ids
+            if input_ids_2d.ndim == 1:
+                input_ids_2d = input_ids_2d.unsqueeze(0)
+            if input_ids_2d.shape != (batch, length):
+                input_ids_2d = input_ids_2d.reshape(batch, length)
+
+            # RoPE tables — pre-compute at model level.  Sliding layers
+            # read `main`; CSA/HCA layers read `compress`.  `cos_win /
+            # sin_win` are window-position RoPE for the CSA/HCA
+            # compressor's own K rotation (paper §2.3.1/2).
+            cos_main, sin_main = build_main_rope_cos_sin(
+                position_ids,
+                rope_dim=self.qk_rope_head_dim,
+                rope_theta=self.rope_theta,
+                dtype=hidden_states.dtype,
+            )
+            cos_compress, sin_compress = build_main_rope_cos_sin(
+                position_ids,
+                rope_dim=self.qk_rope_head_dim,
+                rope_theta=self.compress_rope_theta,
+                dtype=hidden_states.dtype,
+            )
+            # Window-position rope for the compressor's internal K
+            # rotation.  Window index n at compress_rate `c` corresponds
+            # to source position `n * c`.  Both CSA (c=4) and HCA
+            # (c=128) share the same compress_rope_theta; the two
+            # families need distinct window tables because CSA emits
+            # `S // 4` windows while HCA emits `S // 128`.
+            hca_compress_rate = 128
+            n_windows_hca = max(length // hca_compress_rate, 1)
+            win_positions_hca = (
+                torch.arange(
+                    n_windows_hca,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                ).unsqueeze(0).expand(batch, -1)
+                * hca_compress_rate
+            )
+            cos_win_hca, sin_win_hca = build_main_rope_cos_sin(
+                win_positions_hca,
+                rope_dim=self.qk_rope_head_dim,
+                rope_theta=self.compress_rope_theta,
+                dtype=hidden_states.dtype,
+            )
+            csa_compress_rate = 4
+            n_windows_csa = max(length // csa_compress_rate, 1)
+            win_positions_csa = (
+                torch.arange(
+                    n_windows_csa,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                ).unsqueeze(0).expand(batch, -1)
+                * csa_compress_rate
+            )
+            cos_win_csa, sin_win_csa = build_main_rope_cos_sin(
+                win_positions_csa,
+                rope_dim=self.qk_rope_head_dim,
+                rope_theta=self.compress_rope_theta,
+                dtype=hidden_states.dtype,
+            )
+
+            # Aliased state in, updated state out — one slice per layer.
+            caches_in = list(self.past_key_values)
+            caches_out: list[torch.Tensor] = []
+            for layer_idx, layer in enumerate(self.layers):
+                start, stop = self.layer_cache_slices[layer_idx]
+                if layer.attn_kind == "csa":
+                    cos_win_i, sin_win_i = cos_win_csa, sin_win_csa
+                else:
+                    cos_win_i, sin_win_i = cos_win_hca, sin_win_hca
+                hidden_states, updated = layer(
+                    hidden_states,
+                    position_ids,
+                    tuple(caches_in[start:stop]),
+                    input_ids_2d,
+                    cos_main=cos_main,
+                    sin_main=sin_main,
+                    cos_compress=cos_compress,
+                    sin_compress=sin_compress,
+                    cos_win=cos_win_i,
+                    sin_win=sin_win_i,
+                    attention_mask=attention_mask,
+                )
+                if len(updated) != stop - start:
+                    raise RuntimeError(
+                        f"layer {layer_idx} returned {len(updated)} state "
+                        f"tensors but declared {stop - start}; the alias "
+                        "list and the output list must agree exactly or "
+                        "lowering aborts with 'parameter not found in "
+                        "lowering context'."
+                    )
+                caches_out.extend(updated)
+
+            hidden_states = _weighted_rms_norm(
+                hidden_states, self.final_norm_weight, self.rms_eps
+            )
+            logits = self.lm_head(hidden_states)
+
+            # State-alias contract inherited from GLM-5.3-Flash Round 4.
+            expected = len(self.past_key_values)
+            if len(caches_out) != expected:
+                raise RuntimeError(
+                    f"forward produced {len(caches_out)} state outputs "
+                    f"but {expected} parameters are aliased; NxDI maps "
+                    "alias i to output index num_output_from_trace + i, "
+                    "so the lists must be the same length and in the "
+                    "same order."
+                )
+            if expected:
+                return [logits] + caches_out
+            return logits
+
+    class NeuronDeepseekV4FlashForCausalLM(NeuronBaseForCausalLM):
+        """Public NxDI-compatible DeepSeek-V4-Flash class.
+
+        Round 8: full per-layer schedule + input-id side channel.  The
+        block scaffold ships through ``_NeuronDeepseekV4FlashModel``.
         """
 
         _model_cls = _NeuronDeepseekV4FlashModel
+
+        @classmethod
+        def get_config_cls(cls):
+            return DeepseekV4FlashNeuronInferenceConfig
 
         @classmethod
         def from_configs(
@@ -3221,6 +3781,7 @@ else:  # pragma: no cover - CPU-only guard
 __all__ = [
     "DSV4_BLOCKWISE_MATMUL_WORKAROUND",
     "DSV4_ROUTED_SCORING_FUNC",
+    "DeepseekV4FlashLayer",
     "DeepseekV4FlashNeuronInferenceConfig",
     "FORBIDDEN_FP8_KV_KEYS",
     "NeuronDeepseekV4FlashForCausalLM",
