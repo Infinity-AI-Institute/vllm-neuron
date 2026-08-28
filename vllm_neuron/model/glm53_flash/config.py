@@ -191,22 +191,46 @@ class Glm53FlashInferenceConfig:
             validate_fp8_scale(float(getattr(self, name)), name)
 
     def _validate_architecture(self) -> None:
-        if self.num_hidden_layers != 45:
-            raise ValueError("GLM-5.3-Flash requires exactly 45 text layers")
+        # Layer-stack invariants are shape-dependent, so they are exactly the
+        # ones `allow_reduced_shapes` is meant to relax for the 1-layer compile
+        # smoke.  Round 2 gated only the `frozen` dict below, which left
+        # `build_one_layer_smoke_config` unable to construct: it sets
+        # num_hidden_layers=1 and a 1-entry layer_types, both of which tripped
+        # here before `allow_reduced_shapes` was ever consulted.
+        if not self.allow_reduced_shapes:
+            if self.num_hidden_layers != 45:
+                raise ValueError("GLM-5.3-Flash requires exactly 45 text layers")
+            if self.layer_types != GLM53_LAYER_TYPES:
+                raise ValueError("layer_types must encode DSA at [3,7,...,43]")
+            if self.linear_attn_config.kda_layers != KDA_LAYER_INDICES:
+                raise ValueError(
+                    "linear_attn_config.kda_layers disagrees with layer_types"
+                )
+            if self.linear_attn_config.full_attn_layers != DSA_LAYER_INDICES:
+                raise ValueError(
+                    "linear_attn_config.full_attn_layers disagrees with layer_types"
+                )
+            if self.mlp_layer_types != GLM53_MLP_LAYER_TYPES:
+                raise ValueError("layers 0-2 must be dense and layers 3-44 MoE")
+        else:
+            # Reduced shapes still have to be self-consistent — a mismatched
+            # stack would trace a graph that silently isn't the model.
+            if len(self.layer_types) != self.num_hidden_layers:
+                raise ValueError(
+                    f"layer_types has {len(self.layer_types)} entries but "
+                    f"num_hidden_layers={self.num_hidden_layers}"
+                )
+            if len(self.mlp_layer_types) != self.num_hidden_layers:
+                raise ValueError(
+                    f"mlp_layer_types has {len(self.mlp_layer_types)} entries "
+                    f"but num_hidden_layers={self.num_hidden_layers}"
+                )
+        # Per-head / per-mechanism invariants are shape-independent and hold
+        # even for a reduced stack.
         if self.qk_head_dim != 256 or self.qk_nope_head_dim != 256:
             raise ValueError("GLM-5.3-Flash requires qk/nope head dim 256")
         if self.qk_rope_head_dim != 0:
             raise ValueError("GLM-5.3-Flash MLA is All-NoPE (rope head dim 0)")
-        if self.layer_types != GLM53_LAYER_TYPES:
-            raise ValueError("layer_types must encode DSA at [3,7,...,43]")
-        if self.linear_attn_config.kda_layers != KDA_LAYER_INDICES:
-            raise ValueError("linear_attn_config.kda_layers disagrees with layer_types")
-        if self.linear_attn_config.full_attn_layers != DSA_LAYER_INDICES:
-            raise ValueError(
-                "linear_attn_config.full_attn_layers disagrees with layer_types"
-            )
-        if self.mlp_layer_types != GLM53_MLP_LAYER_TYPES:
-            raise ValueError("layers 0-2 must be dense and layers 3-44 MoE")
         if self.index_kpool != 4 or not self.index_kpool_always_select_tail:
             raise ValueError("GLM-5.3-Flash requires IndexPool=4 and tail selection")
         if not self.index_kpool_compress:

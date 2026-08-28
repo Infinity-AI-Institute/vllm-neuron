@@ -36,14 +36,19 @@ from .moe import MOE_KERNEL_SLUG
 #   state, DSA sparse-attn, blockwise MoE.  The Round-2 forward for those
 #   kernel-dependent ops raises NotImplementedError until Round 3 binds NKI.
 GLM53_SOURCE_CACHE_ABI = (
-    "glm53-flash-round2-nxdi-primitives-v1"
+    "glm53-flash-round3-nki-bound-v1"
     f"|dsa={DSA_KERNEL_SLUG}"
     f"|kda={KDA_KERNEL_SLUG}"
     f"|moe={MOE_KERNEL_SLUG}"
     "|qk=256|nope=256|rope=0|index-kpool=4|layers=45"
     "|hc-mult=4|routed-experts=288|top-k=8|shared-experts=1"
+    # Round-3 sharding contract is part of the cache identity: the routed
+    # expert slabs and the KDA short-conv moved from replicated-full-width to
+    # rank-local, and the DSA index-K side moved to gather_output=True. A
+    # Round-2 artifact is NOT reusable under these shapes.
+    "|moe-shard=intermediate|kda-conv=rank-local|dsa-indexk=replicated"
 )
-_GLM53_GRAPH_ID = "glm53-flash-nkiv0-refs-round2-v1"
+_GLM53_GRAPH_ID = "glm53-flash-nkiv0-bound-round3-v1"
 
 
 def get_models() -> list[tuple[str, type]]:

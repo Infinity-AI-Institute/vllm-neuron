@@ -78,8 +78,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .checkpoint_convert import _convert_glm53_checkpoint
 from .config import Glm53FlashInferenceConfig
 from .model import NeuronGlm53FlashForCausalLMImpl
+from .nki_bindings import (
+    DSA_KERNEL_SLUG_V0,
+    KDA_KERNEL_SLUG_V2,
+    MOE_KERNEL_SLUG_V1,
+    build_glm53_moe_dispatch_config,
+    dsa_attend_from_scores,
+    dsa_scores_from_qidx,
+    glm53_route,
+    kda_state_forward_torch,
+    moe_gather_dispatch_torch,
+)
 from .registry import GLM53_SOURCE_CACHE_ABI, _GLM53_GRAPH_ID
 
 logger = logging.getLogger(__name__)
@@ -264,6 +276,66 @@ if _NXDI_AVAILABLE:
         value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
         return (value * weight.to(torch.float32)).to(x.dtype)
 
+    def _tp_rank() -> int:
+        """Trace-time TP rank.
+
+        NxDI traces one graph per rank, so this is a Python constant at trace
+        time and folds into the graph.  Small replicated parameters that the
+        checkpoint stores full-width (``A_log``, ``dt_bias``, the DSA
+        ``q_proj`` index-head cube) are sliced with it so each rank's
+        recurrence uses the heads its Q/K/V column-parallel shard produced.
+
+        Returns 0 when the parallel state is not initialised (single-rank CPU
+        import, unit tests) — the slice then degenerates to the full tensor.
+        """
+        try:
+            from neuronx_distributed.parallel_layers.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            return int(get_tensor_model_parallel_rank())
+        except Exception:  # pragma: no cover - single-rank / uninitialised
+            return 0
+
+    def _reduce_from_tp_region(x: torch.Tensor) -> torch.Tensor:
+        """All-reduce a partial contraction across the TP group.
+
+        Used by the DSA indexer, whose query-side projection contracts over
+        the sharded main-attention head axis.  Without the reduce each rank
+        would score positions from only its own head shard and select a
+        different sparse set — a silent correctness bug that would look like
+        mild quality loss rather than a crash, which is exactly the failure
+        mode this campaign refuses to ship.
+
+        Raises when the TP group is real but the primitive is unavailable;
+        a no-op reduce at TP>1 would be that silent bug.
+        """
+        try:
+            from neuronx_distributed.parallel_layers.mappings import (
+                reduce_from_tensor_model_parallel_region,
+            )
+
+            return reduce_from_tensor_model_parallel_region(x)
+        except Exception as exc:
+            from neuronx_distributed.parallel_layers.parallel_state import (
+                get_tensor_model_parallel_size,
+            )
+
+            try:
+                world = int(get_tensor_model_parallel_size())
+            except Exception:
+                world = 1
+            if world > 1:
+                raise RuntimeError(
+                    "GLM-5.3-Flash DSA indexer needs a TP all-reduce on the "
+                    f"query projection at tp_degree={world}, but NxD's "
+                    "`reduce_from_tensor_model_parallel_region` is "
+                    f"unavailable: {exc!r}. Refusing to run a per-rank "
+                    "partial top-k, which would silently select different "
+                    "sparse positions on every rank."
+                ) from exc
+            return x
+
     class _NoPeMLABlock(nn.Module):
         """All-NoPE MLA projections lowered to NxDI parallel primitives.
 
@@ -419,17 +491,32 @@ if _NXDI_AVAILABLE:
             self.qk_head_dim = src.qk_head_dim
             dtype = config.neuron_config.torch_dtype
             tp_degree = config.neuron_config.tp_degree
-            if self.index_n_heads % tp_degree:
-                raise NotImplementedError(
+            # Round-3 TP contract.  The indexer's K side is *replicated*, not
+            # sharded: the top-k it produces has to be identical on every rank
+            # (ranks hold different head shards of the same KV, and they must
+            # gather the same sparse positions).  `gather_output=True` gives
+            # every rank the full index-K, so the selection is bit-identical
+            # across ranks by construction rather than by an extra all-reduce.
+            # The projection is small (hidden -> 32*128) so replicating its
+            # compute is cheap relative to getting the selection wrong.
+            #
+            # Round 2's `index_n_heads % tp_degree` guard was the wrong
+            # invariant — at TP=16 it passes (32 % 16 == 0) but leaves 2 index
+            # heads per rank, which then fails the IndexPool=4 collapse. The
+            # pool divisibility is the real constraint.
+            self.pooled_index_heads = self.index_n_heads // self.index_kpool
+            if self.index_n_heads % self.index_kpool:
+                raise ValueError(
                     f"DSA indexer requires index_n_heads ({self.index_n_heads}) "
-                    f"divisible by TP degree ({tp_degree}); Round-3 will add a "
-                    "head-padded fallback."
+                    f"divisible by IndexPool ({self.index_kpool})"
                 )
+            self.tp_degree = tp_degree
+            self.heads_per_rank = self.num_attention_heads // tp_degree
             self.k_proj = _NxdColumnParallelLinear(
                 self.hidden_size,
                 self.index_n_heads * self.index_head_dim,
                 bias=False,
-                gather_output=False,
+                gather_output=True,
                 dtype=dtype,
             )
             # Q_proj is a rank-3 parameter; store the full tensor and slice at
@@ -437,10 +524,19 @@ if _NXDI_AVAILABLE:
             # because the slicing axis (index-head) is the leading axis and
             # NxDI's ColumnParallelLinear shards only the output axis of a 2D
             # weight.  Round-3 loader materialises the rank-local slice.
+            # Q_proj contracts the *main-attention* query (which IS sharded by
+            # head) into the indexer space, so its middle axis is rank-local
+            # and the resulting q_idx must be summed across ranks before it can
+            # be scored.  Leading axis is the POOLED index-head count: the
+            # golden scores `q_idx[B,Q,H_idx,D_idx]` against the pool-collapsed
+            # `k_pooled[B,L,H_idx,D_idx]`, and the collapse divides the 32
+            # stored index heads by IndexPool=4 -> 8.  `_assert_indexer_shapes`
+            # re-checks this at trace time so a wrong reading of the HF layout
+            # is a hard error, never silent corruption.
             self.q_proj = nn.Parameter(
                 torch.empty(
-                    self.index_n_heads,
-                    self.num_attention_heads * self.qk_head_dim,
+                    self.pooled_index_heads,
+                    self.heads_per_rank * self.qk_head_dim,
                     self.index_head_dim,
                     dtype=dtype,
                 ),
@@ -457,17 +553,83 @@ if _NXDI_AVAILABLE:
                 ),
             )
 
-        def local_indexer_head_slice(self, rank: int, tp_degree: int) -> slice:
-            heads_per_rank = self.index_n_heads // tp_degree
-            return slice(rank * heads_per_rank, (rank + 1) * heads_per_rank)
+        def local_query_slice(self, rank: int) -> slice:
+            """Rank-local slice of the main-attention query feature axis."""
+            width = self.heads_per_rank * self.qk_head_dim
+            return slice(rank * width, (rank + 1) * width)
 
-        def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-            raise NotImplementedError(
-                "GLM-5.3-Flash DSA lightning-indexer + sparse-attn forward "
-                "requires the Round-3 device NKI binding.  Reference at "
-                "`C:\\Users\\apumu\\research\\InfinityAI\\gemma4-trn2-handoff\\"
-                "harness-v2\\staging\\reference-sweep-20260826T2150Z\\kernels\\"
-                "dsa_lightning_indexer.py` (nki_v0_reference_lightning_indexer)."
+        def _assert_indexer_shapes(
+            self, q_idx: torch.Tensor, k_pooled_heads: int
+        ) -> None:
+            if q_idx.shape[-2] != k_pooled_heads:
+                raise ValueError(
+                    "GLM-5.3-Flash indexer head-count disagreement: q_proj "
+                    f"produced {q_idx.shape[-2]} index heads but the "
+                    f"IndexPool={self.index_kpool} collapse of a "
+                    f"{self.index_n_heads}-head index-K cache produced "
+                    f"{k_pooled_heads}. The HF checkpoint's indexer layout "
+                    "does not match the pooled-head reading assumed here; fix "
+                    "the loader rather than reshaping to make it fit."
+                )
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            query: torch.Tensor,
+            kv_cache_k: torch.Tensor,
+            kv_cache_v: torch.Tensor,
+            key_lengths: torch.Tensor,
+            *,
+            return_lse: bool = False,
+        ):
+            """Round-3 bound DSA lightning-indexer + sparse attention.
+
+            Kernel identity: ``DSA_KERNEL_SLUG_V0``.  Scoring, masking, top-k,
+            sparse gather and the sparse softmax all come from the torch
+            golden ``dsa_lightning_indexer.py`` (IndexPool=4, natural-log LSE
+            convention, ``-inf`` sentinel on fully-masked rows).  The only
+            piece not delegated is the query-side projection, which has to be
+            split around a TP reduce — see ``dsa_scores_from_qidx``.
+
+            No fallback: the sparse path never degrades to dense attention.
+            The one shape-driven adaptation is clamping ``index_topk`` to the
+            context length, which is a degenerate top-k, not a substitution.
+            """
+            batch, length, _ = hidden_states.shape
+
+            # Index-K side: replicated (gather_output=True), so this is the
+            # full [B, L, index_n_heads, index_head_dim] cache on every rank.
+            index_k = self.k_proj(hidden_states).view(
+                batch, length, self.index_n_heads, self.index_head_dim
+            )
+
+            # Query side: rank-local contraction, then sum across ranks.
+            q_flat = query.reshape(batch, query.shape[1], -1)
+            q_idx = torch.einsum(
+                "bqf,hfd->bqhd",
+                q_flat.to(torch.float32),
+                self.q_proj.to(torch.float32),
+            )
+            q_idx = _reduce_from_tp_region(q_idx)
+            self._assert_indexer_shapes(q_idx, self.pooled_index_heads)
+
+            scores = dsa_scores_from_qidx(
+                q_idx,
+                index_k,
+                index_pool=self.index_kpool,
+                pool_weights=self.pool_weights,
+            )
+            return dsa_attend_from_scores(
+                scores,
+                query,
+                kv_cache_k,
+                kv_cache_v,
+                position_ids,
+                key_lengths,
+                topk=self.index_topk,
+                causal=True,
+                return_lse=return_lse,
             )
 
     class _DSABlock(nn.Module):
@@ -486,19 +648,40 @@ if _NXDI_AVAILABLE:
             self.indexer = _DSAIndexerBlock(config, layer_idx=layer_idx)
 
         def forward(
-            self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+            self,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         ) -> torch.Tensor:
-            # Project the QKV so the tracer sees the MLA weight shapes bind.
-            # The DSA sparse-attention step is a Round-3 NKI kernel; refuse
-            # explicitly rather than silently falling through to full-dense
-            # attention or CPU.
-            _ = self.mla.project(hidden_states)
-            self.indexer(hidden_states, position_ids)  # raises
-            raise NotImplementedError(
-                "GLM-5.3-Flash DSA layer forward defers the sparse-attn kernel "
-                "invocation to Round 3.  MLA + indexer projections are lowered; "
-                "the sparse KV gather + score/softmax lands in the NKI v0 "
-                "wrapper (see `_DSAIndexerBlock.forward` pointer)."
+            """Round-3 bound DSA layer: All-NoPE MLA + indexer-selected sparse attn.
+
+            When ``kv_cache`` is supplied the sparse gather runs against the
+            full cached context; otherwise K/V come from the current window,
+            which is the correct prefill/self-attention behaviour and the
+            shape the 1-layer smoke exercises.
+            """
+            query, key, value = self.mla.project(hidden_states)
+            if kv_cache is not None:
+                key, value = kv_cache
+            batch = hidden_states.shape[0]
+            context_len = key.shape[1]
+            key_lengths = torch.full(
+                (batch,),
+                context_len,
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            attn, _topk = self.indexer(
+                hidden_states,
+                position_ids,
+                query,
+                key,
+                value,
+                key_lengths,
+            )
+            batch, length = attn.shape[0], attn.shape[1]
+            return self.mla.o_proj(
+                attn.reshape(batch, length, -1).to(hidden_states.dtype)
             )
 
     class _KDABlock(nn.Module):
@@ -546,6 +729,10 @@ if _NXDI_AVAILABLE:
                     f"TP degree ({tp_degree}); Round-3 will add head-padded "
                     "fallback."
                 )
+            self.tp_degree = tp_degree
+            self.heads_per_rank = self.num_heads // tp_degree
+            self.qkv_dim_local = self.heads_per_rank * self.head_dim
+            self.max_batch_size = config.neuron_config.max_batch_size
             self.q_proj = _NxdColumnParallelLinear(
                 self.hidden_size,
                 self.qkv_dim,
@@ -567,9 +754,15 @@ if _NXDI_AVAILABLE:
                 gather_output=False,
                 dtype=dtype,
             )
-            # Depthwise-groups conv1d.  Kept replicated in Round 2; Round-3
-            # NKI kernel will shard along the head axis to match Q/K/V.
-            channels = 3 * self.qkv_dim
+            # Depthwise-groups conv1d over the *rank-local* channel set.
+            # Round 2 declared this at full width, which contradicted the
+            # column-parallel Q/K/V it consumes (each rank only ever holds
+            # `qkv_dim_local` channels).  A depthwise conv is per-channel, so
+            # the channel axis shards exactly like Q/K/V's output axis and the
+            # rank-local declaration is the correct one — no cross-rank
+            # communication is needed for the short conv.
+            channels = 3 * self.qkv_dim_local
+            self.conv_channels = channels
             self.conv1d = nn.Conv1d(
                 channels,
                 channels,
@@ -631,22 +824,169 @@ if _NXDI_AVAILABLE:
                 input_is_parallel=True,
                 dtype=dtype,
             )
-
-        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            # Trace the projections so the tracer binds Q/K/V/F/G/B weight
-            # shapes.  The KDA state kernel invocation is Round-3 territory.
-            _ = self.q_proj(hidden_states)
-            _ = self.k_proj(hidden_states)
-            _ = self.v_proj(hidden_states)
-            raise NotImplementedError(
-                "GLM-5.3-Flash KDA state kernel forward is a Round-3 device "
-                "NKI binding.  Reference at "
-                "`C:\\Users\\apumu\\research\\InfinityAI\\gemma4-trn2-handoff\\"
-                "harness-v2\\staging\\reference-sweep-20260826T2150Z\\kernels\\"
-                "kda_state_v2.py` (kda_state.decode.kda_gate.rank1_delta."
-                "bf16_state.v1; SigmoidBeta + SafeGate + LOWER_BOUND=-5.0 + "
-                "in-kernel L2-norm per FLA v0.5.2)."
+            # Recurrent-state SHAPE contract, laid out as the vLLM KDA cache
+            # does: [num_slots, HV, V, K] == [max_batch, heads_per_rank,
+            # head_dim, head_dim].  Deliberately NOT a registered buffer.
+            #
+            # A `persistent=False` buffer is excluded from `state_dict()`, and
+            # NxDI's model builder derives the graph's parameter set from the
+            # state dict — so reading such a buffer inside forward produces
+            # "Unable to lower HLO: parameter not found in lowering context".
+            # A `persistent=True` buffer would instead demand a checkpoint
+            # tensor that does not exist.  The state is therefore materialised
+            # inside forward (a graph constant for prefill-from-zero) or
+            # supplied by the caller as a real tensor argument.
+            self.kda_state_shape = (
+                self.heads_per_rank,
+                self.head_dim,
+                self.head_dim,
             )
+            self.conv_state_shape = (
+                self.conv_channels,
+                self.short_conv_kernel_size - 1,
+            )
+            self.state_dtype = dtype
+
+        def _local_heads(self) -> slice:
+            """Rank-local head slice for the checkpoint-width small params."""
+            rank = _tp_rank()
+            return slice(
+                rank * self.heads_per_rank, (rank + 1) * self.heads_per_rank
+            )
+
+        def _short_conv(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            conv_state: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Causal depthwise short conv + SiLU, mirroring ``kda.py``.
+
+            Returns the three post-conv streams plus the updated conv state.
+            """
+            batch, length = query.shape[0], query.shape[1]
+            joined = torch.cat((query, key, value), dim=-1)
+            joined = joined.flatten(-2).transpose(1, 2)  # [B, C, L]
+            conv_input = torch.cat((conv_state.to(joined.dtype), joined), dim=-1)
+            history = self.short_conv_kernel_size - 1
+            new_conv_state = conv_input[..., -history:] if history else conv_state
+            convolved = F.silu(self.conv1d(conv_input))
+            convolved = convolved.transpose(1, 2).view(
+                batch, length, self.heads_per_rank, 3 * self.head_dim
+            )
+            q_c, k_c, v_c = torch.split(convolved, self.head_dim, dim=-1)
+            return q_c, k_c, v_c, new_conv_state
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            kda_state: torch.Tensor | None = None,
+            conv_state: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Round-3 bound KDA forward.
+
+            Kernel identity: ``KDA_KERNEL_SLUG_V2``
+            (``kda_state.decode.kda_gate.rank1_delta.bf16_state.v1``).
+
+            The state recurrence is the torch transcription of the numpy
+            golden ``kda_state_v2._kda_delta_rule_step`` living in
+            ``nki_bindings.kda_state_forward_torch``; it preserves the four
+            FLA v0.5.2 parity pieces (per-channel gate with LOWER_BOUND=-5.0,
+            in-kernel L2-norm at eps=1e-6, query scale ``D_qk ** -0.5``, bf16
+            state).  Bit-exactness against the numpy golden is asserted by
+            ``nki_bindings.kda_reference_parity_check``.
+
+            No fallback: there is no branch here that reaches softmax or dense
+            attention.  KDA is a linear-attention recurrence; a dense
+            substitute would be a different model, not a slower one.
+            """
+            if hidden_states.ndim != 3:
+                raise ValueError("KDA expects [batch, sequence, hidden]")
+            batch, length, _ = hidden_states.shape
+            heads = self.heads_per_rank
+
+            query = self.q_proj(hidden_states).view(
+                batch, length, heads, self.head_dim
+            )
+            key = self.k_proj(hidden_states).view(
+                batch, length, heads, self.head_dim
+            )
+            value = self.v_proj(hidden_states).view(
+                batch, length, heads, self.head_dim
+            )
+
+            if conv_state is None:
+                conv_state = torch.zeros(
+                    (batch,) + self.conv_state_shape,
+                    dtype=self.state_dtype,
+                    device=hidden_states.device,
+                )
+            query, key, value, new_conv_state = self._short_conv(
+                query, key, value, conv_state
+            )
+
+            # Per-channel gate logits and per-head beta logit.
+            g_raw = self.f_b_proj(self.f_a_proj(hidden_states)).view(
+                batch, length, heads, self.head_dim
+            )
+            beta_raw = self.b_proj(hidden_states).view(batch, length, heads)
+
+            local = self._local_heads()
+            a_log = self.A_log[local]
+            g_bias = self.dt_bias.view(self.num_heads, self.head_dim)[local]
+
+            if kda_state is None:
+                kda_state = torch.zeros(
+                    (batch,) + self.kda_state_shape,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+
+            output, new_state = kda_state_forward_torch(
+                kda_state,
+                query,
+                key,
+                value,
+                g_raw,
+                beta_raw,
+                a_log,
+                g_bias,
+                lower_bound=self.gate_lower_bound,
+                l2norm_eps=self.l2norm_eps,
+                impl="torch",
+            )
+
+            # State hand-off is FUNCTIONAL, not a buffer mutation.
+            #
+            # Reassigning `self.kda_state` / `self.conv_state` inside forward
+            # is exactly the pattern torch_neuronx refuses to lower:
+            #   "Unable to lower HLO: parameter not found in lowering context.
+            #    This is likely caused by an attempted in-place operation, or
+            #    an attempted access of nn.Parameter.data or nn.Buffer.data."
+            # The recurrence therefore leaves its updated state on plain
+            # Python attributes, which the tracer ignores, and the caller
+            # reads them to thread state between graph invocations.
+            #
+            # NOTE (next blocker, tracked in the Round-3 status doc): making
+            # the state survive across *decode steps* on device needs NxDI's
+            # `input_output_aliases` state wireup, so the state tensor becomes
+            # a real graph input/output pair rather than a Python attribute.
+            # Until that lands, a CTE (prefill-from-zero) graph is exact and a
+            # multi-step TKG graph would silently restart from zero state —
+            # which is why the TKG contract must not be declared correct until
+            # the aliasing is wired.
+            self._new_kda_state = new_state
+            self._new_conv_state = new_conv_state
+
+            # Gated output RMSNorm over head_dim, then row-parallel out-proj.
+            output = output.to(hidden_states.dtype)
+            gate = self.g_b_proj(self.g_a_proj(hidden_states)).view_as(output)
+            normed = _rms_norm(output, self.o_norm_weight, self.rms_eps)
+            normed = normed * torch.sigmoid(gate.to(torch.float32)).to(
+                normed.dtype
+            )
+            return self.o_proj(normed.flatten(-2))
 
     class _DenseMLPBlock(nn.Module):
         """GLM-5.3-Flash dense MLP (first ``first_k_dense_replace`` layers).
@@ -768,6 +1108,21 @@ if _NXDI_AVAILABLE:
             self.scoring_func = src.scoring_func
             self.swiglu_limit = src.swiglu_limit
             dtype = config.neuron_config.torch_dtype
+            tp_degree = config.neuron_config.tp_degree
+            self.tp_degree = tp_degree
+            if self.moe_intermediate_size % tp_degree:
+                raise NotImplementedError(
+                    f"Routed MoE requires moe_intermediate_size "
+                    f"({self.moe_intermediate_size}) divisible by TP degree "
+                    f"({tp_degree})."
+                )
+            # Round-3: the routed-expert slabs are sharded on the intermediate
+            # axis, exactly like the shared expert's ColumnParallel gate/up +
+            # RowParallel down.  Round 2 declared them at full width and
+            # replicated, which is 288 x 4096 x 2048 x 2 B = 4.8 GiB per slab
+            # per layer per rank — unschedulable.  Sharding gives
+            # moe_intermediate_per_tp = 2048/tp.
+            self.moe_intermediate_per_tp = self.moe_intermediate_size // tp_degree
             router_dtype = torch.float32 if src.moe_router_dtype == "float32" else dtype
             self.router = nn.Linear(
                 self.hidden_size,
@@ -779,7 +1134,7 @@ if _NXDI_AVAILABLE:
                 torch.empty(
                     self.n_routed_experts,
                     self.hidden_size,
-                    self.moe_intermediate_size,
+                    self.moe_intermediate_per_tp,
                     dtype=dtype,
                 ),
                 requires_grad=False,
@@ -788,7 +1143,7 @@ if _NXDI_AVAILABLE:
                 torch.empty(
                     self.n_routed_experts,
                     self.hidden_size,
-                    self.moe_intermediate_size,
+                    self.moe_intermediate_per_tp,
                     dtype=dtype,
                 ),
                 requires_grad=False,
@@ -796,29 +1151,71 @@ if _NXDI_AVAILABLE:
             self.down = nn.Parameter(
                 torch.empty(
                     self.n_routed_experts,
-                    self.moe_intermediate_size,
+                    self.moe_intermediate_per_tp,
                     self.hidden_size,
                     dtype=dtype,
                 ),
                 requires_grad=False,
             )
             self.shared_expert = _MoESharedExpert(config)
+            # GLM's router uses a selection-only correction bias (see
+            # `glm52_moe_dsa.moe.select_glm52_experts`): it moves WHICH experts
+            # win top-k but must never leak into the routing weights.  Declared
+            # unconditionally with an explicit zero default so a checkpoint
+            # that omits it degrades to plain top-k rather than to `None`.
+            self.e_score_correction_bias = nn.Parameter(
+                torch.zeros(self.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            # Tier-1 CPU battery on the device-kernel identity: partition cap,
+            # I_TP % 16, top-k in the tested set.  Runs at construction so a
+            # bad shape family can never reach a compile submit.
+            self.dispatch_config = build_glm53_moe_dispatch_config(
+                hidden=self.hidden_size,
+                num_experts=self.n_routed_experts,
+                top_k=self.num_experts_per_tok,
+                intermediate_global=self.moe_intermediate_size,
+                tp_degree=tp_degree,
+                renormalize_topk=self.norm_topk_prob,
+            )
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            # Shared branch is lowered and can be traced; routed dispatch is
-            # a Round-3 blockwise-MoE NKI kernel (nc_find_index8 + capacity
-            # dispatch), so the routed branch raises rather than silently
-            # falling through to the CPU per-expert loop.
-            _shared = self.shared_expert(hidden_states)  # noqa: F841 (traced)
-            raise NotImplementedError(
-                "GLM-5.3-Flash routed-MoE dispatch (288 experts, top-8) is a "
-                "Round-3 blockwise-MoE NKI kernel.  Reference at "
-                "`C:\\Users\\apumu\\research\\InfinityAI\\gemma4-trn2-handoff\\"
-                "harness-v2\\staging\\reference-sweep-20260826T2150Z\\kernels\\"
-                "moe_dispatch.py` (MoEDispatchConfig).  The blockwise-matmul "
-                "container workaround is already applied via "
-                "`build_neuron_config` (use_shard_on_intermediate_dynamic_while=True)."
+            """Round-3 bound MoE: GLM routing + top-k gather dispatch + shared.
+
+            Kernel identity: ``MOE_KERNEL_SLUG_V1``.  The routed branch is
+            O(top_k) FLOPs, not O(num_experts) — it gathers only the 8 selected
+            expert slabs per token, matching the fused NKI kernel's asymptotics
+            without its capacity-dispatch machinery.  ``self.dispatch_config``
+            carries the validated shape identity the fused kernel compiles to.
+
+            No fallback: there is no branch that silently drops to
+            ``torch_blockwise_matmul_inference`` or skips the routed half.
+            """
+            shared = self.shared_expert(hidden_states)
+            expert_indices, routing_weights = glm53_route(
+                hidden_states,
+                self.router.weight,
+                top_k=self.num_experts_per_tok,
+                scoring_func=self.scoring_func,
+                norm_topk_prob=self.norm_topk_prob,
+                routed_scaling_factor=self.routed_scaling_factor,
+                correction_bias=self.e_score_correction_bias,
             )
+            routed = moe_gather_dispatch_torch(
+                hidden_states,
+                expert_indices,
+                routing_weights,
+                self.gate,
+                self.up,
+                self.down,
+                swiglu_limit=self.swiglu_limit,
+            )
+            # `down` is sharded on the intermediate axis, so each rank produced
+            # a partial sum over its slice — the same RowParallelLinear
+            # contract the shared expert's `down_proj` gets for free.  Without
+            # this reduce every rank would emit 1/tp of the routed activation.
+            routed = _reduce_from_tp_region(routed)
+            return shared + routed.to(shared.dtype)
 
     class _MHCBlock(nn.Module):
         """One mHC 4-stream pre/post mixer (Sinkhorn manifold projection).
@@ -1040,15 +1437,35 @@ if _NXDI_AVAILABLE:
         def forward(
             self,
             input_ids: torch.LongTensor,
-            positions: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            seq_ids: torch.Tensor | None = None,
+            sampling_params: torch.Tensor | None = None,
+            *args: Any,
             **kwargs: Any,
         ) -> torch.Tensor:
+            """Match ``NeuronBaseModel.forward``'s positional contract.
+
+            NxDI's tracer calls the model with its full positional input list
+            (input_ids, attention_mask, position_ids, seq_ids, sampling_params,
+            then a long optional tail).  Round 2 declared ``(input_ids,
+            positions, **kwargs)``, so the tracer's 8 positional arguments
+            never bound — the graph could not be generated at all.  The
+            trailing ``*args`` absorbs the optional tail (slot_mapping,
+            block tables, tile indices, …) that this graph does not consume.
+            """
+            positions = position_ids
             hidden_states = self.embed_tokens(input_ids)
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.unsqueeze(0)
             batch, length, _ = hidden_states.shape
+            if positions is None:
+                positions = torch.arange(
+                    length, dtype=torch.int64, device=hidden_states.device
+                ).unsqueeze(0).expand(batch, -1)
             if positions.ndim == 1:
                 positions = positions.expand(batch, -1)
+            positions = positions.to(torch.int64)
             # mHC 4-stream residual widening (matches Impl.forward at model.py:140).
             residual_streams = hidden_states.unsqueeze(-2).repeat(
                 1, 1, self.hc_mult, 1
@@ -1126,12 +1543,45 @@ if _NXDI_AVAILABLE:
         def convert_hf_to_neuron_state_dict(
             state_dict: dict, config: Any
         ) -> dict:
-            raise NotImplementedError(
-                "Round-3 GLM-5.3-Flash HF-to-Neuron state-dict conversion. "
-                "See the GLM-5.2 `checkpoint_mapping.build_checkpoint_contract` "
-                "for the fused-QKV + routed-expert mapping template; GLM-5.3 "
-                "adds the KDA `short_conv`, DSA IndexPool tail, and mHC "
-                "4-stream projections."
+            """Round-3 HF -> Neuron checkpoint conversion.
+
+            Verified against the real index (`model.safetensors.index.json`,
+            snapshot 04c4e9e9): 76,108 tensors, text prefix
+            ``model.language_model.``, `lm_head.weight` unprefixed, 62 shards.
+
+            Layer signatures actually present (4 distinct):
+              SIG0  layers 0-2    KDA + dense MLP            (29 tensors)
+              SIG1  layers 3,7..43 DSA + sparse MoE          (34 + 288x6)
+              SIG2  the other 31  KDA + sparse MoE           (31 + 288x6)
+              SIG3  layer 45      MTP (no hc_*)              -> DROPPED
+
+            Quantization facts that drive this function (from the checkpoint,
+            not assumed):
+              * The ONLY scale suffix present is ``weight_scale_inv`` — a
+                per-block reciprocal scale under
+                ``weight_block_size = [128, 128]``.  ``weight_scale`` and
+                ``input_scale`` are ABSENT (activation_scheme is "dynamic",
+                so no static activation scales are stored).
+              * 37,338 scale tensors, all on MoE experts / shared experts /
+                dense MLP / MLA q_a,q_b,kv_a_proj_with_mqa,o_proj.
+              * The whole KDA block is BF16 — no KDA projection carries a
+                scale.  ``kv_b_proj`` is BF16 too, unlike its siblings.
+              * ``fused_qkvbfg_a_proj`` / ``qkv_proj`` appear in the config's
+                ``modules_to_not_convert`` but do NOT exist as tensors; KDA
+                Q/K/V are separate, as are ``q_conv1d`` / ``k_conv1d`` /
+                ``v_conv1d``.
+
+            Anti-inheritance (the OCP-448-when-None bug): every FP8 scale
+            field gets an explicit non-``None`` default and a load-time
+            ``max(scale) <= 240.0`` assertion via ``validate_fp8_scale``.
+            ``normalize_static_fp8_weight_format()`` is deliberately NOT
+            called — its OCP-448 fallback when a scale is ``None`` is the
+            defect this port refuses to inherit.
+            """
+            src = _require_source_config(config)
+            tp_degree = config.neuron_config.tp_degree
+            return _convert_glm53_checkpoint(
+                state_dict, src, tp_degree=tp_degree
             )
 
         def __init__(
