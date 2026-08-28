@@ -17,10 +17,14 @@ CTX_BATCH="$(jq -r '.compile.ctx_batch_size // 1' "$COMPILE_CONTRACT")"
 TKG_BATCH="$(jq -r '.compile.tkg_batch_size // 1' "$COMPILE_CONTRACT")"
 DISABLE_ARGMAX="$(jq -r '.compile.disable_argmax_kernel // false' "$COMPILE_CONTRACT")"
 DRY_RUN="$(jq -r '.compile.dry_run // false' "$COMPILE_CONTRACT")"
+CONTRACT_SLUG="$(jq -r '.contract_slug // empty' "$COMPILE_CONTRACT")"
 
 MODEL_DIR="${MODEL_DIR:-/mnt/compile/hf-cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
 SRC_DIR="${SRC_DIR:-/mnt/compile/src/vllm-neuron-bravo}"
 OUT_DIR="$COMPILE_RUN_ROOT/artifacts/model"
+if [[ -z "$CONTRACT_SLUG" ]]; then
+  CONTRACT_SLUG="tp${TP}-lnc2-b1c1-s${SEQ}-bf16-shard_intermediate-skip_dma-cont_batch"
+fi
 
 test -s "$MODEL_DIR/config.json"
 test -f "$SRC_DIR/vllm_neuron/model/dsv4_flash/neuron_wrapper.py"
@@ -50,6 +54,7 @@ sudo docker run --rm --network none --shm-size 64g --entrypoint bash \
   -e SRC_PATH=/src/vllm-neuron-bravo \
   -e TP="$TP" -e SEQ="$SEQ" -e CTX_BATCH="$CTX_BATCH" -e TKG_BATCH="$TKG_BATCH" \
   -e DISABLE_ARGMAX="$DISABLE_ARGMAX" -e DRY_RUN="$DRY_RUN" \
+  -e CONTRACT_SLUG="$CONTRACT_SLUG" \
   -v "$MODEL_DIR:/models/dsv4-flash:ro" \
   -v "$SRC_DIR:/src/vllm-neuron-bravo:ro" \
   -v "$COMPILE_RUN_ROOT:/runroot" \
@@ -76,6 +81,7 @@ ctx_batch = int(os.environ["CTX_BATCH"])
 tkg_batch = int(os.environ["TKG_BATCH"])
 disable_argmax = os.environ["DISABLE_ARGMAX"].lower() == "true"
 dry_run = os.environ["DRY_RUN"].lower() == "true"
+contract_slug = os.environ["CONTRACT_SLUG"]
 
 source = DeepseekV4FlashInferenceConfig.from_pretrained(model_path)
 neuron = build_neuron_config(
@@ -98,6 +104,7 @@ inference = DeepseekV4FlashNeuronInferenceConfig(
 inference.neuron_config.skip_sharding = True
 inference.neuron_config.save_sharded_checkpoint = True
 effective = {
+    "contract_slug": contract_slug,
     "tp": tp,
     "logical_nc_config": 2,
     "sequence": seq,
@@ -124,3 +131,8 @@ PY
 
 sudo chown -R ec2-user:ec2-user "$COMPILE_RUN_ROOT"
 test -s "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json"
+jq --arg slug "$CONTRACT_SLUG" '. + {contract_slug: $slug}' \
+  "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json" \
+  > "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json.tmp"
+mv "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json.tmp" \
+  "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json"

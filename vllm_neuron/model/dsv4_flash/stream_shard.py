@@ -33,7 +33,9 @@ from .config import DeepseekV4FlashInferenceConfig
 class _MmapState(Mapping[str, torch.Tensor]):
     """Read-through mapping for the currently selected layer."""
 
-    def __init__(self, weight_map: dict[str, str], handles: dict[str, Any], keys: set[str]) -> None:
+    def __init__(
+        self, weight_map: dict[str, str], handles: dict[str, Any], keys: set[str]
+    ) -> None:
         self._weight_map = weight_map
         self._handles = handles
         self._keys = keys
@@ -69,7 +71,9 @@ def _load_hf_index(model_path: str) -> dict[str, str]:
     weight_map = raw.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"{index_path!r} has no non-empty weight_map")
-    if not all(isinstance(k, str) and isinstance(v, str) for k, v in weight_map.items()):
+    if not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in weight_map.items()
+    ):
         raise ValueError(f"{index_path!r} contains malformed weight_map entries")
     return weight_map
 
@@ -96,7 +100,9 @@ def _close_shards(handles: dict[str, Any]) -> None:
             pass
 
 
-def _row_shard(tensor: torch.Tensor, rank: int, tp_degree: int, dim: int) -> torch.Tensor:
+def _row_shard(
+    tensor: torch.Tensor, rank: int, tp_degree: int, dim: int
+) -> torch.Tensor:
     size = int(tensor.shape[dim])
     if size % tp_degree:
         raise ValueError(
@@ -108,7 +114,9 @@ def _row_shard(tensor: torch.Tensor, rank: int, tp_degree: int, dim: int) -> tor
     return tensor[tuple(slices)].contiguous()
 
 
-def _shard_expert_gate_up(tensor: torch.Tensor, rank: int, tp_degree: int) -> torch.Tensor:
+def _shard_expert_gate_up(
+    tensor: torch.Tensor, rank: int, tp_degree: int
+) -> torch.Tensor:
     """Shard NxDI ``[expert, hidden, gate|up]`` on the fused axis."""
     if tensor.ndim != 3 or tensor.shape[-1] % (2 * tp_degree):
         raise ValueError(
@@ -122,17 +130,15 @@ def _shard_expert_gate_up(tensor: torch.Tensor, rank: int, tp_degree: int) -> to
     return torch.cat((gate, up), dim=-1).contiguous()
 
 
-def _target_shard(key: str, tensor: torch.Tensor, rank: int, tp_degree: int) -> torch.Tensor:
+def _target_shard(
+    key: str, tensor: torch.Tensor, rank: int, tp_degree: int
+) -> torch.Tensor:
     """Apply the frozen DSv4 first-fire TP layout to one converted tensor."""
     if key in {"embed_tokens.weight", "lm_head.weight"}:
         return _row_shard(tensor, rank, tp_degree, 0)
-    if key.endswith(
-        ("router.weight", "tid2eid", "e_score_correction_bias")
-    ):
+    if key.endswith(("router.weight", "tid2eid", "e_score_correction_bias")):
         return tensor.contiguous()
-    if key.endswith(
-        ("shared_expert.gate_proj.weight", "shared_expert.up_proj.weight")
-    ):
+    if key.endswith(("shared_expert.gate_proj.weight", "shared_expert.up_proj.weight")):
         return _row_shard(tensor, rank, tp_degree, 0)
     if key.endswith("shared_expert.down_proj.weight"):
         return _row_shard(tensor, rank, tp_degree, 1)
@@ -142,11 +148,18 @@ def _target_shard(key: str, tensor: torch.Tensor, rank: int, tp_degree: int) -> 
         return _row_shard(tensor, rank, tp_degree, 1)
     # MQA projections are TP-sharded; compressor/indexer leaves are replicated
     # for the first fire (their local head axes are deliberately not sliced).
-    if key.endswith(("attn.wq_a.weight", "attn.wq_b.weight")):
+    if key.endswith(
+        (
+            "attn.wq_a.weight",
+            "attn.wq_b.weight",
+            "attn.mqa.wq_a.weight",
+            "attn.mqa.wq_b.weight",
+        )
+    ):
         return _row_shard(tensor, rank, tp_degree, 0)
-    if key.endswith("attn.wo_a.weight"):
+    if key.endswith(("attn.wo_a.weight", "attn.mqa.wo_a.weight")):
         return _row_shard(tensor, rank, tp_degree, 0)
-    if key.endswith("attn.wo_b.weight"):
+    if key.endswith(("attn.wo_b.weight", "attn.mqa.wo_b.weight")):
         return _row_shard(tensor, rank, tp_degree, 1)
     return tensor.contiguous()
 
@@ -197,7 +210,9 @@ def _convert_one_layer(
     elif layer_type == "heavily_compressed_attention":
         converted = _convert_hca_block(layer_state, layer_idx, src)
     else:  # pragma: no cover
-        raise ValueError(f"unsupported attention layer type {layer_type!r} at {layer_idx}")
+        raise ValueError(
+            f"unsupported attention layer type {layer_type!r} at {layer_idx}"
+        )
 
     ffn_norm_key = f"layers.{layer_idx}.ffn_norm.weight"
     ffn_norm = layer_state.get(ffn_norm_key)
@@ -214,9 +229,7 @@ def _convert_one_layer(
     # full-layer path is retained for CPU correctness tests; this path keeps
     # peak host memory bounded while producing the same fused [E,H,2I] and
     # [E,I,H] tensors for the selected rank.
-    expert_key = (
-        f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
-    )
+    expert_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
     down_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"
     gate_chunks: list[torch.Tensor] = []
     down_chunks: list[torch.Tensor] = []
@@ -322,7 +335,11 @@ def stream_shard_dsv4_checkpoint(
         "start_unix": int(time.time()),
     }
     try:
-        top_state = _MmapState(weight_map, handles, {key for key in weight_map if not key.startswith("layers.")})
+        top_state = _MmapState(
+            weight_map,
+            handles,
+            {key for key in weight_map if not key.startswith("layers.")},
+        )
         embed = top_state.get("embed.weight")
         final_norm = top_state.get("norm.weight")
         lm_head = top_state.get("head.weight")
@@ -336,12 +353,18 @@ def stream_shard_dsv4_checkpoint(
         for rank in ranks_iter:
             started = time.time()
             rank_dict: dict[str, torch.Tensor] = {
-                "embed_tokens.weight": _row_shard(embed.to(src.torch_dtype), rank, tp_degree, 0),
+                "embed_tokens.weight": _row_shard(
+                    embed.to(src.torch_dtype), rank, tp_degree, 0
+                ),
                 "final_norm_weight": final_norm.to(src.torch_dtype).contiguous(),
-                "lm_head.weight": _row_shard(lm_head.to(src.torch_dtype), rank, tp_degree, 0),
+                "lm_head.weight": _row_shard(
+                    lm_head.to(src.torch_dtype), rank, tp_degree, 0
+                ),
             }
             for layer_idx in range(src.num_hidden_layers):
-                layer_keys = {key for key in weight_map if key.startswith(f"layers.{layer_idx}.")}
+                layer_keys = {
+                    key for key in weight_map if key.startswith(f"layers.{layer_idx}.")
+                }
                 state = _MmapState(weight_map, handles, layer_keys)
                 converted = _convert_one_layer(
                     state,
@@ -350,7 +373,9 @@ def stream_shard_dsv4_checkpoint(
                     rank=rank,
                     tp_degree=tp_degree,
                 )
-                report["peak_layer_key_count"] = max(report["peak_layer_key_count"], len(converted))
+                report["peak_layer_key_count"] = max(
+                    report["peak_layer_key_count"], len(converted)
+                )
                 rank_dict.update(
                     {
                         key: value
@@ -366,7 +391,9 @@ def stream_shard_dsv4_checkpoint(
                 )
                 del converted, state
                 gc.collect()
-            output_path = os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors")
+            output_path = os.path.join(
+                weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"
+            )
             save_file(rank_dict, output_path)
             report["ranks_written"].append(rank)
             report["rank_bytes"][str(rank)] = os.path.getsize(output_path)
