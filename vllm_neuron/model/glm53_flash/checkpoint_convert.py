@@ -46,12 +46,17 @@ Converter traps this module handles explicitly
    precision, so "all MLA tensors are FP8" is wrong.
 3. The indexer tensors (``wk``, ``wq_b``, ``k_norm.{weight,bias}``,
    ``weights_proj``, ``index_kpool_compress_{ape,gate}``) carry **no** scales
-   at all.  Round-4 wrapper only maps ``wk`` -> ``indexer.k_proj.weight``,
-   ``wq_b`` -> ``indexer.q_proj`` (reshaped rank-3 param), and
-   ``weights_proj`` -> ``indexer.pool_weights`` (from a Linear weight).  The
-   remainder (k_norm.{w,b}, kpool_compress_{ape,gate}) is NOT declared by the
-   Round-4 module tree and would land as an "unexpected key" if forwarded;
-   they are dropped with a report entry that names each one.
+   at all.  Round-7 wrapper (``_DSAIndexerBlock`` after the HF-parity
+   rewrite) maps every one of them 1:1 to their HF names — ``wq_b`` and
+   ``wk`` stay as ``indexer.wq_b.weight`` / ``indexer.wk.weight`` (no
+   reshape; both are the HF 2D layouts), ``weights_proj`` stays as
+   ``indexer.weights_proj.weight``, ``k_norm.{weight,bias}`` are carried
+   through unchanged, and both compress params are copied through as
+   raw parameters.  The Round-6 wrapper's rank-3 ``q_proj`` /
+   scalar ``pool_weights`` scaffolds are gone — that mapping was
+   provably non-numerical (``wq_b`` is a low-rank projection off q_lora,
+   not a per-head reformulation of ``q_proj @ Q_B``; see
+   ``DSA-INDEXER-MAPPING-FIX-2026-08-28.md``).
 4. ``weight_scale_inv`` is a **reciprocal** block scale.  Dequantization is
    ``w_bf16 = (w_fp8_fp32 * scale_inv).to(bf16)`` blockwise, NOT a divide.
 5. HF's routed-expert ``gate_proj`` / ``up_proj`` weights are stored as
@@ -474,19 +479,32 @@ def _convert_dsa_layer(
 ) -> None:
     """DSA block: mixed-precision MLA (mostly FP8 dequantized to bf16, kv_b BF16) + BF16 indexer.
 
-    The Round-4 wrapper's ``_NoPeMLABlock`` uses these parameter names
+    The Round-7 wrapper's ``_NoPeMLABlock`` uses these parameter names
     (rename from HF's ``kv_a_proj_with_mqa`` to ``kv_a_proj``).  MLA is
     mixed precision: q_a, q_b, kv_a, o carry block scales; kv_b does not.
     Dequantize the ones that carry scales; carry kv_b through as bf16.
 
-    The indexer body Round-4 declares — ``k_proj`` (from HF ``wk``),
-    ``q_proj`` (from HF ``wq_b``, held as a rank-3 param, reshaped below),
-    ``pool_weights`` (from HF ``weights_proj``) — is the WHOLE set the
-    module reads.  The HF checkpoint also stores ``indexer.k_norm.{w,b}``
-    and ``indexer.index_kpool_compress_{ape,gate}`` which the current
-    Round-4 wrapper does not declare; forwarding them as-is would let
-    NxDI's loader report an unexpected key.  They are dropped and named
-    in the report so the next round can decide whether to model them.
+    Round-7 indexer contract (Option A: wrapper adapts to HF layout — see
+    ``DSA-INDEXER-MAPPING-FIX-2026-08-28.md`` for why Option B was
+    provably lossy):
+
+      * ``indexer.wq_b.weight`` -> ``indexer.wq_b.weight`` (unchanged 2D
+        ``[index_n_heads * index_head_dim, q_lora_rank]``)
+      * ``indexer.wk.weight``   -> ``indexer.wk.weight`` (unchanged 2D
+        ``[index_head_dim, hidden_size]`` — SINGLE-head)
+      * ``indexer.k_norm.weight`` / ``indexer.k_norm.bias`` (LayerNorm on
+        ``head_dim``) -> carried through unchanged.
+      * ``indexer.weights_proj.weight`` -> ``indexer.weights_proj.weight``
+        (unchanged 2D ``[index_n_heads, hidden_size]``).
+      * ``indexer.index_kpool_compress_ape`` -> unchanged
+        (``[index_kpool, index_head_dim]``).
+      * ``indexer.index_kpool_compress_gate`` -> unchanged
+        (``[index_head_dim, hidden_size]``).
+
+    All indexer tensors are BF16 with no block-scale carriage; the
+    ``keep_in_fp32_modules`` list carries ``weights_proj`` in the
+    upstream HF forward but the wrapper's forward up-casts to fp32
+    internally so bf16 storage is safe.
     """
     attn = f"{base}self_attn."
     target = f"{out}self_attn."
@@ -520,47 +538,25 @@ def _convert_dsa_layer(
         if hf_key in state_dict:
             converted[f"{target}{dest}"] = state_dict[hf_key].to(dtype)
 
-    # Indexer: k_proj (from wk).  BF16.  wk is 2D ``[index_n_heads *
-    # index_head_dim, hidden]``.
-    wk_key = f"{attn}indexer.wk.weight"
-    if wk_key in state_dict:
-        converted[f"{target}indexer.k_proj.weight"] = state_dict[wk_key].to(dtype)
-
-    # Indexer q_proj is rank-3 in the wrapper: ``[pooled_index_heads,
-    # heads_per_rank * qk_head_dim, index_head_dim]``.  The HF ``wq_b`` is
-    # stored 2D as ``[index_n_heads * index_head_dim, num_attention_heads *
-    # qk_head_dim]``; the wrapper loads a rank-local slice at load time.
-    # Reshape to ``[index_n_heads, num_attention_heads * qk_head_dim,
-    # index_head_dim]`` and let the loader's per-rank slicing subset it.
-    #
-    # NOTE: because this converter runs BEFORE sharding, we produce the
-    # FULL-width rank-3 tensor; NxDI's ``get_sharded_checkpoint`` handles
-    # the per-rank slice at ``shard_weights_with_cache`` time.
-    wq_b_key = f"{attn}indexer.wq_b.weight"
-    if wq_b_key in state_dict:
-        wq_b = state_dict[wq_b_key].to(dtype)
-        # Best-effort reshape: HF spelling depends on head_dim ordering;
-        # forwarding as-is lets the wrapper's own load-time slice complain
-        # loudly if the ordering disagrees, which is preferable to a silent
-        # reshape here.
-        converted[f"{target}indexer.q_proj"] = wq_b
-
-    # Indexer pool_weights (from weights_proj).
-    wp_key = f"{attn}indexer.weights_proj.weight"
-    if wp_key in state_dict:
-        converted[f"{target}indexer.pool_weights"] = state_dict[wp_key].to(dtype)
-
-    # Indexer tensors the current wrapper does NOT declare — recorded, not
-    # forwarded (see docstring).
+    # DSA indexer: straight-through carry into the HF-parity module tree.
+    # Every HF key lands at ``indexer.<same-name>`` on the wrapper; the
+    # loader's default slicing takes care of any TP sharding
+    # (ColumnParallelLinear on ``wq_b`` / ``wk`` / ``weights_proj``).  No
+    # reshape here: the Round-4 rank-3 ``q_proj`` scaffold, and the scalar
+    # ``pool_weights`` mapping onto HF's per-token ``weights_proj``, were
+    # both provably non-numerical — see ``DSA-INDEXER-MAPPING-FIX``.
     for hf_suffix in (
+        "indexer.wq_b.weight",
+        "indexer.wk.weight",
         "indexer.k_norm.weight",
         "indexer.k_norm.bias",
+        "indexer.weights_proj.weight",
         "indexer.index_kpool_compress_ape",
         "indexer.index_kpool_compress_gate",
     ):
         hf_key = f"{attn}{hf_suffix}"
         if hf_key in state_dict:
-            unmapped_indexer.append(hf_key)
+            converted[f"{target}{hf_suffix}"] = state_dict[hf_key].to(dtype)
 
 
 def _convert_dense_mlp_layer(

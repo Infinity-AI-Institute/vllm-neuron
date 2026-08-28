@@ -685,32 +685,37 @@ def _emit_dsa_rank(
         if t is not None:
             rank_dict[f"{target}{tk_suffix}"] = t
 
-    # Indexer k_proj (gather_output=True — full width per rank).  We still
-    # write only rank-r slice; the forward gathers across ranks.
-    wk = fetch(f"{attn}indexer.wk.weight")
-    if wk is not None:
-        # Actually: gather_output=True keeps the parameter sharded on dim=0
-        # like any ColumnParallelLinear; the gather is at forward-time on
-        # the output.  So we shard dim=0.
-        rank_dict[f"{target}indexer.k_proj.weight"] = _row_shard(
-            wk, rank, tp_degree, dim=0
-        )
-
-    # DSA indexer q_proj / pool_weights: the wrapper's Round-4
-    # ``_DSAIndexerBlock`` declares these with shapes that reflect a
-    # per-index-head reformulation (``q_proj`` is rank-3
-    # ``[pooled_index_heads, heads_per_rank * qk_head_dim, index_head_dim]``,
-    # ``pool_weights`` is ``[index_kpool]``) that does NOT map 1:1 to the
-    # HF ``indexer.wq_b`` / ``indexer.weights_proj`` shapes.  A correct
-    # mapping is a Round 7 exercise and requires wrapper-side changes;
-    # forwarding an unaligned tensor here would let NxDI's loader accept a
-    # wrong-shape reshape.
+    # Round-7 DSA indexer sharding.  Every projection is
+    # ``ColumnParallelLinear(gather_output=True)`` (see ``_DSAIndexerBlock``
+    # in ``neuron_wrapper.py``); each rank stores a per-rank dim=0 slice and
+    # the forward all-gathers on the output.  ``k_norm`` and both
+    # ``index_kpool_compress_*`` params are replicated.
     #
-    # Round 6 leaves these two keys UNPOPULATED — NxDI's ``strict=False``
-    # loader keeps the wrapper's ``torch.empty(...)`` values.  DSA
-    # correctness will fail until the mapping is corrected, but the
-    # streaming loader itself, MoE, MLA, KDA and mHC compile cleanly.
-    report.setdefault("dsa_indexer_gap_layers", []).append(base)
+    # ``pool_weights`` and the rank-3 ``q_proj`` scaffolds are gone in Round
+    # 7: they mapped provably-lossily onto HF's ``weights_proj`` (per-token,
+    # per-head) and ``wq_b`` (low-rank off q_lora).  See
+    # ``DSA-INDEXER-MAPPING-FIX-2026-08-28.md`` for the derivation that
+    # rules out Option B (converter-side reformulation).
+    for hf_suffix, tp_dim in (
+        ("indexer.wq_b.weight", 0),
+        ("indexer.wk.weight", 0),
+        ("indexer.weights_proj.weight", 0),
+    ):
+        t = fetch(f"{attn}{hf_suffix}")
+        if t is not None:
+            rank_dict[f"{target}{hf_suffix}"] = _row_shard(
+                t, rank, tp_degree, dim=tp_dim
+            )
+
+    for hf_suffix in (
+        "indexer.k_norm.weight",
+        "indexer.k_norm.bias",
+        "indexer.index_kpool_compress_ape",
+        "indexer.index_kpool_compress_gate",
+    ):
+        t = fetch(f"{attn}{hf_suffix}")
+        if t is not None:
+            rank_dict[f"{target}{hf_suffix}"] = t
 
 
 def _emit_dense_mlp_rank(
