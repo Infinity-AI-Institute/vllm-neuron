@@ -1705,6 +1705,16 @@ class _LightningIndexerHead(nn.Module):
         if src is None:
             src = config
         self.layer_idx = layer_idx
+        # Advertised DSA kernel slug for THIS indexer head. Read at
+        # construction time so the compile driver can log the NEFF cache
+        # identity before the first forward. See
+        # `.kernel_dispatch.resolve_dsa_impl_slug()` for the env-var
+        # mapping. DSv4-Flash does not structurally call
+        # `dsa_sparse_attention_forward` (the indexer builds a
+        # block_bias mask; softmax runs on the extended KV axis), so
+        # the slug here is metadata-only for cache-identity audit.
+        from .kernel_dispatch import resolve_dsa_impl_slug
+        self._emitted_dsa_slug = resolve_dsa_impl_slug()
         self.hidden_size = int(src.hidden_size)
         self.q_lora_rank = int(src.q_lora_rank)
         self.head_dim = int(src.index_head_dim)
@@ -1954,6 +1964,13 @@ class _CSABlock(nn.Module):
         # walked by NxDI's state-dict traversal (verified against
         # `test_hca_1layer.py::test_hca_wrapper_tree_key_set` — the same
         # walk logic applies here).
+        # Advertised DSA kernel slug for this CSA layer. See
+        # `.kernel_dispatch.resolve_dsa_impl_slug()` for the env-var
+        # mapping. Metadata-only on DSv4 -- see the module-level docstring
+        # of `.kernel_dispatch` for why DSv4 does not swap the runtime
+        # callable.
+        from .kernel_dispatch import resolve_dsa_impl_slug
+        self._emitted_dsa_slug = resolve_dsa_impl_slug()
         self.mqa = _MQABlock(config, layer_idx=layer_idx)
         self.compressor = _CSAOverlapCompressor(
             hidden_size=int(src.hidden_size),
@@ -3225,4 +3242,17 @@ __all__ = [
     "dsv4_reference_hash_moe_forward",
     "dsv4_reference_router_forward",
     "dsv4_route_affinities",
+    "get_emitted_kernel_slugs",
+    "DSA_CPU_GOLDEN_SLUG",
+    "DSA_NKI_V2_SLUG",
 ]
+
+
+# Re-export slug identities + resolver so the compile driver / audit
+# tools have a single import surface (parallel to
+# ``glm53_flash/neuron_wrapper.py``).
+from .kernel_dispatch import (  # noqa: E402
+    DSA_CPU_GOLDEN_SLUG,
+    DSA_NKI_V2_SLUG,
+    get_emitted_kernel_slugs,
+)
