@@ -637,12 +637,24 @@ def _verify_emitted(out_path: str) -> dict[str, Any]:
             report[f"neuron_config_has_{marker}"] = marker in raw
     else:
         report["neuron_config_json"] = "MISSING"
+    # NEFFs do NOT land in out_path. `compile()` writes the traced model
+    # (`model.pt`) and `neuron_config.json` there, while neuronx-cc emits each
+    # `model.neff` into the compile cache under
+    # `$NEURON_COMPILE_CACHE_URL/<compiler-version>/<MODULE_slug>/`. Scanning
+    # only out_path reports `neff_count: 0` for a compile that succeeded —
+    # which is a receipt that lies in the safe direction, but still lies.
+    search = [out_path]
+    cache = os.environ.get("NEURON_COMPILE_CACHE_URL")
+    if cache and os.path.isdir(cache):
+        search.append(cache)
+        report["compile_cache"] = cache
     neffs = []
-    for root, _dirs, files in os.walk(out_path):
-        for name in files:
-            if name.endswith(".neff"):
-                full = os.path.join(root, name)
-                neffs.append((full, os.path.getsize(full)))
+    for base in search:
+        for root, _dirs, files in os.walk(base):
+            for name in files:
+                if name.endswith(".neff"):
+                    full = os.path.join(root, name)
+                    neffs.append((full, os.path.getsize(full)))
     report["neff_count"] = len(neffs)
     report["neffs"] = [
         {"path": p, "bytes": n} for p, n in sorted(neffs)[:20]

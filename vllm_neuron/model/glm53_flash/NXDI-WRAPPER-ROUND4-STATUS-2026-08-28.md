@@ -487,8 +487,27 @@ reference bindings, so both are fixable in Round 5 without touching the stack:
 |---|---|---|---|
 | TKG (decode) | 16 / 2 | `S=2048`, `B=1` | **refused by neuronx-cc** — `NCC_EVRF009`, 39.64 GB vs 24 GB |
 | CTE+TKG | 16 / 2 | `S=2048`, `B=1` | refused, byte-identical footprint |
-| **TKG (decode)** | **32 / 2** | `S=2048`, `B=1` | **`Compiler status PASS`, zero `NCC_EVRF009`** |
+| **TKG (decode)** | **32 / 2** | `S=2048`, `B=1` | **PASS — 1454.01 s, zero `NCC_EVRF009`** |
 | CTE (prefill) | 32 / 2 | bucket 512, KV window 2048, `B=1` | HLO 163.39 s; NEFF in flight |
+
+**TKG artifacts (TP=32, LNC=2, `S=2048`, `B=1`):**
+
+| artifact | path | size |
+|---|---|---|
+| NEFF | `/mnt/compile/runroot/glm53-round4/cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_af3c7d673e9280a223d1+8f34053f/model.neff` | 10,283,678 B |
+| traced model | `/mnt/compile/runroot/glm53-round4/artifacts/real45-tkg-tp32/model.pt` | 43,967,683 B |
+| emitted config | `/mnt/compile/runroot/glm53-round4/artifacts/real45-tkg-tp32/neuron_config.json` | 13,174 B |
+
+Slug: `MODULE_af3c7d673e9280a223d1+8f34053f`, compiler `neuronxcc-2.26.6360.0+6f180f47`.
+
+A receipt bug worth carrying forward: **NEFFs do not land in `out_path`.**
+`compile()` writes `model.pt` and `neuron_config.json` there, while neuronx-cc
+emits each `model.neff` into
+`$NEURON_COMPILE_CACHE_URL/<compiler-version>/<MODULE_slug>/`. The first
+version of `_verify_emitted` scanned only `out_path` and reported
+`neff_count: 0` for a compile that had just succeeded — a receipt that errs
+safe but is still wrong. Both `smoke_round4.py` and
+`glm53-flash-command.sh` now scan the compile cache as well.
 
 The CTE bucket is **512, not 2048**, and that is a measured choice rather than
 a concession: at 2048 the prefill costs 709 s of HLO generation and 16 GiB of
@@ -530,6 +549,49 @@ It also carries the two gates this round paid for:
 Receipts written: `effective-shape.json` (resolved config, including
 `models_compiled` so an emit-phase restriction is visible), `compile-result.json`
 (emitted NEFF paths + sizes + emitted dtype flags), `terminal.json`.
+
+## THE next blocker: the checkpoint converter no longer matches the module tree
+
+Swapping the routed branch onto `ExpertMLPs` moved the expert parameters, and
+`checkpoint_convert.py` was not moved with them. It still emits the Round-3
+names (`checkpoint_convert.py:425-447`):
+
+```
+{layer}.mlp.gate    [E, hidden, inter]
+{layer}.mlp.up      [E, hidden, inter]
+{layer}.mlp.down    [E, inter, hidden]
+```
+
+Round 4 deleted those parameters. The module tree now wants NxDI's layout:
+
+```
+{layer}.mlp.expert_mlps.mlp_op.gate_up_proj.weight   # FUSED, stride=2
+{layer}.mlp.expert_mlps.mlp_op.down_proj.weight
+```
+
+Three distinct pieces of work, in order:
+
+1. **Fuse gate and up on the intermediate axis at `stride=2`**, matching
+   `ExpertFusedColumnParallelLinear`'s expectation, and shard on that axis for
+   the target TP. `Experts._activation` splits with `torch.chunk(x, 2, -1)`, so
+   the interleave has to match or gate and up swap silently — which reads as a
+   quality regression, not a crash.
+2. **Dequantize FP8 → bf16 at load.** The `weight_scale_inv` block scales are
+   *reciprocal* (multiply, do not divide), `weight_block_size=[128,128]`, and
+   `ExpertMLPs` holds bf16 weights with no quantisation wired. The HBM budget
+   above already assumes this.
+3. **Run it.** `_convert_glm53_checkpoint` has never been executed against the
+   real 76,108-tensor checkpoint — it was authored by reading
+   `model.safetensors.index.json` and is called from nothing. `load_hf_model`
+   still raises `NotImplementedError`. Every compile so far has been
+   shape-only, which is exactly why this defect survived the round.
+
+Until this lands, the NEFF cannot be populated and no number can be measured,
+so it gates everything downstream — the correctness gate against reference
+logits included. The traps recorded in Round 3 still apply: `hc_attn_scale` /
+`hc_ffn_scale` are hyper-connection parameters and not FP8 scales, the KDA
+block and `kv_b_proj` are BF16 with no scales at all, and
+`normalize_static_fp8_weight_format()` must stay uncalled.
 
 ## Files
 
