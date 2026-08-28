@@ -86,6 +86,7 @@ neuron = build_neuron_config(
     torch_dtype=source.torch_dtype,
     is_continuous_batching=True,
     disable_argmax_kernel=disable_argmax,
+    extra={"logical_nc_config": 2},
 )
 inference = DeepseekV4FlashNeuronInferenceConfig(
     neuron_config=neuron,
