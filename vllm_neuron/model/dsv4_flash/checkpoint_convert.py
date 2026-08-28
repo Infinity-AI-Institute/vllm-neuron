@@ -340,6 +340,58 @@ def dequantize_block_fp4_ue8m0(
     return result.to(out_dtype)
 
 
+# ---------------------------------------------------------------------------
+# HF DSv4-Flash routed-MoE checkpoint layout (source-cited).
+#
+# Verified against ``model.safetensors.index.json`` of HF snapshot
+# ``deepseek-ai/DeepSeek-V4-Flash-0731 @ 7872f01b1d1fe23eabc4c98b48bffcef5a386062``
+# (72,317 total keys; 11,776 keys each for w1/w2/w3 = 3 * 256 experts *
+# ~46 layers).
+#
+# Router-only keys (per routed-MoE layer i >= num_hash_layers):
+#     layers.<i>.ffn.gate.weight    : [n_routed_experts=256, hidden=4096]
+#     layers.<i>.ffn.gate.bias      : [n_routed_experts=256] fp32
+#         `.bias` is the `e_score_correction_bias` from
+#         `DeepseekV4TopKRouter` (`modeling_deepseek_v4.py:1042`);
+#         DeepSeek's on-disk `.pt` -> safetensors converter renames it
+#         `e_score_correction_bias -> bias`.  There is no additive bias in
+#         the `nn.Linear(bias=False)` router — the field is the
+#         selection-only correction.
+#
+# Shared-expert keys (identical layout on every MoE layer, hash or routed):
+#     layers.<i>.ffn.shared_experts.w1.{weight, scale}  -> gate_proj
+#     layers.<i>.ffn.shared_experts.w3.{weight, scale}  -> up_proj
+#     layers.<i>.ffn.shared_experts.w2.{weight, scale}  -> down_proj
+#
+# Routed-expert keys (per expert e in [0, n_routed_experts)):
+#     layers.<i>.ffn.experts.<e>.w1.{weight, scale}  -> gate  [I, H]
+#     layers.<i>.ffn.experts.<e>.w3.{weight, scale}  -> up    [I, H]
+#     layers.<i>.ffn.experts.<e>.w2.{weight, scale}  -> down  [H, I]
+#     (w1/w3 stored FP4-E2M1 packed 2 nibbles / byte along K axis;
+#      w2 same.  Scale is UE8M0 `float8_e8m0fnu`, block (1, 32) on K.)
+#
+# The ``w1/w2/w3`` naming comes from DeepSeek's original inference
+# reference (repo ``deepseek-ai/DeepSeek-V4-Flash-0731`` at
+# ``inference/model.py``); the transformers HF wrapper renames it at load
+# time to ``gate_proj/down_proj/up_proj``, and further packs w1+w3 into a
+# single ``gate_up_proj`` per-expert 3-D parameter (see
+# ``modeling_deepseek_v4.py:1001``, ``DeepseekV4Experts.gate_up_proj``:
+# ``nn.Parameter(torch.empty(num_experts, 2 * intermediate_dim, hidden_dim))``).
+# We do the same fuse in the converter, and additionally transpose to
+# NxDI's ``[E, hidden, 2*I]`` shape convention (identical structural
+# layout to GLM-5.3-Flash Round 5, see
+# ``glm53_flash/checkpoint_convert.py::_convert_moe_layer``).
+# ---------------------------------------------------------------------------
+
+FFN_PREFIX = "ffn."
+ROUTED_EXPERTS_SUBTREE = "experts"
+SHARED_EXPERTS_SUBTREE = "shared_experts"
+ROUTER_KEY = "ffn.gate.weight"
+ROUTER_CORRECTION_BIAS_KEY = "ffn.gate.bias"
+# HF DSv4-Flash routed-expert w1/w2/w3 FP4 block shape (K axis, per-row).
+DSV4_FP4_BLOCK_SIZE: tuple[int, int] = (1, 32)
+
+
 def _dequant_or_cast(
     state_dict: dict[str, Any],
     key: str,
@@ -377,6 +429,286 @@ def _dequant_or_cast(
     if dtype_hint == "fp4":
         return dequantize_block_fp4_ue8m0(weight, scale, block_size, out_dtype)
     raise ValueError(f"unknown dtype_hint {dtype_hint!r}")
+
+
+def _dsv4_scale_key_for(weight_key: str) -> str:
+    """Return the HF scale key paired with a DSv4-Flash weight key.
+
+    HF DSv4-Flash convention (verified against the safetensors index of
+    snapshot ``deepseek-ai/DeepSeek-V4-Flash-0731 @ 7872f01b1d1fe...``):
+    every quantized weight ``<base>.<name>.weight`` has its block scale
+    stored as a sibling ``<base>.<name>.scale`` — NOT
+    ``<base>.<name>.weight.scale`` (which is what
+    :func:`_dequant_or_cast` expects for GLM-5.3-Flash's
+    ``_scale_inv`` convention).  Getting this wrong is a silent
+    correctness failure: the weight would land at ``2**0=1`` scale
+    across every tile instead of the real UE8M0 exponent.
+    """
+    if not weight_key.endswith(".weight"):
+        raise ValueError(
+            f"DSv4-Flash scale-key computation expects a '.weight' suffix; "
+            f"got {weight_key!r}"
+        )
+    return weight_key[: -len(".weight")] + SCALE_SUFFIX
+
+
+def _dequant_expert_fp4_weight(
+    state_dict: dict[str, Any],
+    key: str,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize one FP4-UE8M0 routed-expert tensor to ``out_dtype``.
+
+    Wraps :func:`dequantize_block_fp4_ue8m0` at the DSv4-Flash-frozen
+    ``block_size=(1, 32)``.  Every silent-corruption guard the primitive
+    ships (weight-dtype, block-scale shape, NaN scale) is inherited.  A
+    missing weight OR scale raises loudly — a partial routed expert is a
+    correctness bug, not a "soft skip" case.
+
+    Uses the DSv4 scale-naming convention via :func:`_dsv4_scale_key_for`.
+    """
+    weight = state_dict.get(key)
+    if weight is None:
+        raise KeyError(f"missing routed-expert weight {key!r}")
+    scale_key = _dsv4_scale_key_for(key)
+    scale = state_dict.get(scale_key)
+    if scale is None:
+        raise KeyError(
+            f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}"
+        )
+    return dequantize_block_fp4_ue8m0(
+        weight, scale, DSV4_FP4_BLOCK_SIZE, out_dtype
+    )
+
+
+def _dequant_shared_fp8_weight(
+    state_dict: dict[str, Any],
+    key: str,
+    block_size: tuple[int, int],
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize one FP8-UE8M0 shared-expert (or other non-routed) tensor.
+
+    Same DSv4 scale-naming convention as
+    :func:`_dequant_expert_fp4_weight`, dispatched to
+    :func:`dequantize_block_fp8_ue8m0` (native-E4M3 path with UE8M0
+    scale).  Missing weight OR scale raises loudly.
+    """
+    weight = state_dict.get(key)
+    if weight is None:
+        raise KeyError(f"missing shared/non-routed weight {key!r}")
+    scale_key = _dsv4_scale_key_for(key)
+    scale = state_dict.get(scale_key)
+    if scale is None:
+        raise KeyError(
+            f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}"
+        )
+    return dequantize_block_fp8_ue8m0(weight, scale, block_size, out_dtype)
+
+
+def _convert_shared_expert(
+    state_dict: dict[str, Any],
+    converted: dict[str, Any],
+    hf_base: str,
+    wrapper_target: str,
+    dtype: torch.dtype,
+    block_size_fp8: tuple[int, int],
+) -> None:
+    """Shared-expert path: dequant + rename w1/w3/w2 -> gate/up/down.
+
+    Same layout convention as ``DeepseekV4MLP`` (line 974 in the HF
+    modeling file).  Weight naming matches DeepSeek's inference reference:
+    ``w1 -> gate_proj``, ``w3 -> up_proj``, ``w2 -> down_proj``.  Shared
+    experts are FP8-e4m3 with UE8M0 block scale at block ``(128, 128)``
+    (the ``quantization_config.weight_block_size`` on the top-level
+    config), NOT the routed FP4 block ``(1, 32)`` — this is why the
+    converter carries two block-size arguments.
+    """
+    hf_map = (
+        ("w1", "gate_proj"),
+        ("w3", "up_proj"),
+        ("w2", "down_proj"),
+    )
+    for hf_name, wrapper_name in hf_map:
+        key = f"{hf_base}{FFN_PREFIX}{SHARED_EXPERTS_SUBTREE}.{hf_name}.weight"
+        tensor = _dequant_shared_fp8_weight(
+            state_dict, key, block_size_fp8, dtype
+        )
+        converted[f"{wrapper_target}shared_expert.{wrapper_name}.weight"] = (
+            tensor
+        )
+
+
+def _convert_routed_moe_layer(
+    state_dict: dict[str, Any],
+    converted: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash routed-MoE layer HF -> wrapper module tree.
+
+    This is the routed-MoE per-layer helper.  It is safe to invoke on
+    layers ``[num_hash_layers, num_hidden_layers)``; the caller decides
+    whether the schedule permits it (the frozen
+    ``src.mlp_layer_types[layer_idx]`` MUST equal ``"moe"``).
+
+    Structure it produces (for one layer i):
+
+      * ``{wrapper_prefix}layers.<i>.mlp.router.weight``            fp32
+      * ``{wrapper_prefix}layers.<i>.mlp.e_score_correction_bias``  fp32
+      * ``{wrapper_prefix}layers.<i>.mlp.shared_expert.gate_proj.weight``  dtype
+      * ``{wrapper_prefix}layers.<i>.mlp.shared_expert.up_proj.weight``    dtype
+      * ``{wrapper_prefix}layers.<i>.mlp.shared_expert.down_proj.weight``  dtype
+      * ``{wrapper_prefix}layers.<i>.mlp.expert_mlps.mlp_op.gate_up_proj.weight``
+            shape ``[n_routed_experts, hidden, 2 * moe_intermediate_size]``
+            stride=2 fused ``[gate_full | up_full]`` on last axis
+      * ``{wrapper_prefix}layers.<i>.mlp.expert_mlps.mlp_op.down_proj.weight``
+            shape ``[n_routed_experts, moe_intermediate_size, hidden]``
+
+    Also returns a per-layer conversion report keyed under
+    ``_routed_moe_report`` on the ``converted`` dict for debugging and
+    the per-layer smoke — the report is a plain dict, not a tensor, so it
+    never lands in NxDI's state_dict traversal.
+
+    The per-expert dequant is FP4-UE8M0 at block ``(1, 32)`` on the K
+    axis (per :func:`dequantize_block_fp4_ue8m0`) — bit-exact against the
+    HF inference reference at
+    ``inference/kernel.py::fp4_gemm_kernel`` @ SHA ``7872f01b1d1fe...``.
+
+    NxDI's ExpertMLPs weight layout is ``[E, hidden, 2*I]`` for
+    ``gate_up_proj`` and ``[E, I, hidden]`` for ``down_proj`` — same as
+    GLM-5.3-Flash Round 5.
+    """
+    dtype = dtype if dtype is not None else src.torch_dtype
+    if src.mlp_layer_types[layer_idx] != "moe":
+        raise ValueError(
+            f"_convert_routed_moe_layer called for layer {layer_idx} but "
+            f"mlp_layer_types[{layer_idx}]="
+            f"{src.mlp_layer_types[layer_idx]!r} — refusing to route a "
+            "hash-MoE layer through the routed-MoE converter."
+        )
+    hidden = src.hidden_size
+    inter = src.moe_intermediate_size
+    n_experts = src.n_routed_experts
+    block_fp8 = tuple(src.quantization_config.weight_block_size)
+
+    hf_base = f"{hf_prefix}layers.{layer_idx}."
+    target = f"{wrapper_prefix}layers.{layer_idx}.mlp."
+
+    # ---- router + correction bias ----
+    router_key = f"{hf_base}{ROUTER_KEY}"
+    router = state_dict.get(router_key)
+    if router is None:
+        raise KeyError(f"missing router weight {router_key!r}")
+    if tuple(router.shape) != (n_experts, hidden):
+        raise ValueError(
+            f"router weight {router_key!r} shape {tuple(router.shape)} "
+            f"disagrees with expected ({n_experts}, {hidden})"
+        )
+    # Router lives in fp32 in the wrapper — cast at conversion so no cast
+    # is inserted at forward time.
+    converted[f"{target}router.weight"] = router.to(torch.float32)
+
+    corr_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
+    corr = state_dict.get(corr_key)
+    if corr is None:
+        # A missing correction bias degrades gracefully to top-k on the raw
+        # scores; the wrapper declares the parameter with a zero default so
+        # this is a documented soft fallback.  Record it in the report.
+        e_bias_present = False
+    else:
+        if tuple(corr.shape) != (n_experts,):
+            raise ValueError(
+                f"correction bias {corr_key!r} shape {tuple(corr.shape)} "
+                f"disagrees with expected ({n_experts},)"
+            )
+        converted[f"{target}e_score_correction_bias"] = corr.to(torch.float32)
+        e_bias_present = True
+
+    # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
+    _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
+
+    # ---- routed experts (FP4-UE8M0, block (1, 32)) ----
+    #
+    # HF stores per expert:
+    #   w1 (gate): [inter, hidden]      packed FP4 -> [inter, hidden/2] int8
+    #   w3 (up)  : [inter, hidden]      packed FP4 -> [inter, hidden/2] int8
+    #   w2 (down): [hidden, inter]      packed FP4 -> [hidden, inter/2] int8
+    #
+    # We dequant each to bf16 (or `dtype`) at native shape, then stack across
+    # experts and fuse gate|up on the intermediate axis, then transpose to
+    # [E, hidden, 2*I] / [E, I, hidden].
+    #
+    # Materialising all 256 experts into one stacked tensor per layer is
+    # ~4.0 GiB (gate_up) + ~2.0 GiB (down) at bf16 — smaller than GLM's
+    # 288-expert case because DSv4's moe_intermediate_size (2048) is the
+    # same and n_experts is one fewer.  Streaming would still be Round 3
+    # material; for the per-layer smoke we do it in-memory.
+    gate_stack: list[torch.Tensor] = []
+    up_stack: list[torch.Tensor] = []
+    down_stack: list[torch.Tensor] = []
+    for e in range(n_experts):
+        base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
+        gate = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w1.weight", dtype
+        )
+        up = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w3.weight", dtype
+        )
+        down = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w2.weight", dtype
+        )
+        if tuple(gate.shape) != (inter, hidden):
+            raise ValueError(
+                f"expert {e} w1 (gate) shape {tuple(gate.shape)} != "
+                f"({inter}, {hidden}); layer {layer_idx}"
+            )
+        if tuple(up.shape) != (inter, hidden):
+            raise ValueError(
+                f"expert {e} w3 (up) shape {tuple(up.shape)} != "
+                f"({inter}, {hidden}); layer {layer_idx}"
+            )
+        if tuple(down.shape) != (hidden, inter):
+            raise ValueError(
+                f"expert {e} w2 (down) shape {tuple(down.shape)} != "
+                f"({hidden}, {inter}); layer {layer_idx}"
+            )
+        gate_stack.append(gate)
+        up_stack.append(up)
+        down_stack.append(down)
+
+    # Stack along the new leading expert axis.
+    gate_stacked = torch.stack(gate_stack, dim=0)      # [E, I, H]
+    up_stacked = torch.stack(up_stack, dim=0)          # [E, I, H]
+    down_stacked = torch.stack(down_stack, dim=0)      # [E, H, I]
+    # Fuse gate|up on the intermediate axis, then transpose to [E, H, 2I].
+    gate_up_stacked = torch.cat([gate_stacked, up_stacked], dim=1)  # [E, 2I, H]
+    gate_up_stacked = gate_up_stacked.transpose(1, 2).contiguous()  # [E, H, 2I]
+    down_stacked = down_stacked.transpose(1, 2).contiguous()        # [E, I, H]
+
+    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = (
+        gate_up_stacked
+    )
+    converted[f"{target}expert_mlps.mlp_op.down_proj.weight"] = down_stacked
+
+    report = {
+        "layer_idx": layer_idx,
+        "n_routed_experts": n_experts,
+        "hidden": hidden,
+        "moe_intermediate": inter,
+        "gate_up_shape": tuple(gate_up_stacked.shape),
+        "down_shape": tuple(down_stacked.shape),
+        "e_score_correction_bias_present": e_bias_present,
+        "dtype": str(dtype),
+        "block_size_fp4": DSV4_FP4_BLOCK_SIZE,
+        "block_size_fp8_shared": block_fp8,
+    }
+    converted.setdefault("_routed_moe_reports", {})[layer_idx] = report
+    return report
 
 
 def _convert_dsv4_checkpoint(
@@ -470,17 +802,28 @@ def _convert_dsv4_checkpoint(
 
 
 __all__ = [
+    "DSV4_FP4_BLOCK_SIZE",
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
     "EXPECTED_HF_TOTAL_SIZE_BYTES",
+    "FFN_PREFIX",
     "FINAL_NORM_KEY",
     "HC_PARAM_SUFFIXES",
     "LM_HEAD_KEY",
+    "ROUTED_EXPERTS_SUBTREE",
+    "ROUTER_CORRECTION_BIAS_KEY",
+    "ROUTER_KEY",
     "SCALE_SUFFIX",
+    "SHARED_EXPERTS_SUBTREE",
     "TEXT_LAYER_PREFIX",
     "_FP4_E2M1_TABLE",
     "_convert_dsv4_checkpoint",
+    "_convert_routed_moe_layer",
+    "_convert_shared_expert",
+    "_dequant_expert_fp4_weight",
     "_dequant_or_cast",
+    "_dequant_shared_fp8_weight",
+    "_dsv4_scale_key_for",
     "dequantize_block_fp4_ue8m0",
     "dequantize_block_fp8_ue8m0",
     "is_block_scale_key",
