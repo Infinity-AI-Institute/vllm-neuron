@@ -711,6 +711,146 @@ def _convert_routed_moe_layer(
     return report
 
 
+ATTN_PREFIX = "attn."
+ATTN_NORM_KEY = "attn_norm.weight"
+# MQA-block-owned parameter names (mirror of `_MQABlock.PARAM_KEYS` in
+# neuron_wrapper.py — kept in sync at review time).  Every quantized
+# entry is FP8 e4m3 with a UE8M0 block scale under the checkpoint's
+# `quantization_config.weight_block_size = (128, 128)`.  The `.scale`
+# tail is added by :func:`_dsv4_scale_key_for` and is present on every
+# `.weight` in this list except the two RMSNorm gains and the sink,
+# which are stored dense.
+_MQA_FP8_WEIGHT_NAMES: tuple[str, ...] = (
+    "wq_a.weight",
+    "wq_b.weight",
+    "wkv.weight",
+    "wo_a.weight",
+    "wo_b.weight",
+)
+_MQA_DENSE_NAMES: tuple[str, ...] = (
+    "q_norm.weight",
+    "kv_norm.weight",
+    "attn_sink",
+)
+
+
+def _convert_mqa_block(
+    state_dict: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+    require_attn_sink: bool = True,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash MQA attention block HF -> wrapper module tree.
+
+    Reads the 8 `layers.<i>.attn.*` HF tensors (verified against
+    `model.safetensors.index.json` of snapshot 7872f01b), dequants the
+    five FP8-UE8M0 weights to `dtype` (bf16 by default), and carries the
+    three dense tensors (`q_norm.weight`, `kv_norm.weight`, `attn_sink`)
+    through unchanged.
+
+    Also returns the sibling `layers.<i>.attn_norm.weight` (the
+    pre-attention RMSNorm at the decoder-layer level) — it does not live
+    inside the MQA block but is emitted alongside so a caller that owns
+    the whole layer tree can drop the returned dict into `converted` in
+    one call.
+
+    Shape assertions match the wrapper's declared parameter shapes:
+
+      * wq_a.weight       [q_lora_rank, hidden_size]
+      * wq_b.weight       [num_heads * head_dim, q_lora_rank]
+      * wkv.weight        [head_dim, hidden_size]           (single KV head)
+      * wo_a.weight       [o_groups * o_lora_rank,
+                           (num_heads * head_dim) // o_groups]
+      * wo_b.weight       [hidden_size, o_groups * o_lora_rank]
+      * q_norm.weight     [q_lora_rank]
+      * kv_norm.weight    [head_dim]
+      * attn_sink         [num_heads]
+      * attn_norm.weight  [hidden_size]                     (sibling, not MQA)
+
+    Fail-loud on any missing weight or scale — silently degrading to a
+    zero-fill or an identity RMSNorm would produce plausible-looking
+    logits that are quietly wrong.  `attn_sink` is a per-head learnable
+    bias with a documented default of zeros; the checkpoint carries a
+    trained value.  `require_attn_sink=True` refuses to fall back to
+    zeros because the training run relies on it — set False only for
+    smoke tests that deliberately zero the sink.
+    """
+    dtype = dtype if dtype is not None else src.torch_dtype
+    hidden = int(src.hidden_size)
+    num_heads = int(src.num_attention_heads)
+    head_dim = int(src.head_dim)
+    q_lora_rank = int(src.q_lora_rank)
+    o_groups = int(src.o_groups)
+    o_lora_rank = int(src.o_lora_rank)
+    in_per_group = (num_heads * head_dim) // o_groups
+    block_fp8 = tuple(src.quantization_config.weight_block_size)
+
+    hf_base = f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}"
+    layer_root = f"{hf_prefix}layers.{layer_idx}."
+    target = f"{wrapper_prefix}layers.{layer_idx}.attn."
+
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "wq_a.weight": (q_lora_rank, hidden),
+        "wq_b.weight": (num_heads * head_dim, q_lora_rank),
+        "wkv.weight": (head_dim, hidden),
+        "wo_a.weight": (o_groups * o_lora_rank, in_per_group),
+        "wo_b.weight": (hidden, o_groups * o_lora_rank),
+        "q_norm.weight": (q_lora_rank,),
+        "kv_norm.weight": (head_dim,),
+        "attn_sink": (num_heads,),
+    }
+
+    converted: dict[str, Any] = {}
+
+    # ---- FP8-UE8M0 weights (dequant to dtype) ----
+    for name in _MQA_FP8_WEIGHT_NAMES:
+        hf_key = f"{hf_base}{name}"
+        tensor = _dequant_shared_fp8_weight(state_dict, hf_key, block_fp8, dtype)
+        if tuple(tensor.shape) != expected_shapes[name]:
+            raise ValueError(
+                f"{hf_key!r} dequant shape {tuple(tensor.shape)} disagrees "
+                f"with wrapper-expected {expected_shapes[name]}"
+            )
+        converted[f"{target}{name}"] = tensor
+
+    # ---- dense tensors (norm gains + sink) ----
+    for name in _MQA_DENSE_NAMES:
+        hf_key = f"{hf_base}{name}"
+        raw = state_dict.get(hf_key)
+        if raw is None:
+            if name == "attn_sink" and not require_attn_sink:
+                # Documented soft fallback for smoke: a zero sink degrades
+                # to plain softmax over the KV axis.
+                raw = torch.zeros(num_heads, dtype=dtype)
+            else:
+                raise KeyError(f"missing {hf_key!r}")
+        if tuple(raw.shape) != expected_shapes[name]:
+            raise ValueError(
+                f"{hf_key!r} shape {tuple(raw.shape)} disagrees with "
+                f"wrapper-expected {expected_shapes[name]}"
+            )
+        converted[f"{target}{name}"] = raw.to(dtype)
+
+    # ---- sibling: pre-attention RMSNorm at the decoder-layer level ----
+    attn_norm_hf = f"{layer_root}{ATTN_NORM_KEY}"
+    attn_norm_raw = state_dict.get(attn_norm_hf)
+    if attn_norm_raw is None:
+        raise KeyError(f"missing {attn_norm_hf!r}")
+    if tuple(attn_norm_raw.shape) != (hidden,):
+        raise ValueError(
+            f"{attn_norm_hf!r} shape {tuple(attn_norm_raw.shape)} != ({hidden},)"
+        )
+    converted[f"{wrapper_prefix}layers.{layer_idx}.attn_norm.weight"] = (
+        attn_norm_raw.to(dtype)
+    )
+
+    return converted
+
+
 def _convert_dsv4_checkpoint(
     state_dict: dict[str, Any],
     src: DeepseekV4FlashInferenceConfig,
@@ -802,6 +942,8 @@ def _convert_dsv4_checkpoint(
 
 
 __all__ = [
+    "ATTN_NORM_KEY",
+    "ATTN_PREFIX",
     "DSV4_FP4_BLOCK_SIZE",
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
@@ -817,7 +959,10 @@ __all__ = [
     "SHARED_EXPERTS_SUBTREE",
     "TEXT_LAYER_PREFIX",
     "_FP4_E2M1_TABLE",
+    "_MQA_DENSE_NAMES",
+    "_MQA_FP8_WEIGHT_NAMES",
     "_convert_dsv4_checkpoint",
+    "_convert_mqa_block",
     "_convert_routed_moe_layer",
     "_convert_shared_expert",
     "_dequant_expert_fp4_weight",
