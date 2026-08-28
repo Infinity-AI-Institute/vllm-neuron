@@ -151,6 +151,22 @@ GLM53_BLOCKWISE_MATMUL_WORKAROUND: dict[str, bool] = {
     "skip_dma_token": True,
 }
 
+# Fields that would flag an FP8-packed KV cache — DELIBERATELY FORBIDDEN on
+# GLM-5.3-Flash.  Mirrors the GLM-5.2 fail-loud guard at
+# ``vllm-neuron:apuroop/glm5-2-enablement:vllm_neuron/model/glm52_moe_dsa/
+# factory.py:260-261``.  Structural reason: this wrapper replaces NxDI's
+# ``KVCacheManager`` with its own hybrid state cache (see
+# ``_NeuronGlm53FlashModel.init_inference_optimization``) — the aliased
+# tensors are declared bf16 explicitly, and any FP8-KV request would emit a
+# neuron_config.json advertising ``float8_e4m3fn`` KV while the actual
+# tensors stayed bf16.  That "requested-vs-emitted" split is exactly the
+# silent-drop failure class this port refuses to inherit.
+FORBIDDEN_FP8_KV_KEYS: tuple[str, ...] = (
+    "fp8_packed_kv",
+    "kv_cache_quant",
+    "kv_quant_config",
+)
+
 
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
@@ -198,6 +214,23 @@ def build_neuron_config(
     ``"LNC_1 kernels not available in nkilib"``.
     """
     _require_nxdi()
+    # Fail-loud FP8-KV guard.  Any legacy contract that carries
+    # ``fp8_packed_kv`` / ``kv_cache_quant`` / ``kv_quant_config`` blows up
+    # here rather than silently landing on bf16 KV.  See
+    # ``FORBIDDEN_FP8_KV_KEYS`` for the structural reason.  Mirrored at the
+    # compile-driver layer in ``/mnt/compile/shared-images/glm53-flash-command.sh``
+    # so both entry points refuse the same set.
+    if extra:
+        offenders = sorted(k for k in FORBIDDEN_FP8_KV_KEYS if k in extra)
+        if offenders:
+            raise ValueError(
+                "GLM-5.3-Flash refuses FP8-packed KV configuration: "
+                f"{offenders!r}. This wrapper replaces NxDI's KVCacheManager "
+                "with its own hybrid state cache (KDA + DSA + indexer); the "
+                "aliased state tensors are declared bf16 explicitly and any "
+                "FP8-KV request would silently mismatch the emitted "
+                "neuron_config.json against the actual tensor dtypes."
+            )
     kwargs = {
         "tp_degree": tp_degree,
         "batch_size": tkg_batch_size,
@@ -2035,6 +2068,17 @@ if _NXDI_AVAILABLE:
         GLM53_SOURCE_CACHE_ABI = GLM53_SOURCE_CACHE_ABI
         _GLM53_GRAPH_ID = _GLM53_GRAPH_ID
 
+        # HF checkpoint prefix strip.  We accept NxDI's default
+        # ``_STATE_DICT_MODEL_PREFIX = "model."`` (strip to ``""``), so the
+        # converter (``checkpoint_convert._convert_glm53_checkpoint``) sees
+        # keys under ``language_model.`` (text) and ``visual.`` (vision).
+        # ``lm_head.weight`` never carries a ``model.`` prefix in the HF
+        # index and survives the strip untouched.  Keeping the default
+        # matters because the strip only replaces one occurrence: switching
+        # to ``"model.language_model."`` would leave ``model.visual.``
+        # untouched, which would then miss ``is_vision_key`` and try to
+        # convert vision tensors into the text module tree.
+
         # NxDI's default `emit_phases` (via `enable_context_encoding`
         # + `enable_token_generation`) covers CTE + TKG together.  A caller
         # that wants TKG-only or CTE-only artifacts sets the corresponding
@@ -2050,11 +2094,53 @@ if _NXDI_AVAILABLE:
 
         @staticmethod
         def load_hf_model(model_path: str, **kwargs: Any):
-            raise NotImplementedError(
-                "GLM-5.3-Flash HF direct load is deferred to Round 3 "
-                "alongside device-attached NKI kernels; the compile-driver "
-                "smoke uses `initialize_model_weights=False`."
+            """HF-side loader shim.
+
+            NxDI's ``get_state_dict`` only calls this when ``model_path`` is
+            neither an existing directory nor an existing file (i.e. a
+            Hub model id).  On the compile path ``model_path`` is the
+            snapshot directory ``.../04c4e9e9...`` so NxDI takes the
+            ``load_state_dict(directory)`` branch instead and never touches
+            this method.
+
+            For the direct-HuggingFace path we intentionally do NOT
+            instantiate a HF ``AutoModelForCausalLM`` — GLM-5.3-Flash has no
+            in-tree HF modelling module and the transformers loader would
+            need the full FP8 kernels the campaign explicitly does not
+            ship.  Rather than raise, we return a minimal ``nn.Module``
+            whose ``state_dict()`` reads the safetensors shards from disk
+            via NxDI's own ``load_state_dict`` helper, which is exactly what
+            the directory branch would have used.  This keeps the two
+            code paths semantically identical so a caller that forgets the
+            directory contract does not silently drop into a stub.
+
+            Any other ``kwargs`` (``trust_remote_code``, ``revision``, ...)
+            are accepted for API parity and ignored — the campaign never
+            fetches from the network.
+            """
+            del kwargs  # network-fetch kwargs are inert here.
+            import os
+            from neuronx_distributed_inference.modules.checkpoint import (
+                load_state_dict as _load_state_dict,
             )
+
+            if not os.path.isdir(model_path):
+                raise NotImplementedError(
+                    "GLM-5.3-Flash load_hf_model requires a local snapshot "
+                    f"directory; got {model_path!r}. Hub-name fetch is not "
+                    "supported by this campaign."
+                )
+            sd = _load_state_dict(model_path)
+
+            class _Glm53HfShell(torch.nn.Module):
+                def __init__(self, state: dict) -> None:
+                    super().__init__()
+                    self._state = state
+
+                def state_dict(self, *_args: Any, **_kwargs: Any) -> dict:
+                    return self._state
+
+            return _Glm53HfShell(sd)
 
         @staticmethod
         def convert_hf_to_neuron_state_dict(
