@@ -108,6 +108,7 @@ try:
     )
     from neuronx_distributed_inference.models.config import (
         InferenceConfig as _NxdiInferenceConfig,
+        MoENeuronConfig as _NxdiMoENeuronConfig,
         NeuronConfig as _NxdiNeuronConfig,
     )
     from neuronx_distributed.parallel_layers.layers import (
@@ -125,6 +126,7 @@ except Exception as exc:  # pragma: no cover - CPU-only guard
     NeuronBaseModel = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdiInferenceConfig = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdiNeuronConfig = _NxdiUnavailable  # type: ignore[assignment,misc]
+    _NxdiMoENeuronConfig = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdColumnParallelLinear = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdRowParallelLinear = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdParallelEmbedding = _NxdiUnavailable  # type: ignore[assignment,misc]
@@ -165,12 +167,26 @@ def build_neuron_config(
     disable_argmax_kernel: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> Any:
-    """Construct an NxDI ``NeuronConfig`` with the GLM-5.3 MoE workaround pinned.
+    """Construct an NxDI ``MoENeuronConfig`` with the GLM-5.3 MoE workaround pinned.
 
-    The blockwise-matmul workaround MUST be inside ``blockwise_matmul_config``
-    at construction time — the ``InferenceConfig.__init__`` reads
-    ``kwargs["blockwise_matmul_config"]`` and freezes it via
-    ``BlockwiseMatmulConfig.from_kwargs`` before the model can observe it.
+    **This must be a ``MoENeuronConfig``, not a ``NeuronConfig``.**
+    ``blockwise_matmul_config`` is popped and frozen at
+    ``models/config.py:837-839``, which is inside ``MoENeuronConfig``
+    (declared at :798, next class at :849) — **not** the base ``NeuronConfig``
+    (:84).  Passing it to the base class makes NxDI log
+
+        NeuronConfig init: Unexpected keyword arguments: {'blockwise_matmul_config': ...}
+
+    and silently drop it.  That is not cosmetic: with the flag dropped, the
+    LNC=2 blockwise dispatch (``modules/moe/blockwise.py:1005-1017``) falls
+    through to ``_call_shard_hidden_kernel``, which in this container is a stub
+    that unconditionally raises ``NotImplementedError`` (``blockwise.py:267``).
+    So the flag is not a performance knob — it is the only way to reach a real
+    kernel on this build.  (``use_shard_on_block_dynamic_while`` is the one
+    alternative; the two are mutually exclusive per the assert at :927.)
+
+    LNC=1 is not an option at all for MoE here — the ``else`` branch raises
+    ``"LNC_1 kernels not available in nkilib"``.
     """
     _require_nxdi()
     kwargs = {
@@ -198,7 +214,23 @@ def build_neuron_config(
             merged = dict(GLM53_BLOCKWISE_MATMUL_WORKAROUND)
             merged.update(extra_bmc)
             kwargs["blockwise_matmul_config"] = merged
-    return _NxdiNeuronConfig(**kwargs)
+    config = _NxdiMoENeuronConfig(**kwargs)
+    # Fail loudly if the flag did not survive construction — a silently
+    # dropped flag compiles and then dies inside the raising stub, far from
+    # the cause.
+    bmc = getattr(config, "blockwise_matmul_config", None)
+    if bmc is None or not getattr(
+        bmc, "use_shard_on_intermediate_dynamic_while", False
+    ):
+        raise RuntimeError(
+            "GLM-5.3-Flash MoE requires "
+            "blockwise_matmul_config.use_shard_on_intermediate_dynamic_while=True "
+            "to survive NeuronConfig construction; it did not. Without it the "
+            "LNC=2 blockwise dispatch falls into _call_shard_hidden_kernel, "
+            "which raises NotImplementedError on this container. Got: "
+            f"{bmc!r}"
+        )
+    return config
 
 
 class Glm53FlashNeuronInferenceConfig(_NxdiInferenceConfig):
@@ -1830,6 +1862,67 @@ if _NXDI_AVAILABLE:
             fields_dict["linear_attn_config"].kda_layers = (0,)
             fields_dict["linear_attn_config"].full_attn_layers = ()
             fields_dict["indexer_types"] = ("full",)
+            slim = Glm53FlashInferenceConfig(**fields_dict)
+            return cls.build_inference_config(
+                slim,
+                tp_degree=tp_degree,
+                ctx_batch_size=ctx_batch_size,
+                tkg_batch_size=tkg_batch_size,
+                seq_len=seq_len,
+            )
+
+        @classmethod
+        def build_kernel_coverage_smoke_config(
+            cls,
+            source_config: Glm53FlashInferenceConfig,
+            *,
+            tp_degree: int = 8,
+            ctx_batch_size: int = 1,
+            tkg_batch_size: int = 1,
+            seq_len: int = 128,
+        ) -> "Glm53FlashNeuronInferenceConfig":
+            """4-layer reduced config that exercises ALL THREE bound kernels.
+
+            ``build_one_layer_smoke_config`` deliberately forces KDA + dense so
+            the stack is minimal — which means a pass there says nothing about
+            the DSA sparse-attention path or the routed-MoE path.  This config
+            reproduces the real layer-0..3 prefix of GLM-5.3-Flash:
+
+                layer 0  linear_attention + dense    (KDA kernel, dense MLP)
+                layer 1  linear_attention + dense
+                layer 2  linear_attention + dense
+                layer 3  deepseek_sparse_attention + sparse
+                         (DSA indexer kernel + 288-expert routed MoE kernel)
+
+            so a pass covers KDA, DSA and MoE in one trace.  Layer 3 being the
+            first DSA/MoE layer matches the checkpoint exactly
+            (``first_k_dense_replace=3``, DSA at indices 3,7,...,43).
+            """
+            reduced = copy.deepcopy(source_config)
+            fields_dict = {
+                name: getattr(reduced, name)
+                for name in reduced.__dataclass_fields__
+            }
+            fields_dict["allow_reduced_shapes"] = True
+            fields_dict["num_hidden_layers"] = 4
+            fields_dict["layer_types"] = (
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "deepseek_sparse_attention",
+            )
+            fields_dict["mlp_layer_types"] = (
+                "dense",
+                "dense",
+                "dense",
+                "sparse",
+            )
+            fields_dict["linear_attn_config"] = copy.deepcopy(
+                reduced.linear_attn_config
+            )
+            fields_dict["linear_attn_config"].kda_layers = (0, 1, 2)
+            fields_dict["linear_attn_config"].full_attn_layers = (3,)
+            fields_dict["indexer_types"] = ("full",) * 4
             slim = Glm53FlashInferenceConfig(**fields_dict)
             return cls.build_inference_config(
                 slim,

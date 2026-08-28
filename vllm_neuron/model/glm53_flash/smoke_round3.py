@@ -183,11 +183,18 @@ def main() -> int:
     NeuronGlm53FlashForCausalLM = wrapper_mod.NeuronGlm53FlashForCausalLM
 
     tp = int(os.environ.get("GLM53_SMOKE_TP", "8"))
+    # GLM53_SMOKE_MODE=coverage traces KDA + DSA + routed-MoE in one graph;
+    # the default 1-layer mode is KDA + dense only and proves nothing about
+    # the other two kernels.
+    mode = os.environ.get("GLM53_SMOKE_MODE", "one-layer")
+    builder = (
+        NeuronGlm53FlashForCausalLM.build_kernel_coverage_smoke_config
+        if mode == "coverage"
+        else NeuronGlm53FlashForCausalLM.build_one_layer_smoke_config
+    )
     cfg = stage(
-        "4b.smoke-config",
-        lambda: NeuronGlm53FlashForCausalLM.build_one_layer_smoke_config(
-            source, tp_degree=tp, seq_len=128
-        ),
+        f"4b.smoke-config[{mode}]",
+        lambda: builder(source, tp_degree=tp, seq_len=128),
     )
     if cfg is None:
         return _finish(1)

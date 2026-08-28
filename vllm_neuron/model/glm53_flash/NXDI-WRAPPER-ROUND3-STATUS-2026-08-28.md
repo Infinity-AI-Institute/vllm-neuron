@@ -5,13 +5,17 @@ Branch: `codex/glm53-flash-enablement` · commit `c6e10b0` (local only, not push
 
 ## Headline
 
-**Smoke = FAIL at stage 6 (dry-run compile). Stages 1–5 PASS.** The failure is
-real, reproducible, and localized; the traceback is below. No NEFF was produced,
-no compile was fired, and nothing here claims a result it did not measure.
+**Smoke = PASS. All 8 stages green, `Compiler status PASS`.** The 1-layer
+GLM-5.3-Flash graph traces, lowers, and compiles under NxDI `e05466c` in
+container `sha256:011d49c7`.
 
-The single most valuable result of this turn is independent of the compile:
-**the KDA torch port is bit-exact against the numpy CPU golden (max abs error
-0.0 across 4 seeds)**, measured inside the NxDI container on the compile host.
+Two results worth separating from the compile itself:
+
+- **The KDA torch port is bit-exact against the numpy CPU golden** — max abs
+  error `0.0` across 4 seeds, measured inside the container on the compile host.
+- **The lowering failure that blocked this for most of the turn was misdiagnosed
+  by its own error message.** See "Root cause" below; the fix is three lines and
+  the wrong reading would have cost far more.
 
 ## Smoke result
 
@@ -31,58 +35,52 @@ Receipt: `/mnt/compile/runroot/glm53-smoke/glm53-smoke-result.json`
 | 4b. 1-layer reduced config | PASS |
 | 4c. wrapper import | PASS |
 | 5. wrapper construct | PASS |
-| 6. dry-run compile | **FAIL** |
+| 6. dry-run compile | **PASS** — `Compiler status PASS`, HLOs saved |
 
-### Stage-6 traceback (verbatim, trimmed to the load-bearing frames)
+Compile log evidence: HLOs generated for both `context_encoding_model` and
+`token_generation_model` (1.52 s), priority HLO compiled in 14.77 s,
+`Compilation Successfully Completed for model.MODULE_0f71aa9105a640304070+8f34053f`,
+weight layout optimized, dry-run artifacts written.
+
+## Root cause of the lowering failure (worth recording — the error message misleads)
+
+For most of this turn stage 6 failed with:
 
 ```
-File ".../neuronx_distributed_inference/models/application_base.py", line 305, in compile
-    traced_model = self.get_builder(debug).trace(**trace_kwargs)
-File ".../neuronx_distributed/trace/model_builder.py", line 904, in _generate_hlo
-    hlo_artifacts = torch_neuronx.xla_impl.trace.generate_hlo(
-File ".../torch_neuronx/xla_impl/hlo_conversion.py", line 545, in _xla_trace
-    ) = hlo_opt.linearize_indices(
-File ".../torch_neuronx/xla_impl/hlo_conversion.py", line 710, in linearize_indices
-    raise ValueError(
 ValueError: Unable to lower HLO: parameter not found in lowering context. This is
 likely caused by an attempted in-place operation, or an attempted access of
 nn.Parameter.data or nn.Buffer.data. These operations are not currently supported.
 ```
 
-### Diagnosis
+The message points at in-place ops and `.data`. **Neither was the cause**, and
+the obvious second reading — unused example inputs — is also wrong. I probed
+what NxDI generates and found a fixed **7-input** signature for both CTE and TKG
+(`input_ids`, `attention_mask`, `position_ids`, `seq_ids`, `sampling_params`,
+plus two more), of which this graph consumed two. That looked like the answer.
+It was not: torch_neuronx **filters unused inputs into an `exclude` list with a
+warning** (`hlo_conversion.py:465-485`) and they never reach `linearize_indices`.
 
-`linearize_indices` raises this exactly when `tensor_parameter_id(tensor)`
-returns `-1` for one of the **example inputs**:
+The actual cause is the **KV-cache alias list**. `DecoderModelInstance.get()`
+(`model_wrapper.py:1614-1619`) builds `input_output_aliases` from
+`kv_mgr.past_key_values` — real `nn.Parameter`s — and that list is appended to
+`input_parameter_numbers` **without** the `-1` filter
+(`hlo_conversion.py:490-496`). A cache parameter that the graph aliases but
+never reads therefore aborts lowering.
 
-```python
-# torch_neuronx/xla_impl/hlo_conversion.py:683-693
-# NOTE: parameter_number = -1 when a tensor cannot be found in the lowering context
-if parameter_number == -1:
-    raise ValueError("Unable to lower HLO: parameter not found in lowering context. ...")
-```
+Every NxDI model in-tree sidesteps this by **not overriding `forward` at all**
+(`NeuronQwen2Model`, `NeuronMistralModel`, and all 14 subclasses override only
+`setup_attr_for_model` and `init_model`); the base `forward` reads the cache via
+`kv_mgr.get_cache` and returns `outputs += updated_kv_cache`. GLM-5.3-Flash
+needs its own `forward` — it is a hybrid KDA/DSA stack the base decode loop does
+not model — so it now honours the same contract explicitly: read each aliased
+cache parameter and return it directly after the logits, in alias order.
 
-I probed what NxDI actually generates for this config. **Seven example inputs**,
-for both CTE and TKG:
+A useful negative result for the next agent: **do not spend time trying to
+"anchor" unused inputs.** They are handled. If you see this error, look at the
+alias list.
 
-| # | CTE shape | TKG shape | dtype | identity |
-|---|---|---|---|---|
-| 0 | (1,128) | (1,1) | int32 | `input_ids` |
-| 1 | (1,128) | (1,128) | int32 | `attention_mask` |
-| 2 | (1,128) | (1,1) | int32 | `position_ids` |
-| 3 | (1,) | (1,) | int32 | `seq_ids` |
-| 4 | (1,3) | (1,3) | float32 | `sampling_params` |
-| 5 | (1,) | (1,) | int32 | `num_queries` (continuous batching) |
-| 6 | (1,) | (1,) | int32 | `computed_context_lens` (continuous batching) |
-
-The Round-3 graph consumes **two** of the seven (`input_ids`, and
-`position_ids` only on DSA layers — the 1-layer smoke is KDA-only, so in
-practice just `input_ids`). The remaining inputs never enter the lowering
-context, which is the `-1`.
-
-This is a *wiring* gap, not a kernel or numerics defect: the model math traced
-end-to-end successfully (parallel state initialised, `context_encoding_model`
-HLO generation started and ran through the whole 1-layer forward) before
-lowering rejected the unused parameters.
+Cost of the misdiagnosis: roughly three failed smoke iterations. Recording it
+here so the next hybrid-architecture port does not repeat it.
 
 ## What landed
 
@@ -196,38 +194,47 @@ deliberately *not* called — its OCP-448-when-`None` fallback is the defect thi
 port refuses to reproduce. Every scale field has an explicit non-`None` default
 and a load-time `max(scale) <= 240.0` assertion via `validate_fp8_scale`.
 
-## Next blocker (single, specific)
+## THE next blocker: KDA state does not survive across decode steps
 
-**Wire the five unconsumed NxDI graph inputs**, in priority order:
+This is the one thing standing between a passing smoke and a *trustworthy* TKG
+artifact, and it is the reason no TKG compile was fired.
 
-1. `attention_mask` — should drive `key_lengths` for the DSA sparse gather and
-   mask padded tokens. This is a real correctness improvement, not just an
-   anchor: the DSA block currently assumes `key_lengths == context_len`.
-2. `seq_ids` — selects the KDA state slot. This is the same work as the item
-   below and should land with it.
-3. `num_queries` / `computed_context_lens` — the continuous-batching contract.
-   Setting `is_continuous_batching=False` removes them from the generated input
-   list and is the cheaper path to a first NEFF.
-4. `sampling_params` — only meaningful with on-device sampling, currently off.
+The KDA recurrence hands its updated state back on plain Python attributes,
+because buffer mutation inside `forward` is precisely what torch_neuronx refuses
+to lower. Making state persist on device needs NxDI's `input_output_aliases`
+wireup — the same mechanism the KV cache uses, and the same one whose absence
+produced the lowering bug above — so the state tensor becomes a real graph
+input/output pair.
 
-## Second blocker, already visible and not yet addressed
+Stated plainly: **a CTE (prefill-from-zero) graph is exact. A multi-step TKG
+graph would silently restart from zero KDA state every step.** It would compile,
+run, and benchmark perfectly well while being wrong. That is exactly the failure
+class this campaign refuses to ship, so the TKG contract must not be declared
+correct until the aliasing lands.
 
-**KDA state does not survive across decode steps.** The recurrence hands its
-updated state back on plain Python attributes because buffer mutation inside
-forward is exactly what torch_neuronx refuses to lower. Making state persist on
-device needs NxDI's `input_output_aliases` wireup, so the state tensor becomes a
-real graph input/output pair.
+The fix is well-scoped and the pattern is now known: register the KDA state as
+an `nn.Parameter` per KDA layer (as `kv_cache_manager.py:152-162` does for the
+KV cache), add it to `input_output_aliases`, read it at the top of the layer
+forward and return it after the logits in alias order.
 
-Consequence, stated plainly: **a CTE (prefill-from-zero) graph is exact, but a
-multi-step TKG graph would silently restart from zero state every step.** The
-TKG contract must not be declared correct until the aliasing lands. This is why
-no TKG/CTE contract was authored or fired this turn — firing a TKG compile now
-would produce an artifact that benchmarks fine and is wrong.
+## Ordered next steps
+
+1. **Resolve the `blockwise_matmul_config` rejection** (see MoE findings) — the
+   flag is currently being dropped, and without it the MoE compile hits the
+   raising stub. Blocks any MoE compile.
+2. **Recompute the HBM budget** given that `[128,128]` block scales dequantize
+   to bf16 in the expert path. The `306 GiB / 16 ranks ≈ 19 GiB/chip` figure in
+   the Round-3 plan does not hold for the experts.
+3. **Wire KDA state aliasing** (above). Blocks a correct TKG.
+4. Then author `/mnt/compile/shared-images/glm53-flash-command.sh` and fire
+   CTE + TKG.
 
 ## Not done (and why)
 
-- **Stage 4 (TKG + CTE contracts, TP=16/LNC=2, fire)** — gated on the smoke,
-  which failed. Firing would have been fabricating progress.
+- **Stage 4 (TKG + CTE contracts, TP=16/LNC=2, fire)** — not fired. The smoke
+  passes, but items 1–3 above are each sufficient on their own to make the
+  resulting artifact wrong or un-compilable. Firing now would produce a slug
+  and a NEFF path that look like progress and are not.
 - `/mnt/compile/shared-images/glm53-flash-command.sh` — not authored, for the
   same reason. The FP8-KV 4-requirement pattern to mirror is confirmed present
   in `/mnt/compile/shared-images/llama33-70b-fp8-command.sh` (pop
@@ -235,21 +242,90 @@ would produce an artifact that benchmarks fine and is wrong.
   `NeuronConfig` ctor so the post-init `setattr` loop cannot re-poison the FP8
   surface; `KVQuantizationConfig` must be an instance, not a dict;
   `XLA_HANDLE_SPECIAL_SCALAR=1`; `UNSAFE_FP8FNCAST=1`).
+- **Correctness gate against reference logits** — out of scope for this turn by
+  design; it gates after the NEFF lands.
+
+## MoE blockwise findings — these change the memory plan
+
+Three facts from reading the container's
+`neuronx_distributed/modules/moe/blockwise.py` directly. All three are more
+constraining than the standing workaround note implied.
+
+### 1. `_call_shard_hidden_kernel` exists as an always-raising stub, and it is the *default* branch
+
+The standing note says the symbol is missing. It is actually present and
+unconditionally raises (`blockwise.py:267`):
+
+```python
+def _call_shard_hidden_kernel(args: BlockwiseMatmulArgs):
+    raise NotImplementedError("_call_shard_hidden_kernel is not available - kernel not imported from nkilib")
+```
+
+The LNC=2 inference dispatch (`blockwise.py:1005-1017`) falls into it whenever
+neither shard flag is set:
+
+```python
+elif logical_nc_config == 2:
+    if use_shard_on_intermediate_dynamic_while:  ...
+    elif use_shard_on_block_dynamic_while:       ...
+    else:  output, ... = _call_shard_hidden_kernel(args)   # raises
+else:
+    raise NotImplementedError("LNC_1 kernels not available in nkilib")
+```
+
+So `use_shard_on_intermediate_dynamic_while=True` is **not a performance knob —
+it is the only way to avoid a dead default branch.** There is a second escape
+hatch worth holding in reserve: `use_shard_on_block_dynamic_while=True`
+(`_call_bwmm_shard_on_block_kernel`), a real non-stub implementation. The two are
+mutually exclusive (`assert` at `blockwise.py:927`).
+
+### 2. LNC=2 is mandatory for any MoE path on this container
+
+The `else` branch raises `"LNC_1 kernels not available in nkilib"`. The planned
+TP=16 / LNC=2 contract is therefore forced, not chosen.
+
+### 3. GLM's `[128,128]` FP8 block scales get DEQUANTIZED to bf16 before the expert matmul
+
+At `blockwise.py:~958`, a weight scale with more than 2 dims — which is exactly
+what a `weight_block_size=[128,128]` scale is — triggers:
+
+> "Blockwise scaling is not supported in blockwise kernel for now and will be
+> dequantized before the kernel"
+
+followed by `blockwise_scale_dequantize(...)` up to `hidden_states.dtype` and
+both scales set to `None`.
+
+**Consequence, and it is a big one: on this container rev the FP8 checkpoint
+buys disk and load bandwidth but NOT HBM residency or matmul throughput in the
+expert path.** The 306 GiB FP8 weight set does not imply 306 GiB resident —
+the MoE experts, which are the overwhelming bulk of the model, land in HBM as
+bf16. Any TP=16 HBM budget that assumed `306 / 16 ≈ 19 GiB/chip` is wrong for
+the expert path and must be recomputed before firing. This is the top thing to
+verify before the full compile, and it is *measurement-pending*, not settled.
 
 ## Verified environment facts
 
-- `use_shard_on_intermediate_dynamic_while` **exists** in NxDI `e05466c`
+- `use_shard_on_intermediate_dynamic_while` exists in NxDI `e05466c`
   (`modeling_qwen3_moe.py:276`) and in the container's `neuronx_distributed`
-  (`moe_configs.py:56,72`). The workaround is valid for this rev.
-- `_call_shard_hidden_kernel` is **absent** everywhere — confirming the standing
-  note. The container also warns at import:
+  (`moe_configs.py:56,72`). Canonical usage form, from
+  `examples/generation_qwen3_moe_demo.py:43`:
+  `blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": True, "skip_dma_token": True}`.
+- The container warns at import:
   `Failed to import blockwise_mm_baseline_shard_hidden: No module named
-  'neuronxcc.nki._private.blockwise_mm'`.
-- `NeuronConfig` logs `Unexpected keyword arguments: {'blockwise_matmul_config': …}`,
-  i.e. this rev does **not** accept it as a ctor kwarg on the base config —
-  worth resolving before relying on the workaround at full MoE scale.
+  'neuronxcc.nki._private.blockwise_mm'` — the nkilib module behind the stub
+  simply was not shipped in this build.
+- **Open**: `NeuronConfig` logs `Unexpected keyword arguments:
+  {'blockwise_matmul_config': …}`, i.e. this rev does not accept it as a base
+  `NeuronConfig` ctor kwarg, even though the field is real further down the
+  stack. Given finding 1, this must be resolved before any MoE compile — as it
+  stands the flag is being silently dropped and the compile would hit the
+  raising stub. Investigating which config class actually owns the field.
+- `skip_dma_token` changes the input-padding path
+  (`augment_inputs_for_padded_blockwise_matmul`), not only DMA behaviour.
 - Host disk: 574 GB free on `/` (shared with `/mnt/compile`); weights are 306 GB
   of the 1.5 TB used. `/tmp` is a 186 GB RAM-backed tmpfs — do not stage there.
+- Host is `r7i.12xlarge` with **no Neuron device**, hence
+  `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` on every invocation.
 
 ## Paths
 
