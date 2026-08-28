@@ -91,7 +91,7 @@ inference = DeepseekV4FlashNeuronInferenceConfig(
     neuron_config=neuron,
     source_config=source,
 )
-# Checkpoint conversion/sharding is a separate streaming step.  NxDI's base
+# Checkpoint conversion/sharding is a separate streaming step.  The NxDI base
 # compile path must not attempt to reopen the 166.87-GB HF snapshot or shard
 # it a second time; it traces the wrapper against the pre-sharded rank files.
 inference.neuron_config.skip_sharding = True
