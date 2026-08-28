@@ -1904,6 +1904,174 @@ class _CSABlock(nn.Module):
         return output, new_state
 
 
+def build_sliding_window_causal_mask(
+    position_ids: torch.Tensor,
+    *,
+    sliding_window: int,
+    dtype: torch.dtype,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Additive-log-space sliding-window causal mask (per-layer).
+
+    Source-cited byte-for-byte against ``transformers/masking_utils.py``:
+
+      * ``causal_mask_function`` (line 80):  ``kv_idx <= q_idx``
+      * ``sliding_window_overlay`` (lines 92-101):
+            ``kv_idx > q_idx - sliding_window``
+      * ``sliding_window_causal_mask_function`` (line 138):
+            ``and_masks(sliding_window_overlay(sliding_window),
+                        causal_mask_function)``
+      * ``LAYER_TYPE_TO_MASK_CREATION_FUNCTION`` (line 1478) routes
+        ``"sliding_attention"`` layers through
+        ``create_sliding_window_causal_mask``.
+
+    A query at absolute position ``t`` is legal for KV positions ``k``
+    iff ``t - sliding_window < k <= t`` — i.e. the sliding window is
+    the inclusive interval ``[t - sliding_window + 1, t]``.  Early
+    queries (``t < sliding_window``) see all past KV; late queries see
+    exactly ``sliding_window`` past KV.
+
+    Returns shape ``[B, 1, S, S]`` with ``0.0`` on visible slots and
+    ``-inf`` on forbidden slots.  The head axis is 1 for broadcast
+    across the MQA block's ``num_heads`` in ``attend_and_project``.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError(
+            f"position_ids must be [B, S]; got shape {tuple(position_ids.shape)}"
+        )
+    if sliding_window <= 0:
+        raise ValueError(f"sliding_window must be positive; got {sliding_window}")
+    if device is None:
+        device = position_ids.device
+    q_broadcast = position_ids.unsqueeze(-1)
+    kv_broadcast = position_ids.unsqueeze(-2)
+    visible = (kv_broadcast <= q_broadcast) & (
+        kv_broadcast > (q_broadcast - int(sliding_window))
+    )
+    neg_inf = torch.full((), float("-inf"), dtype=dtype, device=device)
+    zero = torch.zeros((), dtype=dtype, device=device)
+    mask = torch.where(visible, zero, neg_inf)
+    return mask.unsqueeze(1)
+
+
+class _SlidingOnlyAttentionBlock(nn.Module):
+    """DSv4-Flash sliding-only attention block (paper layers 0-1 bootstrap).
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py``:
+
+      * ``DeepseekV4Attention.__init__`` (lines 770-799),
+        ``layer_type == "sliding_attention"`` branch:
+          - ``self.rope_layer_type = "main"`` (line 777) — plain
+            theta=10000 rope, NOT the yarn-scaled "compress" rope
+            (theta=160000) that CSA/HCA layers share.
+          - ``self.sliding_window = config.sliding_window`` (line 781).
+          - ``self.compressor = None`` (line 797-799).
+      * ``DeepseekV4Attention.forward`` (lines 801-873), sliding branch:
+        Q + KV via _MQABlock hooks, no compressor cat, attend with the
+        sliding-window mask, output projection.
+      * ``masking_utils.py`` sliding+causal predicate — see
+        :func:`build_sliding_window_causal_mask`.
+
+    Composes :class:`_MQABlock` verbatim.  No compressor, no indexer,
+    no overlap state, no input-id side channel — the simplest attention
+    family, and the base against which CSA/HCA add their compressor
+    branches.
+
+    Wrapper-tree keys for one sliding layer i:
+
+      * 8 MQA params under ``mqa.<one of _MQABlock.PARAM_KEYS>``
+      * (Sibling ``layers.<i>.attn_norm.weight`` at the decoder-layer
+        level — NOT owned by this block, same convention as _HCABlock
+        and _CSABlock.)
+    """
+
+    def __init__(self, config: Any, *, layer_idx: int) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        # Refuse a non-sliding layer index — a caller that routed a CSA/HCA
+        # layer through this block would silently drop the compressor
+        # branch AND flip the rope table from "compress" (theta=160000) to
+        # "main" (theta=10000), producing plausible-looking logits that
+        # are quietly wrong.
+        got = src.layer_types[layer_idx]
+        if got != "sliding_attention":
+            raise ValueError(
+                f"_SlidingOnlyAttentionBlock requires sliding_attention at "
+                f"layer_idx={layer_idx}; got layer_types[{layer_idx}]={got!r}. "
+                "The frozen HF schedule places sliding_attention only at "
+                "the '0' entries of compress_ratios (layers 0, 1 in the "
+                "43-layer bootstrap; trailing 0-entries at 43-45 are the "
+                "MTP region and are dropped)."
+            )
+        ratio = int(src.compress_ratios[layer_idx])
+        if ratio != 0:
+            raise ValueError(
+                f"_SlidingOnlyAttentionBlock requires compress_ratios"
+                f"[{layer_idx}]=0 (sliding-only); got {ratio}."
+            )
+        self.layer_idx = layer_idx
+        self.sliding_window = int(src.sliding_window)
+        if self.sliding_window <= 0:
+            raise ValueError(
+                f"sliding_window must be positive; got {self.sliding_window}"
+            )
+        # Same wrapper-tree convention as _HCABlock / _CSABlock: a single
+        # `mqa` sub-module.  State-dict lands under `layers.<i>.attn.mqa.*`.
+        self.mqa = _MQABlock(config, layer_idx=layer_idx)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,             # [B, S, hidden]
+        cos: torch.Tensor,                       # [B, S, rope_dim/2] "main"
+        sin: torch.Tensor,                       # [B, S, rope_dim/2] "main"
+        position_ids: torch.Tensor,              # [B, S]
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sliding-only forward — Q + KV via _MQABlock hooks, sliding-window
+        causal mask, delegate to :meth:`_MQABlock.attend_and_project`.
+
+        The ``cos`` / ``sin`` MUST be built from the "main" rope table
+        (``rope_theta = src.rope_theta = 10000.0``).  A caller that fed
+        the "compress" rope (theta=160000) here would silently produce
+        wrong logits.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_SlidingOnlyAttentionBlock expects hidden_states "
+                f"[B, S, hidden]; got shape {tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        if position_ids.shape != (batch, seq):
+            raise ValueError(
+                f"_SlidingOnlyAttentionBlock expects position_ids shape "
+                f"({batch}, {seq}); got {tuple(position_ids.shape)}"
+            )
+
+        # 1. Q + KV via _MQABlock hooks (same boundary CSA/HCA compose).
+        q, _q_residual = self.mqa.project_q(hidden_states, cos, sin)
+        kv = self.mqa.project_kv(hidden_states, cos, sin)                    # [B, 1, S, D]
+
+        # 2. Build (or extend) the additive sliding-window causal mask.
+        sliding_mask = build_sliding_window_causal_mask(
+            position_ids,
+            sliding_window=self.sliding_window,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        if attention_mask is not None:
+            extended_mask = attention_mask + sliding_mask.to(attention_mask.dtype)
+        else:
+            extended_mask = sliding_mask
+
+        # 3. Delegate to _MQABlock.attend_and_project.
+        return self.mqa.attend_and_project(
+            q, kv, cos, sin, attention_mask=extended_mask
+        )
+
+
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
         return
@@ -2091,18 +2259,6 @@ if _NXDI_AVAILABLE:
                     "produce wrong logits on every token."
                 ) from exc
             return x
-
-    class _SlidingOnlyAttentionBlock(nn.Module):
-        """Sliding-only attention (bootstrap layers 0, 1): window=128, no compressor."""
-
-        def __init__(self, config: Any, *, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_idx = layer_idx
-            self._config = config
-            raise NotImplementedError(
-                "_SlidingOnlyAttentionBlock is Round 2.  Composes _MQABlock + "
-                "sliding-window causal mask over `sliding_window=128` KV positions."
-            )
 
     class _HashMoEBlock(nn.Module):
         """Hash-MoE bootstrap for layers 0..num_hash_layers-1 (paper §2.1).
@@ -2408,9 +2564,11 @@ __all__ = [
     "_HCACompressor",
     "_LightningIndexerHead",
     "_MQABlock",
+    "_SlidingOnlyAttentionBlock",
     "apply_partial_rope",
     "build_main_rope_cos_sin",
     "build_neuron_config",
+    "build_sliding_window_causal_mask",
     "dsv4_reference_router_forward",
     "dsv4_route_affinities",
 ]
