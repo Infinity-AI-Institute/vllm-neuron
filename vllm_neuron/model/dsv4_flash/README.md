@@ -1,12 +1,15 @@
-# `vllm_neuron.model.dsv4_flash` — DeepSeek-V4-Flash Neuron enablement (Round 6: SlidingOnly composability landed)
+# `vllm_neuron.model.dsv4_flash` — DeepSeek-V4-Flash Neuron enablement (Round 7: HashMoE composability landed — ALL 6 BLOCK CLASSES DONE)
 
-**Status:** Round 6 — `_SlidingOnlyAttentionBlock` +
-`build_sliding_window_causal_mask` implemented and verified byte-clean
-against real HF tensors on the first sliding layer (layer 0), on top of
-Round 5's CSA composition, Round 4's HCA composition, and Round 3's MQA
-+ routed-MoE blocks.  5 of 6 wrapper block classes now landed; only
-`_HashMoEBlock` (bootstrap input-id side channel) remains before the
-first NEFF fire.  NO NEFF compile fired yet.
+**Status:** Round 7 — `_HashMoEBlock` implemented and verified byte-clean
+against a hand-transcribed HF-reference forward on synthetic + real-router
+tensors (layer 0 bootstrap), plus a bit-exact input-ids side-channel
+routing gate.  On top of Round 6's `_SlidingOnlyAttentionBlock`, Round 5's
+CSA composition, Round 4's HCA composition, and Round 3's MQA + routed-MoE
+blocks.  **All 6 of 6 wrapper block classes are now landed**; the single
+next blocker for the first NEFF fire is the per-layer dispatch loop in
+`_NeuronDeepseekV4FlashModel.init_model` + the `input_ids` side channel
+threaded through the NxDI decoder-layer forward (documented on
+`_HashMoEBlock`).  NO NEFF compile fired yet.
 **HF snapshot pinned:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 head SHA `7872f01b1d1fe23eabc4c98b48bffcef5a386062` (MIT-licensed).
 
@@ -30,9 +33,11 @@ The full enablement research + architecture-delta analysis lives at
 | `neuron_wrapper.py::_LightningIndexerHead` | **Implemented (CPU-portable)** | Round 5. Owns its own inner `_CSAOverlapCompressor` at `index_head_dim=128` + `wq_b.weight` (FP8-UE8M0, `index_n_heads*index_head_dim × q_lora_rank`) + `weights_proj.weight` (`index_n_heads × hidden_size`). Scorer implements `∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)` with fp32 softmax scale = `index_head_dim**-0.5` and per-head weight scale = `index_n_heads**-0.5`; top-`min(index_topk=512, compressed_len)` selection with `-1` sentinel for causality-violating picks. Source-cited byte-for-byte against `DeepseekV4Indexer` (`modeling_deepseek_v4.py:462-586`) + `DeepseekV4IndexerScorer` (lines 446-459). |
 | `neuron_wrapper.py::_HCABlock` | **Implemented (CPU-portable)** — max_abs_error_bf16 = 0.0 vs HF reference on real layer-3 tensors | Round 4. Composes `_MQABlock` hooks (project_q / project_kv / attend_and_project) + `_HCACompressor` (non-overlapping m'=128 pool, no indexer, no overlap state) + causal `block_bias` for compressed slots. 12 params match HF layer-3 subtree byte-for-byte. Verified via `tests/test_hca_1layer.py` against `deepseek-ai/DeepSeek-V4-Flash-0731@7872f01b` shard `model-00005-of-00048.safetensors`. |
 | `neuron_wrapper.py::_HCACompressor` | **Implemented (CPU-portable)** | Round 4. Owns `wkv.weight` / `wgate.weight` / `ape` / `norm.weight`; softmax-gated per-window aggregation + compress-rope at window positions. Exposes `compress()` and `build_block_bias()` — the two pieces `_HCABlock` composes. Source-cited byte-for-byte against `DeepseekV4HCACompressor` (transformers 5.15.1 `modeling_deepseek_v4.py:362-443`). |
-| `neuron_wrapper.py::_HashMoEBlock` | **Stub** | Round 6. `tid2eid[input_ids]` frozen lookup (bootstrap layers 0-2 MLP). |
+| `neuron_wrapper.py::_HashMoEBlock` | **Implemented (CPU-portable)** — max_abs_error_bf16 = 0.0 vs HF reference forward on synthetic + real-router weights; input-ids side channel bit-exact | Round 7. 6th and final DSv4-Flash block class. 7 wrapper-tree keys (same as `_RoutedMoEBlock` with `tid2eid` [vocab_size, num_experts_per_tok] int32 replacing `e_score_correction_bias`). Composes: `router` (fp32 `nn.Linear`) + `tid2eid` (frozen `nn.Parameter` requires_grad=False, dtype=int32) + `_HashMoESharedExpert` + `_HashMoEStackedExperts` (per-expert Python dispatch loop for CPU byte-cleanness; Round-8 NxDI subclass will swap in `_NxdExpertMLPs`). Forward signature `forward(hidden_states, input_ids)` — see class docstring for the `input_ids` side-channel plumbing decision (Round-8 NxDI wire-up extends decoder-layer forward to accept `input_ids` as a real graph input, NOT an attribute stash which would not survive `torch.export`/`torch_xla` lowering). Verified via `tests/test_hash_moe_1layer.py` against `deepseek-ai/DeepSeek-V4-Flash-0731@7872f01b` shard `model-00002-of-00048.safetensors` (router.weight + tid2eid pulled via HTTP-Range slice, ~5 MiB after dequant — no 3.6 GiB shard download). Side-channel gate proves the routing DIFFERENTIATES by input_ids: flipping one token's id changes ONLY that token's output while leaving other tokens byte-identical. |
+| `neuron_wrapper.py::_HashMoESharedExpert` | **Implemented (CPU-portable)** | Round 7. Owns `gate_proj.weight` / `up_proj.weight` / `down_proj.weight` — three `nn.Linear` projections with the same on-disk spelling as `_MoESharedExpert` so state-dict is portable across the CPU-portable and NxDI paths. fp32 SwiGLU + ±swiglu_limit clamp per HF `Expert.forward` (`inference/model.py:601-611`). |
+| `neuron_wrapper.py::_HashMoEStackedExperts` | **Implemented (CPU-portable)** | Round 7. Owns two stacked-expert tensors via `mlp_op.gate_up_proj.weight` `[E, hidden, 2*inter]` and `mlp_op.down_proj.weight` `[E, inter, hidden]` — same layout as `_RoutedMoEBlock`'s NxDI `ExpertMLPs` bearing, but wrapped in a CPU-portable Python per-expert dispatch loop (bit-exact against HF `MoE.forward` @ hash-MoE, `inference/model.py:634-649`). Round-8 NxDI subclass will rebind the two `mlp_op.<proj>_proj.weight` leaves onto `_NxdExpertMLPs` without renaming a single key. |
 | `neuron_wrapper.py::_MoEBlock` | **Implemented via `_RoutedMoEBlock`** | Round 3. `sqrt(softplus(x))` scoring, 256×top-6, NxDI blockwise ExpertMLPs + separate shared branch, partial-sum all-reduce discipline. |
-| `neuron_wrapper.py::NeuronDeepseekV4FlashForCausalLM` | **Stub** — `init_model` raises | Per-layer dispatch loop lands with Round 7 (once `_HashMoEBlock` — the last remaining block class — lands). |
+| `neuron_wrapper.py::NeuronDeepseekV4FlashForCausalLM` | **Stub** — `init_model` raises | Per-layer dispatch loop lands with Round 8 (all 6 block classes ARE now landed; the remaining wiring is `_NeuronDeepseekV4FlashModel.init_model` composing the per-layer schedule + extending decoder-layer forward with the `input_ids` side channel for layers 0-2). |
 | `checkpoint_convert.py::dequantize_block_fp8_ue8m0` | **Implemented** | UE8M0 exponent → `torch.ldexp` multiplier. Byte-clean per `smoke_round1_one_tensor.py`. |
 | `checkpoint_convert.py::dequantize_block_fp4_ue8m0` | **Implemented** — byte-exact vs HF reference (see `tests/test_fp4_dequant_1tensor.py`, max_abs_error_bf16 = 0.0). |
 | `checkpoint_convert.py::_convert_routed_moe_layer` | **Implemented** — 7/7 wrapper-tree keys, 256/256 experts, router bit-exact vs HF (see `tests/test_routed_moe_1layer.py`). |
@@ -40,11 +45,12 @@ The full enablement research + architecture-delta analysis lives at
 | `checkpoint_convert.py::_convert_hca_block` | **Implemented** — 12 wrapper-tree keys under `layers.<i>.attn.*` (8 MQA + 4 compressor) + sibling `attn_norm`. Layer-type guard refuses non-HCA layer indices. Verified via `tests/test_hca_1layer.py` on layer 3. |
 | `checkpoint_convert.py::_convert_csa_block` | **Implemented** — 18 wrapper-tree keys under `layers.<i>.attn.*` (8 MQA + 4 CSA compressor + 4 indexer inner-compressor + 2 indexer projection [`wq_b` FP8-UE8M0 + `weights_proj` dense]) + sibling `attn_norm`. Layer-type guard refuses non-CSA layer indices. Verified via `tests/test_csa_1layer.py` on layer 2. |
 | `checkpoint_convert.py::_convert_sliding_only_block` | **Implemented** — 8 wrapper-tree keys under `layers.<i>.attn.*` (same 8 MQA params — no compressor, no indexer) + sibling `attn_norm` = 9 tensors per layer. Delegates to `_convert_mqa_block` verbatim (identical on-disk parameter set). Layer-type guard refuses non-sliding layer indices. Verified via `tests/test_sliding_only_1layer.py` on layer 0. |
-| `checkpoint_convert.py::_convert_dsv4_checkpoint` | **Partial** — top-level tensors + routed-MoE per-layer + MQA-block per-layer + HCA-block per-layer + CSA-block per-layer + sliding-only per-layer available; per-attention-type composition and per-layer dispatch loop is Round 7. |
+| `checkpoint_convert.py::_convert_hash_moe_block` | **Implemented** — 7 wrapper-tree keys under `layers.<i>.mlp.*` (`router.weight` fp32, `tid2eid` int32 [vocab_size, num_experts_per_tok], 3 shared_expert projections dequanted from FP8-UE8M0 block (128, 128), 2 stacked/fused expert_mlps tensors dequanted from FP4-UE8M0 block (1, 32)). Layer-type guard refuses non-hash-MoE layer indices. Refuses a checkpoint that carries `ffn.gate.bias` at a hash-MoE layer (schedule drift). Refuses an out-of-range `tid2eid`. Enforces int32 dtype on `tid2eid` for round-trip fidelity with HF. Verified via `tests/test_hash_moe_1layer.py` on layer 0. |
+| `checkpoint_convert.py::_convert_dsv4_checkpoint` | **Partial** — top-level tensors + routed-MoE per-layer + MQA-block per-layer + HCA-block per-layer + CSA-block per-layer + sliding-only per-layer + hash-MoE per-layer available; per-attention-type composition and per-layer dispatch loop is Round 8. |
 | `stream_shard.py::stream_shard_dsv4_checkpoint` | **Stub** | Round 6. Sharding-rule mapping described in the docstring. |
 | `registry.py::get_models` / `registry_hook.py::register_dsv4_flash` | **Implemented** | Binds HF architecture id `DeepseekV4ForCausalLM` to the wrapper class. |
 | `smoke_round1_one_tensor.py` | **Implemented** | FP8-UE8M0 dequant vs hand golden. Synthetic mode passes offline; HF-shard mode drops into any FP8 e4m3 non-expert weight + its `.scale` companion. |
-| `tests/` | Round-6 gate: 8/8 sliding-only tests PASS (in addition to Round-5's 7/7 CSA, Round-4's 6/6 HCA, Round-3's 5/5 MQA + 7/7 routed-MoE, Round-2's 8/8 FP4 dequant). | `test_config_load.py` / `test_factory_validation.py` / `test_dequant_ue8m0.py` are pending Round 7 dispatch tests. |
+| `tests/` | Round-7 gate: 13/13 hash-MoE tests PASS (in addition to Round-6's 8/8 sliding-only, Round-5's 7/7 CSA, Round-4's 6/6 HCA, Round-3's 5/5 MQA + 7/7 routed-MoE, Round-2's 8/8 FP4 dequant). | `test_config_load.py` / `test_factory_validation.py` / `test_dequant_ue8m0.py` are pending Round 8 dispatch tests. |
 
 ## Verified
 

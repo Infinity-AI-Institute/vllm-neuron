@@ -242,6 +242,244 @@ def dsv4_reference_router_forward(
     return logits, weights * routed_scaling_factor, indices
 
 
+# ---------------------------------------------------------------------------
+# Hash-MoE bootstrap router — CPU-portable, ships in both NxDI and CPU-only
+# paths.  Source-cited against the DSv4-Flash HF inference reference
+# `inference/model.py::Gate` @ HF SHA
+# `7872f01b1d1fe23eabc4c98b48bffcef5a386062` (repo
+# `deepseek-ai/DeepSeek-V4-Flash-0731`, `inference/model.py`):
+#
+#     class Gate(nn.Module):
+#         def __init__(self, layer_id, args):
+#             super().__init__()
+#             ...
+#             self.hash = layer_id < args.n_hash_layers
+#             self.weight = nn.Parameter(torch.empty(n_routed_experts, dim))
+#             if self.hash:
+#                 self.tid2eid = nn.Parameter(
+#                     torch.empty(vocab_size, n_activated_experts,
+#                                 dtype=torch.int32),
+#                     requires_grad=False,
+#                 )
+#                 self.bias = None
+#             else:
+#                 self.bias = nn.Parameter(...)
+#
+#         def forward(self, x, input_ids=None):
+#             scores = linear(x.float(), self.weight.float())
+#             ...
+#             scores = F.softplus(scores).sqrt()     # sqrtsoftplus
+#             original_scores = scores
+#             if self.bias is not None:              # NOT the hash branch
+#                 scores = scores + self.bias
+#             if self.hash:
+#                 indices = self.tid2eid[input_ids]  # [T, top_k] frozen lookup
+#             else:
+#                 indices = scores.topk(self.topk, dim=-1)[1]
+#             weights = original_scores.gather(1, indices)
+#             if self.score_func != "softmax":
+#                 weights /= weights.sum(dim=-1, keepdim=True)
+#             weights *= self.route_scale
+#             return weights, indices
+#
+# Structural facts inherited by this port:
+#   * The router weight is present AND FORWARD-USED even in hash mode — it
+#     computes the ``scores`` from which the gathered top-`top_k` weights come.
+#     The `tid2eid` table selects WHICH experts route, not with what weight.
+#   * There is NO `e_score_correction_bias` in hash mode — HF sets
+#     `self.bias = None`.  The wrapper's `_HashMoEBlock` reflects this by NOT
+#     declaring the parameter (a routed-MoE checkpoint accidentally converted
+#     through the hash-MoE converter would fail loud on the missing key).
+#   * `input_ids` reaches Gate.forward as a 1-D `[T]` LongTensor over the
+#     vocabulary.  In the top-level `MoE.forward` HF calls
+#     `self.gate(x, input_ids.flatten())`, so batching is folded to a single
+#     token axis before the lookup — this port keeps the same convention.
+#
+# Cousin of `dsv4_route_affinities` — same NxDI-`ExpertMLPs` shape contract
+# (returns *full-width* raw affinities, top-`top_k` indices as int64), the
+# caller is expected to apply `routed_scaling_factor` on the OUTPUT (same
+# "cancel-through-normalize" argument documented on `dsv4_route_affinities`
+# and used by `_HashMoEBlock.forward`).
+# ---------------------------------------------------------------------------
+
+
+def dsv4_hash_route_affinities(
+    hidden_states: torch.Tensor,      # [B, L, hidden] or [T, hidden]
+    router_weight: torch.Tensor,      # [n_routed_experts, hidden]
+    tid2eid: torch.Tensor,            # [vocab_size, top_k] int32/int64
+    input_ids: torch.Tensor,          # [B, L] or [T] int
+    *,
+    scoring_func: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DSv4-Flash HASH-MoE routing in the shape contract NxDI's ``ExpertMLPs``
+    expects.
+
+    Returns ``(affinities[T, n_routed_experts] fp32, expert_index[T, top_k]
+    int64)``.  ``affinities`` come from the router forward exactly like the
+    routed path; ``expert_index`` comes from the frozen ``tid2eid`` lookup
+    instead of a ``topk`` on the scores.
+
+    Bit-for-bit equivalence with HF's ``Gate.forward`` @ ``hash=True``:
+
+    * ``scores`` are ``sqrt(softplus(router_weight @ x_fp32))`` — same
+      operator, same fp32 up-cast, no bias term (HF sets ``self.bias =
+      None`` for hash mode).
+    * ``indices = tid2eid[input_ids.flatten()]`` (int64 cast).  HF stores
+      ``tid2eid`` as ``int32``; this helper accepts either ``int32`` or
+      ``int64`` and always emits ``int64``.
+    * NxDI's ``ExpertMLPs.forward`` masks + L1-normalises when
+      ``normalize_top_k_affinities=True``, reproducing HF's
+      ``weights / weights.sum(-1, keepdim=True)``.  Caller then multiplies
+      by ``routed_scaling_factor`` on the *output* (linear-through-normalize
+      equivalence, same argument as :func:`dsv4_route_affinities`).
+
+    Fail-loud checks that catch every silent-quality failure mode we thought
+    about:
+
+    * ``scoring_func`` MUST be ``"sqrtsoftplus"`` — any other value is a
+      layer-schedule drift and is rejected loudly (matching the routed-MoE
+      helper's discipline).
+    * ``tid2eid`` MUST have shape ``[vocab_size, top_k]`` — a caller that
+      hands a flattened 1-D buffer would silently produce out-of-range
+      expert indices via broadcasting.
+    * ``input_ids`` MUST be integer dtype; ``input_ids`` values MUST fall
+      inside ``[0, vocab_size)`` — an off-by-one from a caller who mistook
+      an "index of end-of-string" sentinel for an in-vocab token would
+      route every affected token to expert 0 silently.
+    """
+    if scoring_func != DSV4_ROUTED_SCORING_FUNC:
+        raise NotImplementedError(
+            f"DSv4-Flash hash-MoE scoring_func={scoring_func!r}; only "
+            f"{DSV4_ROUTED_SCORING_FUNC!r} is qualified.  Refusing to guess a "
+            "sigmoid/softmax equivalent — score-function drift would move "
+            "which experts win top-k on every token and is a silent-quality "
+            "failure mode."
+        )
+    if tid2eid.ndim != 2:
+        raise ValueError(
+            f"tid2eid must be 2-D [vocab_size, top_k]; got shape "
+            f"{tuple(tid2eid.shape)}"
+        )
+    if input_ids.dtype not in (
+        torch.int32,
+        torch.int64,
+        torch.int16,
+        torch.uint8,
+    ):
+        raise ValueError(
+            f"input_ids dtype {input_ids.dtype!r} is not integer; refusing to "
+            "gather tid2eid with a non-integer index."
+        )
+    hidden = hidden_states.shape[-1]
+    flat = hidden_states.reshape(-1, hidden)
+    logits = F.linear(flat.to(torch.float32), router_weight.to(torch.float32))
+    scores = F.softplus(logits).sqrt()              # [T, E] fp32
+    ids_flat = input_ids.reshape(-1).to(torch.long)
+    if ids_flat.numel() != flat.shape[0]:
+        raise ValueError(
+            f"input_ids has {ids_flat.numel()} tokens but hidden_states has "
+            f"{flat.shape[0]}; the hash-MoE side channel must be parallel "
+            "to the hidden-state token axis."
+        )
+    vocab_size = int(tid2eid.shape[0])
+    if int(ids_flat.min().item()) < 0 or int(ids_flat.max().item()) >= vocab_size:
+        raise ValueError(
+            f"input_ids out of vocab range [0, {vocab_size}); got "
+            f"[{int(ids_flat.min().item())}, {int(ids_flat.max().item())}]. "
+            "Refusing to gather tid2eid with an out-of-range token id — the "
+            "resulting expert index would be silently wrong."
+        )
+    indices = tid2eid.to(torch.long)[ids_flat]      # [T, top_k]
+    return scores, indices
+
+
+def dsv4_reference_hash_moe_forward(
+    hidden_states: torch.Tensor,             # [B, L, hidden]
+    input_ids: torch.Tensor,                 # [B, L]
+    router_weight: torch.Tensor,             # [n_routed_experts, hidden]
+    tid2eid: torch.Tensor,                   # [vocab_size, top_k] int
+    *,
+    shared_gate: torch.Tensor,               # [I, H]
+    shared_up: torch.Tensor,                 # [I, H]
+    shared_down: torch.Tensor,               # [H, I]
+    expert_gate_up_stack: torch.Tensor,      # [E, H, 2I]
+    expert_down_stack: torch.Tensor,         # [E, I, H]
+    swiglu_limit: float,
+    routed_scaling_factor: float,
+    weight_eps: float = 1e-20,
+) -> torch.Tensor:
+    """Reference DSv4-Flash hash-MoE forward that matches HF's ``MoE.forward``
+    verbatim on hash-MoE layers (``layer_id < num_hash_layers``).
+
+    Transcribes:
+      * ``Gate.forward`` @ ``hash=True`` (model.py:569-589) — sqrtsoftplus
+        scores + tid2eid[input_ids] gather + normalize + scale.
+      * ``Expert.forward`` (model.py:601-611) — fp32 SwiGLU with the ±10.0
+        clamp on both gate (upper) and up (both), fp32 intermediate, cast
+        back to bf16 before w2.
+      * ``MoE.forward`` @ hash-MoE (model.py:634-649) — per-expert dispatch
+        loop with `torch.where(indices == e)`, accumulate into a fp32
+        buffer, add the shared-expert forward at the end, cast back to
+        input dtype.
+
+    Kept as a numerical reference for the per-layer smoke; NOT invoked at
+    inference time.
+    """
+    B, L, H = hidden_states.shape
+    E, H2, twoI = expert_gate_up_stack.shape
+    assert H2 == H, (H2, H)
+    assert twoI % 2 == 0, twoI
+    I = twoI // 2
+    assert expert_down_stack.shape == (E, I, H), (
+        expert_down_stack.shape, (E, I, H),
+    )
+    dtype = hidden_states.dtype
+    flat = hidden_states.reshape(-1, H)
+    ids_flat = input_ids.reshape(-1).to(torch.long)
+
+    # Router path — sqrtsoftplus, then gather at tid2eid[input_ids].
+    logits = F.linear(flat.to(torch.float32), router_weight.to(torch.float32))
+    scores = F.softplus(logits).sqrt()                    # [T, E]
+    indices = tid2eid.to(torch.long)[ids_flat]            # [T, top_k]
+    gathered = scores.gather(-1, indices)                 # [T, top_k]
+    weights = gathered / (gathered.sum(dim=-1, keepdim=True) + weight_eps)
+    weights = weights * routed_scaling_factor             # [T, top_k]
+
+    # Routed-expert dispatch (per HF MoE.forward loop).
+    y = torch.zeros_like(flat, dtype=torch.float32)
+    for e in range(E):
+        picks = (indices == e).nonzero(as_tuple=False)    # [Ne, 2]
+        if picks.numel() == 0:
+            continue
+        idx_t = picks[:, 0]
+        idx_k = picks[:, 1]
+        we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)   # [Ne, 1]
+        xe = flat[idx_t]                                   # [Ne, H]
+        # Expert.forward: fp32 gate/up, ±swiglu_limit clamp, weight-multiply,
+        # cast to input dtype before w2.
+        gu = xe.to(torch.float32) @ expert_gate_up_stack[e].to(torch.float32)
+        gate, up = gu.chunk(2, dim=-1)
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, -swiglu_limit, swiglu_limit)
+        inter = F.silu(gate) * up                           # [Ne, I] fp32
+        inter = inter * we                                  # weight applied pre-w2
+        inter_cast = inter.to(dtype)
+        oe = inter_cast @ expert_down_stack[e]              # [Ne, H] input dtype
+        y[idx_t] = y[idx_t] + oe.to(torch.float32)
+
+    # Shared-expert forward (Expert.forward with weights=None).
+    gate_s = F.linear(flat, shared_gate).to(torch.float32)
+    up_s = F.linear(flat, shared_up).to(torch.float32)
+    gate_s = torch.clamp(gate_s, max=swiglu_limit)
+    up_s = torch.clamp(up_s, -swiglu_limit, swiglu_limit)
+    inter_s = F.silu(gate_s) * up_s
+    inter_s_cast = inter_s.to(dtype)
+    shared_out = F.linear(inter_s_cast, shared_down)         # [T, H]
+
+    combined = y.to(dtype) + shared_out
+    return combined.reshape(B, L, H)
+
+
 # Container `sha256:011d49c7...` MoE workaround — identical to GLM-5.3-Flash.
 DSV4_BLOCKWISE_MATMUL_WORKAROUND: dict[str, bool] = {
     "use_shard_on_intermediate_dynamic_while": True,
@@ -2072,6 +2310,417 @@ class _SlidingOnlyAttentionBlock(nn.Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# _HashMoEBlock — CPU-portable hash-MoE bootstrap block for layers 0..2.
+#
+# Source-cited byte-for-byte against the DSv4-Flash HF inference reference
+# (`deepseek-ai/DeepSeek-V4-Flash-0731` @ HF SHA
+# `7872f01b1d1fe23eabc4c98b48bffcef5a386062`, `inference/model.py`):
+#
+#   * `Gate.__init__` / `Gate.forward` lines 551-589 — the hash-mode
+#     `tid2eid[input_ids]` gather + `original_scores.gather` weighting.
+#   * `Expert.__init__` / `Expert.forward` lines 592-611 — the fp32 SwiGLU
+#     with ±swiglu_limit clamp on gate (upper) and up (both).
+#   * `MoE.__init__` / `MoE.forward` lines 614-649 — the per-expert
+#     dispatch loop, the `torch.zeros_like(x, dtype=torch.float32)`
+#     accumulator, the shared-expert addition, the cast back to input
+#     dtype.
+#
+# Structural decisions (documented so the Round-6 NxDI wire-up doesn't
+# have to re-derive them):
+#
+#   1. **`input_ids` side channel plumbing.**  HF hands `input_ids` to
+#      `Gate.forward` as a 1-D `[T]` LongTensor via
+#      `MoE.forward(x, input_ids)`.  NxDI's stock
+#      `DecoderModelInstance.forward` hands each layer only the hidden
+#      state — layers do NOT see input_ids by default.  The Round-6 NxDI
+#      wire-up MUST extend the decoder-layer forward signature to accept
+#      `input_ids` and thread it into `_HashMoEBlock.forward(x,
+#      input_ids)` for layers 0..num_hash_layers-1 only.  Layers 3+
+#      (routed MoE) ignore `input_ids`.  The extension MUST be a real
+#      graph input (`input_ids` is a bound tensor input to the compiled
+#      NEFF), NOT a Python attribute stash — an attribute stash would not
+#      survive `torch.export`/`torch_xla` lowering.  This block's forward
+#      accepts `input_ids` as a named kw so the extension is transparent
+#      to the caller.
+#
+#   2. **Router weight is present AND FORWARD-USED in hash mode.**
+#      HF's `Gate.forward` computes `scores = sqrt(softplus(F.linear(x,
+#      self.weight)))` on every call regardless of `self.hash`; the
+#      `tid2eid` table only picks which experts win — the *weights* of
+#      those experts come from `scores.gather(1, indices)`.  A wrapper
+#      that dropped `router.weight` for hash-MoE layers would silently
+#      route with weight-1 across all 6 selected experts, then normalise
+#      to 1/6 uniform — a plausible-looking-but-wrong distribution.
+#
+#   3. **No `e_score_correction_bias` in hash mode.**  HF sets
+#      `self.bias = None` for hash-MoE layers.  This wrapper deliberately
+#      does NOT declare an `e_score_correction_bias` parameter — a
+#      routed-MoE checkpoint accidentally loaded through the hash-MoE
+#      module tree would fail loud on the missing key, not silently
+#      degrade.
+#
+#   4. **Wrapper-tree layout matches `_RoutedMoEBlock` exactly except:
+#      `tid2eid` replaces `e_score_correction_bias`.**  This keeps the
+#      converter and the state-dict spelling parallel, and lets a
+#      Round-6 NxDI subclass swap in `_NxdExpertMLPs` bearings without
+#      renaming a single key.  Wrapper-tree keys (7 total):
+#
+#        * `router.weight`                                        fp32
+#        * `tid2eid`                                              int32
+#        * `shared_expert.gate_proj.weight`                       dtype
+#        * `shared_expert.up_proj.weight`                         dtype
+#        * `shared_expert.down_proj.weight`                       dtype
+#        * `expert_mlps.mlp_op.gate_up_proj.weight`               dtype
+#            shape [n_routed_experts, hidden, 2*moe_intermediate_size]
+#        * `expert_mlps.mlp_op.down_proj.weight`                  dtype
+#            shape [n_routed_experts, moe_intermediate_size, hidden]
+#
+#   5. **CPU-portable forward** — this block is defined at module level
+#      (like `_MQABlock` / `_HCABlock` / `_CSABlock`) rather than inside
+#      the `if _NXDI_AVAILABLE:` gate, so the byte-clean smoke at
+#      `tests/test_hash_moe_1layer.py` can compare wrapper forward vs
+#      HF-reference forward on a CPU-only host.  The forward uses a
+#      per-expert Python loop over the stacked `[E, H, 2*I]` /
+#      `[E, I, H]` weights — slow but bit-exact.  A Round-6 NxDI
+#      subclass will swap the loop for `_NxdExpertMLPs` at NEFF fire.
+# ---------------------------------------------------------------------------
+
+
+class _HashMoESharedExpert(nn.Module):
+    """CPU-portable shared-expert branch for `_HashMoEBlock`.
+
+    Mirrors HF's `Expert.__init__` (model.py:592-599) — three plain
+    projections with the fp32 SwiGLU + ±swiglu_limit clamp discipline
+    from `Expert.forward` (model.py:601-611).  Same wrapper-tree spelling
+    as `_MoESharedExpert` (see class doc there) so the state-dict is
+    identical across the CPU-portable and NxDI paths — a Round-6 NxDI
+    subclass can rebind `gate_proj` / `up_proj` / `down_proj` to
+    Column/Row-Parallel primitives without changing key names.
+    """
+
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        self.hidden_size = int(src.hidden_size)
+        self.moe_intermediate_size = int(src.moe_intermediate_size)
+        self.swiglu_limit = float(src.swiglu_limit)
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype
+        )
+        self.down_proj = nn.Linear(
+            self.moe_intermediate_size, self.hidden_size, bias=False, dtype=dtype
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        dtype = hidden_states.dtype
+        gate = self.gate_proj(hidden_states).to(torch.float32)
+        up = self.up_proj(hidden_states).to(torch.float32)
+        gate = torch.clamp(gate, max=self.swiglu_limit)
+        up = torch.clamp(up, -self.swiglu_limit, self.swiglu_limit)
+        inter = F.silu(gate) * up
+        return self.down_proj(inter.to(dtype))
+
+
+class _HashMoEStackedTensorParam(nn.Module):
+    """Trivial parameter carrier so the state-dict spells the leaf as
+    `<parent>.weight` rather than `<parent>` — matching NxDI's ExpertMLPs
+    which declares `mlp_op.gate_up_proj.weight` as an `nn.Linear`-style
+    leaf tensor.
+    """
+
+    def __init__(self, *, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(shape, dtype=dtype))
+
+
+class _HashMoEStackedExpertsMlpOp(nn.Module):
+    """State-dict-only container for the two stacked expert weights.
+
+    Split from `_HashMoEStackedExperts` so the state-dict key spelling
+    matches NxDI ExpertMLPs's `mlp_op.<proj>_proj.weight` layout exactly
+    (no re-parenting needed when a Round-6 subclass swaps bearings).
+    """
+
+    def __init__(
+        self, *, n_experts: int, hidden: int, inter: int, dtype: torch.dtype
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = _HashMoEStackedTensorParam(
+            shape=(n_experts, hidden, 2 * inter), dtype=dtype
+        )
+        self.down_proj = _HashMoEStackedTensorParam(
+            shape=(n_experts, inter, hidden), dtype=dtype
+        )
+
+
+class _HashMoEStackedExperts(nn.Module):
+    """CPU-portable stacked-expert container matching `_RoutedMoEBlock`'s
+    NxDI ExpertMLPs wrapper-tree.
+
+    Owns two parameters via `mlp_op`:
+    `expert_mlps.mlp_op.gate_up_proj.weight` and
+    `expert_mlps.mlp_op.down_proj.weight`, in the same
+    `[E, hidden, 2*inter]` / `[E, inter, hidden]` layout the converter
+    emits.  This class is NOT registered under a `_NxdExpertMLPs`
+    bearing — the CPU test exercises the same state-dict spelling, and
+    Round-6 NxDI wire-up subclasses it to swap `nn.Parameter` for
+    `_NxdExpertMLPs` at NEFF fire.
+    """
+
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        self.n_routed_experts = int(src.n_routed_experts)
+        self.hidden_size = int(src.hidden_size)
+        self.moe_intermediate_size = int(src.moe_intermediate_size)
+        self.swiglu_limit = float(src.swiglu_limit)
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+        self.mlp_op = _HashMoEStackedExpertsMlpOp(
+            n_experts=self.n_routed_experts,
+            hidden=self.hidden_size,
+            inter=self.moe_intermediate_size,
+            dtype=dtype,
+        )
+
+    def dispatch(
+        self,
+        flat_hidden: torch.Tensor,        # [T, H] input dtype
+        weights: torch.Tensor,            # [T, top_k] fp32
+        indices: torch.Tensor,            # [T, top_k] int64
+    ) -> torch.Tensor:
+        """CPU-portable per-expert dispatch — bit-exact against HF's
+        `MoE.forward` loop (model.py:634-649).
+
+        Accumulator lives in fp32 (per HF line 638), each expert's
+        contribution is added via `y[idx] += expert(x[idx],
+        weights[idx, top, None])`.  Weight is applied BEFORE `w2`
+        (down proj) — see `Expert.forward` line 609-610.
+
+        Slow (Python-scope loop over 256 experts on CPU) but bit-clean;
+        the whole point of this class is to give the smoke a wrapper
+        forward to diff against the HF reference.  Perf lives on the
+        NxDI subclass path.
+        """
+        dtype = flat_hidden.dtype
+        T, H = flat_hidden.shape
+        E = self.n_routed_experts
+        I = self.moe_intermediate_size
+        gate_up = self.mlp_op.gate_up_proj.weight           # [E, H, 2I]
+        down = self.mlp_op.down_proj.weight                 # [E, I, H]
+        assert gate_up.shape == (E, H, 2 * I), gate_up.shape
+        assert down.shape == (E, I, H), down.shape
+
+        y = torch.zeros((T, H), dtype=torch.float32, device=flat_hidden.device)
+        for e in range(E):
+            picks = (indices == e).nonzero(as_tuple=False)  # [Ne, 2]
+            if picks.numel() == 0:
+                continue
+            idx_t = picks[:, 0]
+            idx_k = picks[:, 1]
+            we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)   # [Ne, 1]
+            xe = flat_hidden[idx_t]                          # [Ne, H]
+            # Expert.forward — fp32 gate/up, ±swiglu_limit clamp,
+            # weight-multiply, cast to input dtype before w2.
+            gu = xe.to(torch.float32) @ gate_up[e].to(torch.float32)
+            g_slice, u_slice = gu.chunk(2, dim=-1)
+            g_slice = torch.clamp(g_slice, max=self.swiglu_limit)
+            u_slice = torch.clamp(u_slice, -self.swiglu_limit, self.swiglu_limit)
+            inter = F.silu(g_slice) * u_slice * we           # [Ne, I] fp32
+            oe = inter.to(dtype) @ down[e]                    # [Ne, H] input dtype
+            y[idx_t] = y[idx_t] + oe.to(torch.float32)
+        return y
+
+
+class _HashMoEBlock(nn.Module):
+    """DSv4-Flash Hash-MoE bootstrap block (layers 0..num_hash_layers-1).
+
+    The 6th and final DSv4-Flash block class — completes the set
+    { `_MQABlock`, `_HCABlock`, `_CSABlock`, `_RoutedMoEBlock`,
+    `_SlidingOnlyAttentionBlock`, `_HashMoEBlock` }.
+
+    Composes:
+
+      * A learned router (`router.weight`, fp32) — computed on every
+        token same as `_RoutedMoEBlock`, gives per-expert affinities
+        via ``sqrt(softplus(router.weight @ x))``.
+      * A frozen ``tid2eid`` lookup (`int32`, shape `[vocab_size,
+        num_experts_per_tok]`) — selects WHICH top-`num_experts_per_tok`
+        experts to route each token to based on its `input_ids` value.
+        This is the "input-id side channel" (paper §2.1, HF `Gate.forward`
+        `hash=True` branch).
+      * A shared expert (`_HashMoESharedExpert`) — same
+        `gate|up|silu|down` SwiGLU shape as `_MoESharedExpert`, per-token
+        unconditionally added to the routed output.
+      * Stacked routed experts (`_HashMoEStackedExperts`) — CPU-portable
+        per-expert dispatch loop over the `[E, H, 2*I]` /
+        `[E, I, H]` stacked weight tensors.
+
+    Forward signature: ``forward(hidden_states, input_ids)`` where
+    ``input_ids`` is `[B, L]` (or `[T]`) of integer token IDs.  This is
+    the NOVEL wiring vs every other block in the port — see the
+    module-level comment above this class for the plumbing decision
+    (Round-6 NxDI wire-up extends the decoder-layer forward signature to
+    accept `input_ids` as a real graph input).
+
+    HF-reference correctness contract: :func:`dsv4_reference_hash_moe_forward`
+    is a byte-for-byte transcription of `MoE.forward` @ hash-MoE
+    (model.py:634-649); the wrapper's forward is bit-exact against it (see
+    `tests/test_hash_moe_1layer.py::test_hash_moe_wrapper_matches_reference_synthetic`).
+    """
+
+    # State-dict spelling under this module — matches HF layer subtree
+    # plus NxDI ExpertMLPs conventions (kept in sync with the converter's
+    # emitted keys at review time).  7 wrapper-tree keys.
+    PARAM_KEYS: tuple[str, ...] = (
+        "router.weight",
+        "tid2eid",
+        "shared_expert.gate_proj.weight",
+        "shared_expert.up_proj.weight",
+        "shared_expert.down_proj.weight",
+        "expert_mlps.mlp_op.gate_up_proj.weight",
+        "expert_mlps.mlp_op.down_proj.weight",
+    )
+
+    def __init__(self, config: Any, *, layer_idx: int) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        # Verify layer schedule pins hash-MoE at this index.  Fail-loud;
+        # a caller that constructs `_HashMoEBlock` at a routed-MoE layer
+        # would silently drop the correction bias.
+        got = src.mlp_layer_types[layer_idx]
+        if got != "hash_moe":
+            raise ValueError(
+                f"_HashMoEBlock requires hash_moe at layer_idx={layer_idx}; "
+                f"got mlp_layer_types[{layer_idx}]={got!r}. The frozen HF "
+                "schedule places hash-MoE only at layers "
+                f"[0, num_hash_layers={src.num_hash_layers}) — after that "
+                "the router uses the noaux_tc top-k method with an "
+                "e_score_correction_bias, not a tid2eid lookup."
+            )
+        self.layer_idx = layer_idx
+        self.hidden_size = int(src.hidden_size)
+        self.n_routed_experts = int(src.n_routed_experts)
+        self.num_experts_per_tok = int(src.num_experts_per_tok)
+        self.vocab_size = int(src.vocab_size)
+        self.moe_intermediate_size = int(src.moe_intermediate_size)
+        self.routed_scaling_factor = float(src.routed_scaling_factor)
+        self.norm_topk_prob = bool(src.norm_topk_prob)
+        self.scoring_func = str(src.scoring_func)
+        self.swiglu_limit = float(src.swiglu_limit)
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+
+        # Router lives in fp32 — same rationale as `_RoutedMoEBlock`
+        # (softplus of large-magnitude logits saturates at fp16; the
+        # router is O(hidden * E) per token so the fp32 cost is
+        # negligible next to expert MLPs).
+        self.router = nn.Linear(
+            self.hidden_size,
+            self.n_routed_experts,
+            bias=False,
+            dtype=torch.float32,
+        )
+        # Frozen tid2eid lookup.  Stored as a Parameter with
+        # requires_grad=False (matches HF `nn.Parameter(...,
+        # requires_grad=False)` byte-for-byte on the state-dict side —
+        # a buffer would spell it differently and break checkpoint
+        # loading).  Dtype MUST be int32 for round-trip fidelity with
+        # the HF checkpoint.
+        self.tid2eid = nn.Parameter(
+            torch.zeros(
+                (self.vocab_size, self.num_experts_per_tok),
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        self.shared_expert = _HashMoESharedExpert(config)
+        self.expert_mlps = _HashMoEStackedExperts(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Hash-MoE forward.
+
+        Args:
+          hidden_states: `[B, L, hidden]` or `[T, hidden]` — pre-FFN
+            layer output (post-LN residual).  Any dtype consistent with
+            the wrapper's `_dtype`.
+          input_ids: `[B, L]` or `[T]` integer token IDs.  MUST be the
+            SAME shape/order as `hidden_states` on the token axis —
+            this is the input-id side channel.
+
+        Returns: `[B, L, hidden]` (or `[T, hidden]`) — the hash-MoE
+        block's contribution, ready to be added into the residual stream
+        by the caller (this block does NOT add the residual itself — HF's
+        `Block.forward` handles that at the transformer-block level, and
+        the Round-6 NxDI decoder-layer forward will do the same).
+        """
+        if hidden_states.ndim not in (2, 3):
+            raise ValueError(
+                f"_HashMoEBlock expects hidden_states of rank 2 or 3; got "
+                f"shape {tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"_HashMoEBlock hidden dim {hidden_states.shape[-1]} does not "
+                f"match config hidden_size={self.hidden_size}"
+            )
+        original_shape = hidden_states.shape
+        H = self.hidden_size
+        flat = hidden_states.reshape(-1, H)
+        # Route: full-width scores + tid2eid[input_ids] gather.  The helper
+        # asserts every silent-quality failure mode (out-of-range input_ids,
+        # wrong scoring_func, mis-shaped tid2eid).
+        scores, indices = dsv4_hash_route_affinities(
+            hidden_states,
+            self.router.weight,
+            self.tid2eid,
+            input_ids,
+            scoring_func=self.scoring_func,
+        )
+        # Gather the selected weights + normalise + scale (HF Gate.forward
+        # lines 585-588; scale is deferred to the OUTPUT via the same
+        # linear-through-normalise argument documented on
+        # dsv4_route_affinities).
+        gathered = scores.gather(-1, indices)                # [T, top_k] fp32
+        if self.norm_topk_prob:
+            weights = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            weights = gathered
+        weights = weights * self.routed_scaling_factor       # [T, top_k]
+
+        # Shared expert forward (per HF MoE.forward line 648, added
+        # unconditionally to every token AFTER the routed contribution).
+        shared_out = self.shared_expert(hidden_states)       # [B, L, H]
+
+        # Routed dispatch — per-expert loop, weight-multiply before down proj.
+        routed_flat = self.expert_mlps.dispatch(flat, weights, indices)  # fp32
+        routed = routed_flat.reshape(*original_shape).to(hidden_states.dtype)
+
+        return routed + shared_out
+
+
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
         return
@@ -2562,6 +3211,9 @@ __all__ = [
     "_CSAOverlapCompressor",
     "_HCABlock",
     "_HCACompressor",
+    "_HashMoEBlock",
+    "_HashMoESharedExpert",
+    "_HashMoEStackedExperts",
     "_LightningIndexerHead",
     "_MQABlock",
     "_SlidingOnlyAttentionBlock",
@@ -2569,6 +3221,8 @@ __all__ = [
     "build_main_rope_cos_sin",
     "build_neuron_config",
     "build_sliding_window_causal_mask",
+    "dsv4_hash_route_affinities",
+    "dsv4_reference_hash_moe_forward",
     "dsv4_reference_router_forward",
     "dsv4_route_affinities",
 ]
