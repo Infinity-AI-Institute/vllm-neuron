@@ -38,6 +38,11 @@ which change what may honestly be fired — see "The CTE wall".
 | 2-layer KDA+DSA trace, TP=16 | PASS — 26.47 s |
 | **4-layer KDA+DSA+MoE trace, TP=16, s=128** | **PASS — 58.97 s** |
 | 4-layer trace, s=256 / s=512 | PASS — 63.65 s / 73.16 s |
+| **4-layer KDA+DSA+MoE trace, TP=32, s=128** | **PASS — 59.83 s** |
+| Real 45-layer TKG HLO, s=2048 | PASS — 5.01 s |
+| Real 45-layer CTE HLO, s=2048 | PASS — 709.12 s, ~87 GB RSS |
+| Real 45-layer TKG NEFF, **TP=16** | **FAIL — `NCC_EVRF009`, 39.6 GB needed vs 24 GB** |
+| Real 45-layer NEFF, TP=16, CTE+TKG traced | FAIL — same `NCC_EVRF009`, byte-identical 39,644,174,584 |
 
 Receipts on the host under `/mnt/compile/runroot/glm53-round4/`:
 `glm53-round4-<tag>.json` per run, `logs/<tag>.log`, and preserved
@@ -336,6 +341,11 @@ Three things this confirms at once:
 So the Round-3 figure was not a harmless bookkeeping error: at 18.64 GiB/chip
 the model would have fit at TP=16, and at the true 36.51 GiB/chip it does not.
 
+A second TP=16 run that traced CTE *and* TKG reported the **byte-identical**
+`39,644,174,584`, which pins the cause: this is the resident weight set, not a
+phase-specific activation peak. Prefill and decode fail at TP=16 for the same
+reason and are fixed by the same change.
+
 | TP | bf16 weights per logical core | fits under 24 GB? |
 |---|---|---|
 | 8 | 78.40 GB | no |
@@ -382,6 +392,24 @@ The two env vars are still set on `docker run` (they are inert without FP8
 casting), so the difference between this model and the Llama-3.3-70B-FP8
 driver is one deliberate omission, documented here rather than silently
 inherited.
+
+## Verified emitted, not requested
+
+From the emitted `neuron_config.json`
+(`/mnt/compile/runroot/glm53-round4/artifacts/real45-tkg-fire/`), read back
+rather than assumed:
+
+| field | emitted value | why it matters |
+|---|---|---|
+| `blockwise_matmul_config.use_shard_on_intermediate_dynamic_while` | `True` | survived `MoENeuronConfig` construction all the way into the artifact — the container workaround is real, not merely requested |
+| `blockwise_matmul_config.use_torch_block_wise` | `False` | no silent torch fallback in the expert path |
+| `blockwise_matmul_config.logical_nc_config` | `LNC_2` | the only branch with a non-raising kernel |
+| `kv_cache_quant` / `kv_quant_config` | `False` / `None` | matches the bf16 tensors the model actually allocates — no float8 claim without float8 storage |
+| `quantized` | `False` | consistent with the bf16 expert weights the compiler reported |
+
+`float8_e4m3fn` is **absent** from the emitted config. That is the correct
+result for this round, not a miss — see "Why FP8-KV was deliberately NOT
+wired".
 
 ## The CTE wall — two prefill-scaling limits found in Round 4
 
@@ -437,6 +465,19 @@ measured shape and is the graph that determines tokenomics. The CTE contract at
 `max_model_len=2048` is where both limits bite. The two are fired and reported
 separately rather than as one number, and a CTE bucket is chosen from
 measurement rather than from the plan.
+
+Neither limit is in NxDI or the compiler — both are properties of the torch
+reference bindings, so both are fixable in Round 5 without touching the stack:
+
+* **KDA prefill** wants the chunked-parallel delta-rule form (process the
+  sequence in chunks of C with an intra-chunk parallel scan), which turns
+  `O(seq_len)` unrolled steps into `O(seq_len / C)`. That is a
+  correctness-critical rewrite and needs its own bit-exactness gate against
+  the numpy golden, exactly like the per-token port got this round.
+* **DSA prefill** wants the gather replaced by a masked score-then-attend that
+  never materialises `[B, Q, topk, H, D]` — at `topk >= L` the selection is
+  the degenerate dense case anyway, so a prefill-specific path is available
+  without changing the model.
 
 ## Compile driver
 

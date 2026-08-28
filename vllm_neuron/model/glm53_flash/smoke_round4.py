@@ -563,7 +563,15 @@ def main() -> int:
     if mode == "real45":
         # The unreduced 45-layer model at the real contract shape.  Not a
         # smoke: this is the config the fire uses.
+        # GLM53_CTX_LEN narrows the *prefill bucket* below the KV window.
+        # Both CTE costs key off it, not off seq_len: the KDA scan unrolls
+        # `num_kda_layers x n_active_tokens` steps, and the DSA sparse gather
+        # is O(Q x topk).  Defaults to seq_len (one full-window prefill).
+        ctx_len = int(os.environ.get("GLM53_CTX_LEN", "0")) or None
+
         def builder(src, **kw):
+            if ctx_len:
+                kw["max_context_length"] = ctx_len
             return NeuronGlm53FlashForCausalLM.build_inference_config(
                 src, ctx_batch_size=1, tkg_batch_size=1, **kw
             )

@@ -218,6 +218,14 @@ def build_neuron_config(
         # so the caller can override individual sub-fields without losing the
         # container fix.
         extra_bmc = extra.pop("blockwise_matmul_config", None)
+        # A caller that narrows `max_context_length` is asking for a *smaller
+        # prefill bucket* than the KV window, which is the lever that makes the
+        # CTE graph tractable: the KDA scan unrolls `num_kda_layers x
+        # n_active_tokens` steps and the DSA sparse gather is O(Q x topk), so
+        # both prefill costs key off this number, not off `seq_len`.  Keeping
+        # `n_active_tokens` pinned to `seq_len` here would silently ignore it.
+        if "max_context_length" in extra and "n_active_tokens" not in extra:
+            kwargs["n_active_tokens"] = int(extra["max_context_length"])
         kwargs.update(extra)
         if extra_bmc is not None:
             merged = dict(GLM53_BLOCKWISE_MATMUL_WORKAROUND)
