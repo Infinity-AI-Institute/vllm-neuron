@@ -297,6 +297,28 @@ if _NXDI_AVAILABLE:
         except Exception:  # pragma: no cover - single-rank / uninitialised
             return 0
 
+    def _aliased_kv_parameters(model: nn.Module) -> list[torch.Tensor]:
+        """The KV-cache parameters NxDI will alias, in alias order.
+
+        Mirrors ``DecoderModelInstance.get()`` (model_wrapper.py:1614-1619):
+        prefer ``kv_mgr.past_key_values``, else the model's own
+        ``past_key_values``.  Returns an empty list when neither exists, in
+        which case there are no aliases to honour.
+
+        Note that *unused example inputs* need no such handling — torch_neuronx
+        filters those to an ``exclude`` list with a warning
+        (hlo_conversion.py:465-485).  Only the alias list is unfiltered.
+        """
+        kv_mgr = getattr(model, "kv_mgr", None)
+        if kv_mgr is not None:
+            values = getattr(kv_mgr, "past_key_values", None)
+            if values is not None:
+                return list(values)
+        values = getattr(model, "past_key_values", None)
+        if values is not None:
+            return list(values)
+        return []
+
     def _reduce_from_tp_region(x: torch.Tensor) -> torch.Tensor:
         """All-reduce a partial contraction across the TP group.
 
@@ -652,6 +674,7 @@ if _NXDI_AVAILABLE:
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
             kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+            key_lengths: torch.Tensor | None = None,
         ) -> torch.Tensor:
             """Round-3 bound DSA layer: All-NoPE MLA + indexer-selected sparse attn.
 
@@ -665,12 +688,16 @@ if _NXDI_AVAILABLE:
                 key, value = kv_cache
             batch = hidden_states.shape[0]
             context_len = key.shape[1]
-            key_lengths = torch.full(
-                (batch,),
-                context_len,
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
+            if key_lengths is None:
+                # No attention_mask supplied — every position is valid.
+                key_lengths = torch.full(
+                    (batch,),
+                    context_len,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+            else:
+                key_lengths = key_lengths.to(torch.int64).clamp(max=context_len)
             attn, _topk = self.indexer(
                 hidden_states,
                 position_ids,
@@ -1355,14 +1382,19 @@ if _NXDI_AVAILABLE:
             self.hc_mlp = _MHCBlock(config)
 
         def forward(
-            self, residual_streams: torch.Tensor, position_ids: torch.Tensor
+            self,
+            residual_streams: torch.Tensor,
+            position_ids: torch.Tensor,
+            key_lengths: torch.Tensor | None = None,
         ) -> torch.Tensor:
             post_mix, comb_mix, hidden_states = self.hc_attn.pre(residual_streams)
             normalized = _rms_norm(
                 hidden_states, self.input_norm_weight, self.rms_eps
             )
             if self.attn_kind == "dsa":
-                attn_out = self.self_attn(normalized, position_ids)
+                attn_out = self.self_attn(
+                    normalized, position_ids, key_lengths=key_lengths
+                )
             else:
                 attn_out = self.self_attn(normalized)
             residual_streams = self.hc_attn.post(
@@ -1466,17 +1498,55 @@ if _NXDI_AVAILABLE:
             if positions.ndim == 1:
                 positions = positions.expand(batch, -1)
             positions = positions.to(torch.int64)
+            # `attention_mask` is consumed for real: it zeroes padded tokens so
+            # they cannot contribute to the KDA recurrence (which, being a
+            # running state, would otherwise carry padding forward into every
+            # subsequent step) and it supplies DSA's key lengths.
+            key_lengths = None
+            if attention_mask is not None:
+                mask = attention_mask.to(torch.int64)
+                if mask.ndim == 2 and mask.shape[-1] == length:
+                    hidden_states = hidden_states * mask.unsqueeze(-1).to(
+                        hidden_states.dtype
+                    )
+                key_lengths = mask.reshape(mask.shape[0], -1).sum(dim=-1)
+
             # mHC 4-stream residual widening (matches Impl.forward at model.py:140).
             residual_streams = hidden_states.unsqueeze(-2).repeat(
                 1, 1, self.hc_mult, 1
             )
             for layer in self.layers:
-                residual_streams = layer(residual_streams, positions)
+                residual_streams = layer(
+                    residual_streams, positions, key_lengths=key_lengths
+                )
             hidden_states = residual_streams.mean(dim=-2)
             hidden_states = _rms_norm(
                 hidden_states, self.final_norm_weight, self.rms_eps
             )
-            return self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states)
+
+            # KV-cache alias contract.
+            #
+            # `DecoderModelInstance.get()` (model_wrapper.py:1614-1619) builds
+            # `input_output_aliases` from `kv_mgr.past_key_values` — real
+            # nn.Parameters — mapping each to output index
+            # `num_output_from_trace + i`.  Unlike the example inputs, that
+            # alias list is NOT filtered for -1 before `linearize_indices`
+            # (hlo_conversion.py:490-496), so a cache parameter that the graph
+            # aliases but never reads aborts lowering with
+            # "parameter not found in lowering context".
+            #
+            # Every NxDI model in-tree avoids this by not overriding `forward`
+            # at all — the base `NeuronBaseModel.forward` reads the cache via
+            # `kv_mgr.get_cache` and returns `outputs += updated_kv_cache`.
+            # This graph keeps its own forward (GLM-5.3 is a hybrid KDA/DSA
+            # stack that the base decode loop does not model), so it must
+            # honour the same contract explicitly: read each cache parameter
+            # and return it directly after the logits, in alias order.
+            caches = _aliased_kv_parameters(self)
+            if caches:
+                return [logits] + list(caches)
+            return logits
 
     def _require_source_config(
         config: Any,
