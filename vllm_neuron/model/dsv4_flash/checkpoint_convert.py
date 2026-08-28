@@ -996,6 +996,244 @@ def _convert_hca_block(
     return converted
 
 
+# ---------------------------------------------------------------------------
+# CSA compressor + Lightning Indexer subtree layout (source-cited).
+#
+# Verified against ``model.safetensors.index.json`` @ HF SHA
+# ``7872f01b1d1fe23eabc4c98b48bffcef5a386062`` and shard header of
+# ``model-00004-of-00048.safetensors`` (layer 2, the first CSA layer per the
+# frozen ``compress_ratios`` schedule):
+#
+#   layers.2.attn.compressor.ape          F32  [4, 1024]   (compress_rate, 2*head_dim)
+#   layers.2.attn.compressor.norm.weight  BF16 [512]       (head_dim)
+#   layers.2.attn.compressor.wgate.weight BF16 [1024, 4096] (2*head_dim, hidden)
+#   layers.2.attn.compressor.wkv.weight   BF16 [1024, 4096] (2*head_dim, hidden)
+#
+#   layers.2.attn.indexer.compressor.ape          F32  [4, 256]    (compress_rate, 2*index_head_dim)
+#   layers.2.attn.indexer.compressor.norm.weight  BF16 [128]       (index_head_dim)
+#   layers.2.attn.indexer.compressor.wgate.weight BF16 [256, 4096] (2*index_head_dim, hidden)
+#   layers.2.attn.indexer.compressor.wkv.weight   BF16 [256, 4096] (2*index_head_dim, hidden)
+#   layers.2.attn.indexer.weights_proj.weight     BF16 [64, 4096]  (index_n_heads, hidden)
+#   layers.2.attn.indexer.wq_b.weight             FP8  [8192, 1024] (index_n_heads*index_head_dim, q_lora_rank)
+#   layers.2.attn.indexer.wq_b.scale              UE8M0 [64, 8]     (block scale @ (128, 128))
+#
+# All CSA-compressor / indexer-compressor tensors are stored *dense* on disk
+# (no ``.scale`` companion), so the converter carries them through with a
+# straight dtype cast — same convention as the HCA compressor.  The indexer's
+# ``wq_b`` is the ONLY quantised piece in this subtree (FP8-UE8M0, same
+# block layout as the outer MQA weights).
+# ---------------------------------------------------------------------------
+
+INDEXER_PREFIX = "indexer."
+_CSA_COMPRESSOR_DENSE_NAMES: tuple[str, ...] = (
+    "wkv.weight",
+    "wgate.weight",
+    "ape",
+    "norm.weight",
+)
+_INDEXER_COMPRESSOR_DENSE_NAMES: tuple[str, ...] = _CSA_COMPRESSOR_DENSE_NAMES
+# Non-compressor indexer tensors: `weights_proj` is dense; `wq_b` is FP8-UE8M0.
+_INDEXER_DENSE_NAMES: tuple[str, ...] = ("weights_proj.weight",)
+_INDEXER_FP8_WEIGHT_NAMES: tuple[str, ...] = ("wq_b.weight",)
+
+
+def _convert_csa_block(
+    state_dict: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+    require_attn_sink: bool = True,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash CSA attention block HF -> wrapper module tree.
+
+    Fuses :func:`_convert_mqa_block` (the shared MQA attention subtree) with
+    the CSA-specific 4-tensor outer compressor subtree at
+    ``layers.<i>.attn.compressor.*`` and the 6-tensor Lightning Indexer
+    subtree at ``layers.<i>.attn.indexer.*`` (4 dense compressor tensors
+    inside the indexer + one dense ``weights_proj`` + one FP8-UE8M0
+    ``wq_b``).
+
+    Contract on the caller:
+      * ``src.layer_types[layer_idx]`` MUST equal
+        ``"compressed_sparse_attention"`` — refusing to load a mismatched
+        layer avoids silently mapping HCA weights onto the CSA wrapper (both
+        subtrees spell their compressor tensors with the same 4 leaf names
+        but with completely different shapes: CSA's ``wkv``/``wgate`` are
+        ``2 * head_dim`` wide, HCA's are ``head_dim`` wide).
+      * ``src.compress_ratios[layer_idx]`` MUST equal 4.
+
+    Structure it produces (for one layer i under wrapper_prefix ""):
+
+      * 8 entries from :func:`_convert_mqa_block` (attention subtree) —
+        ``layers.<i>.attn.{wq_a.weight, wq_b.weight, q_norm.weight,
+        wkv.weight, kv_norm.weight, wo_a.weight, wo_b.weight, attn_sink}``.
+      * 1 sibling from :func:`_convert_mqa_block` (pre-attn RMSNorm) —
+        ``layers.<i>.attn_norm.weight``.
+      * 4 entries for the CSA outer compressor subtree —
+        ``layers.<i>.attn.compressor.{wkv.weight, wgate.weight, ape,
+        norm.weight}``.
+      * 4 entries for the indexer's own compressor subtree —
+        ``layers.<i>.attn.indexer.compressor.{wkv.weight, wgate.weight, ape,
+        norm.weight}``.
+      * 1 dense indexer weights projection —
+        ``layers.<i>.attn.indexer.weights_proj.weight``.
+      * 1 FP8-UE8M0 indexer Q_B projection (dequant to ``dtype``) —
+        ``layers.<i>.attn.indexer.wq_b.weight``.
+      * Total: 8 + 4 + 4 + 1 + 1 = 18 tensors per layer (plus the sibling
+        ``attn_norm.weight``, 19 total keys emitted).
+
+    Shape assertions (fail-loud):
+
+      * compressor.wkv.weight             [2*head_dim, hidden]
+      * compressor.wgate.weight           [2*head_dim, hidden]
+      * compressor.ape                    [compress_rate=4, 2*head_dim]
+      * compressor.norm.weight            [head_dim]
+      * indexer.compressor.wkv.weight     [2*index_head_dim, hidden]
+      * indexer.compressor.wgate.weight   [2*index_head_dim, hidden]
+      * indexer.compressor.ape            [compress_rate=4, 2*index_head_dim]
+      * indexer.compressor.norm.weight    [index_head_dim]
+      * indexer.wq_b.weight               [index_n_heads*index_head_dim, q_lora_rank]
+      * indexer.weights_proj.weight       [index_n_heads, hidden]
+
+    Fail-loud on any missing tensor — a CSA layer without its compressor or
+    indexer weights would silently degrade at that layer (random-init
+    scoring head would place every query at an uninformative top-K,
+    producing plausible-looking but broken logits).  Same failure-mode
+    escalation as ``_convert_hca_block``, one subtree deeper.
+    """
+    if src.layer_types[layer_idx] != "compressed_sparse_attention":
+        raise ValueError(
+            f"_convert_csa_block called for layer {layer_idx} but "
+            f"layer_types[{layer_idx}]={src.layer_types[layer_idx]!r} — "
+            "refusing to route a non-CSA layer through the CSA converter."
+        )
+    ratio = int(src.compress_ratios[layer_idx])
+    if ratio != 4:
+        raise ValueError(
+            f"_convert_csa_block requires compress_ratios[{layer_idx}]=4; "
+            f"got {ratio}."
+        )
+    dtype = dtype if dtype is not None else src.torch_dtype
+    hidden = int(src.hidden_size)
+    head_dim = int(src.head_dim)
+    index_head_dim = int(src.index_head_dim)
+    index_n_heads = int(src.index_n_heads)
+    q_lora_rank = int(src.q_lora_rank)
+    block_fp8 = tuple(src.quantization_config.weight_block_size)
+
+    # 1. Delegate the MQA subtree + sibling attn_norm to the MQA converter.
+    converted = _convert_mqa_block(
+        state_dict,
+        layer_idx,
+        src,
+        hf_prefix=hf_prefix,
+        wrapper_prefix=wrapper_prefix,
+        dtype=dtype,
+        require_attn_sink=require_attn_sink,
+    )
+
+    # 2. CSA outer compressor subtree — 4 tensors, all dense on disk.
+    hf_comp = (
+        f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    tgt_comp = (
+        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    csa_expected: dict[str, tuple[int, ...]] = {
+        "wkv.weight": (2 * head_dim, hidden),
+        "wgate.weight": (2 * head_dim, hidden),
+        "ape": (ratio, 2 * head_dim),
+        "norm.weight": (head_dim,),
+    }
+    for name in _CSA_COMPRESSOR_DENSE_NAMES:
+        hf_key = f"{hf_comp}{name}"
+        raw = state_dict.get(hf_key)
+        if raw is None:
+            raise KeyError(
+                f"missing CSA compressor tensor {hf_key!r} for layer "
+                f"{layer_idx} — refusing to silently substitute zeros / "
+                "random init and degrade at this layer."
+            )
+        expected = csa_expected[name]
+        if tuple(raw.shape) != expected:
+            raise ValueError(
+                f"{hf_key!r} shape {tuple(raw.shape)} disagrees with "
+                f"wrapper-expected {expected}"
+            )
+        converted[f"{tgt_comp}{name}"] = raw.to(dtype)
+
+    # 3. Lightning Indexer's inner compressor subtree — 4 dense tensors,
+    #    same on-disk layout as (2) but at index_head_dim=128.
+    hf_idxc = (
+        f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}"
+        f"{INDEXER_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    tgt_idxc = (
+        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}"
+        f"{INDEXER_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    idxc_expected: dict[str, tuple[int, ...]] = {
+        "wkv.weight": (2 * index_head_dim, hidden),
+        "wgate.weight": (2 * index_head_dim, hidden),
+        "ape": (ratio, 2 * index_head_dim),
+        "norm.weight": (index_head_dim,),
+    }
+    for name in _INDEXER_COMPRESSOR_DENSE_NAMES:
+        hf_key = f"{hf_idxc}{name}"
+        raw = state_dict.get(hf_key)
+        if raw is None:
+            raise KeyError(
+                f"missing indexer inner-compressor tensor {hf_key!r} for "
+                f"layer {layer_idx} — refusing to fall back to a random-init "
+                "scorer head."
+            )
+        expected = idxc_expected[name]
+        if tuple(raw.shape) != expected:
+            raise ValueError(
+                f"{hf_key!r} shape {tuple(raw.shape)} disagrees with "
+                f"wrapper-expected {expected}"
+            )
+        converted[f"{tgt_idxc}{name}"] = raw.to(dtype)
+
+    # 4. Indexer's dense per-head weight projection — `weights_proj.weight`.
+    hf_idx = f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{INDEXER_PREFIX}"
+    tgt_idx = (
+        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{INDEXER_PREFIX}"
+    )
+    wproj_shape = (index_n_heads, hidden)
+    for name in _INDEXER_DENSE_NAMES:
+        hf_key = f"{hf_idx}{name}"
+        raw = state_dict.get(hf_key)
+        if raw is None:
+            raise KeyError(
+                f"missing indexer dense tensor {hf_key!r} for layer "
+                f"{layer_idx}"
+            )
+        if tuple(raw.shape) != wproj_shape:
+            raise ValueError(
+                f"{hf_key!r} shape {tuple(raw.shape)} disagrees with "
+                f"wrapper-expected {wproj_shape}"
+            )
+        converted[f"{tgt_idx}{name}"] = raw.to(dtype)
+
+    # 5. Indexer's FP8-UE8M0 Q_B projection — `wq_b.weight` (+ `.scale`).
+    wq_b_shape = (index_n_heads * index_head_dim, q_lora_rank)
+    for name in _INDEXER_FP8_WEIGHT_NAMES:
+        hf_key = f"{hf_idx}{name}"
+        tensor = _dequant_shared_fp8_weight(state_dict, hf_key, block_fp8, dtype)
+        if tuple(tensor.shape) != wq_b_shape:
+            raise ValueError(
+                f"{hf_key!r} dequant shape {tuple(tensor.shape)} disagrees "
+                f"with wrapper-expected {wq_b_shape}"
+            )
+        converted[f"{tgt_idx}{name}"] = tensor
+
+    return converted
+
+
 def _convert_dsv4_checkpoint(
     state_dict: dict[str, Any],
     src: DeepseekV4FlashInferenceConfig,
@@ -1090,6 +1328,7 @@ __all__ = [
     "ATTN_NORM_KEY",
     "ATTN_PREFIX",
     "COMPRESSOR_PREFIX",
+    "INDEXER_PREFIX",
     "DSV4_FP4_BLOCK_SIZE",
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
@@ -1105,9 +1344,14 @@ __all__ = [
     "SHARED_EXPERTS_SUBTREE",
     "TEXT_LAYER_PREFIX",
     "_FP4_E2M1_TABLE",
+    "_CSA_COMPRESSOR_DENSE_NAMES",
     "_HCA_COMPRESSOR_DENSE_NAMES",
+    "_INDEXER_COMPRESSOR_DENSE_NAMES",
+    "_INDEXER_DENSE_NAMES",
+    "_INDEXER_FP8_WEIGHT_NAMES",
     "_MQA_DENSE_NAMES",
     "_MQA_FP8_WEIGHT_NAMES",
+    "_convert_csa_block",
     "_convert_dsv4_checkpoint",
     "_convert_hca_block",
     "_convert_mqa_block",

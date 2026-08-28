@@ -1165,6 +1165,745 @@ class _HCABlock(nn.Module):
         )
 
 
+class _CSAOverlapCompressor(nn.Module):
+    """Two-series overlap-aware compressor shared by :class:`_CSABlock` and
+    :class:`_LightningIndexerHead`.
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py``:
+
+      * ``DeepseekV4CSACompressor.__init__`` (lines 612-621) — same 4-tensor
+        wrapper-tree layout with 2 * head_dim wide ``wkv`` / ``wgate`` / ``ape``
+        projections.
+      * ``DeepseekV4CSACompressor.forward`` (lines 623-702) — the Ca/Cb window
+        layout (paper §2.3.1 eq. 9-12), softmax over ``2 * compress_rate``
+        slots per window, RoPE at window positions, overlap-state read/write.
+      * ``DeepseekV4CSACache.update_overlap_state`` (lines 286-300) — persists
+        ``chunk[:, -1, :, :head_dim]`` (the *Ca* slice of the last full window)
+        so the next forward call's window-0 can consume it as its "prior
+        window's Ca" slot; Cb of the last window is folded into that window's
+        emitted compressed entry and is never read again.
+
+    Owns 4 tensors under the on-disk subtree ``<name>.<one of>``
+    (matches the HF layer subtree verbatim on disk):
+
+      * ``wkv.weight``   [2 * head_dim, hidden_size]   (BF16 on disk; the
+                                                         Ca (first half) +
+                                                         Cb (second half)
+                                                         projections of
+                                                         ``H·W^{KV}`` in
+                                                         paper eq. 20)
+      * ``wgate.weight`` [2 * head_dim, hidden_size]   (BF16 on disk; the
+                                                         Ca/Cb gate that
+                                                         feeds softmax)
+      * ``ape``          [compress_rate, 2 * head_dim] (F32 on disk — the
+                                                         absolute-position
+                                                         bias broadcast
+                                                         across window axis)
+      * ``norm.weight``  [head_dim]                    (BF16 on disk;
+                                                         RMSNorm gain over
+                                                         the *pooled* (single-
+                                                         width) compressed
+                                                         vector)
+
+    Two callers:
+
+      * The outer CSA attention compressor uses ``head_dim = 512``,
+        ``compress_rate = 4`` and its output goes into the KV-catenation of
+        the main attention.
+      * The Lightning Indexer's internal compressor uses
+        ``head_dim = index_head_dim = 128`` at the same
+        ``compress_rate = 4`` and its output feeds the scorer's inner
+        product with the indexer's Q_B projection.
+
+    **Stateful contract.**  Call it with:
+
+      * ``overlap_kv_prev`` / ``overlap_gate_prev`` = the *previous* forward
+        call's returned ``new_overlap_kv`` / ``new_overlap_gate`` (or None
+        on the very first call).  Shape ``[B, compress_rate, head_dim]``.
+
+    Return value ``(compressed, new_overlap_kv, new_overlap_gate)``:
+
+      * ``compressed [B, 1, n_windows, head_dim]`` — ready to cat onto the
+        main KV axis (outer CSA) or feed the indexer scorer.
+      * ``new_overlap_kv`` / ``new_overlap_gate [B, compress_rate, head_dim]``
+        — the Ca slice of *this* call's last window, for the next call.
+
+    **Statelessness of window 0 on the FIRST call.**  When
+    ``overlap_kv_prev is None``, window 0's first-half (Ca of the phantom
+    prior window) stays zero-kv with ``-inf`` gate — softmax weight 0.  This
+    matches HF line 656-657 exactly (``new_kv`` initialised zeros,
+    ``new_gate`` initialised ``-inf``); the "no prior window on the first
+    call" case is a first-class initialisation, not a special-case branch.
+    """
+
+    PARAM_KEYS: tuple[str, ...] = (
+        "wkv.weight",
+        "wgate.weight",
+        "ape",
+        "norm.weight",
+    )
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        head_dim: int,
+        compress_rate: int,
+        rms_eps: float,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        if compress_rate <= 0:
+            raise ValueError(f"compress_rate must be positive; got {compress_rate}")
+        if head_dim <= 0:
+            raise ValueError(f"head_dim must be positive; got {head_dim}")
+        self.hidden_size = int(hidden_size)
+        self.head_dim = int(head_dim)
+        self.compress_rate = int(compress_rate)
+        self.rms_eps = float(rms_eps)
+        self._dtype = dtype
+        # Note: 2 * head_dim projection width — the Ca (first half) + Cb
+        # (second half) split (paper §2.3.1 eq. 9-12).
+        self.wkv = nn.Linear(
+            self.hidden_size, 2 * self.head_dim, bias=False, dtype=dtype
+        )
+        self.wgate = nn.Linear(
+            self.hidden_size, 2 * self.head_dim, bias=False, dtype=dtype
+        )
+        # ape shape mirrors HF: [compress_rate, 2 * head_dim] — broadcasts
+        # against the last two dims of chunk_gate reshaped to
+        # [B, n_windows, compress_rate, 2 * head_dim].
+        self.ape = nn.Parameter(
+            torch.zeros(self.compress_rate, 2 * self.head_dim, dtype=dtype),
+            requires_grad=False,
+        )
+        # RMSNorm gain applied to the *pooled* per-window vector, which has
+        # width `head_dim` (not 2*head_dim) — the softmax convex combination
+        # collapses the 2*compress_rate axis and the last dim is the single
+        # `head_dim` of the compressed representation.
+        self.norm = _MQANormParam(self.head_dim, dtype)
+
+    def compress(
+        self,
+        hidden_states: torch.Tensor,               # [B, S, hidden]
+        cos_win: torch.Tensor,                     # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,                     # [B, n_windows, rope_dim/2]
+        overlap_kv_prev: torch.Tensor | None = None,   # [B, compress_rate, head_dim]
+        overlap_gate_prev: torch.Tensor | None = None, # [B, compress_rate, head_dim]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Emit compressed entries and the state hand-off for the next call.
+
+        Returns
+        -------
+        compressed : [B, 1, n_windows, head_dim] — pre-rotated with the
+            "compress" RoPE at window positions ``[0, m, 2m, ..., (n_win-1)*m]``.
+            (The rope is applied at *within-this-call* window positions;
+            callers that continue a prior call must offset those positions
+            with ``first_window_position`` — the state-aliasing NEFF wiring
+            handles that via a separate ``entry_count`` counter, mirror of
+            HF's ``DeepseekV4CSACache.entry_count``.  The stateless single-
+            shot path used in the CPU-portable smoke test starts at 0.)
+        new_overlap_kv : [B, compress_rate, head_dim] — the Ca slice of
+            *this* call's last window, ready to become the next call's
+            ``overlap_kv_prev``.
+        new_overlap_gate : [B, compress_rate, head_dim] — the Ca gate slice
+            paired with the KV state.
+
+        When there are no complete windows (``S < compress_rate``), returns
+        an empty ``compressed`` tensor and leaves the overlap state
+        unchanged (equal to the prev values, or None-safe zeros).  HF's
+        cache path handles the same case by draining `store_compression_weights`
+        into the buffer without emitting an entry; the stateless smoke does
+        not exercise the buffered-partial-window branch (Round 6 wires the
+        NxDI-aliased ``buffer_kv`` / ``buffer_gate`` tensors alongside the
+        overlap state — same alias pair contract as GLM-5.3-Flash's KDA
+        conv-state entry declared under ``state_cache_specs``).
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_CSAOverlapCompressor.compress expects [B, S, hidden]; "
+                f"got shape {tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        usable = (seq // self.compress_rate) * self.compress_rate
+        if usable == 0:
+            empty_c = hidden_states.new_zeros((batch, 1, 0, self.head_dim))
+            empty_state = hidden_states.new_zeros(
+                (batch, self.compress_rate, self.head_dim)
+            )
+            return empty_c, empty_state, empty_state
+        chunk = hidden_states[:, :usable]
+        kv = self.wkv(chunk)                                    # [B, U, 2*D]
+        gate = self.wgate(chunk)                                # [B, U, 2*D]
+        n_windows = usable // self.compress_rate
+        # Reshape to per-window tiles [B, n_windows, compress_rate, 2*D].
+        chunk_kv = kv.view(batch, n_windows, self.compress_rate, -1)
+        chunk_gate = gate.view(batch, n_windows, self.compress_rate, -1) + self.ape
+
+        # --------- Ca/Cb window scheme (paper §2.3.1) — HF lines 656-669. ---------
+        # new_kv / new_gate carry `2 * compress_rate` slots per window (width doubled).
+        # Slot layout:
+        #   [0 : compress_rate)                 = Ca slice of the *previous* window
+        #                                          (this call's window-0 gets
+        #                                          `overlap_kv_prev`; window-j (j>0)
+        #                                          gets `chunk_kv[:, j-1, :, :head_dim]`).
+        #   [compress_rate : 2*compress_rate)   = Cb slice of the *current* window.
+        # Cells left unset stay zero-kv / -inf-gate → softmax weight 0.
+        ratio = self.compress_rate
+        new_kv = chunk_kv.new_zeros(
+            (batch, n_windows, 2 * ratio, self.head_dim)
+        )
+        new_gate = chunk_gate.new_full(
+            (batch, n_windows, 2 * ratio, self.head_dim), float("-inf")
+        )
+        # Cb of the current window → second half.
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim:]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim:]
+        # Ca of the prior window → first half (windows 1..n_windows-1).
+        if n_windows > 1:
+            new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
+            new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+        # Ca of the *last window of the previous forward call* → window-0
+        # first half.  On the very first call `overlap_*_prev` is None and
+        # window-0's first half stays zero-kv / -inf-gate — softmax weight 0.
+        if overlap_kv_prev is not None:
+            if overlap_gate_prev is None:
+                raise ValueError(
+                    "_CSAOverlapCompressor: overlap_gate_prev must be provided "
+                    "whenever overlap_kv_prev is (they are paired; a gate slot "
+                    "with no KV feeds softmax(-inf) → weight 0 which discards "
+                    "the KV silently — refusing to accept the pair-broken call)."
+                )
+            if tuple(overlap_kv_prev.shape) != (batch, ratio, self.head_dim):
+                raise ValueError(
+                    "_CSAOverlapCompressor: overlap_kv_prev shape "
+                    f"{tuple(overlap_kv_prev.shape)} must be "
+                    f"({batch}, {ratio}, {self.head_dim})"
+                )
+            if tuple(overlap_gate_prev.shape) != (batch, ratio, self.head_dim):
+                raise ValueError(
+                    "_CSAOverlapCompressor: overlap_gate_prev shape "
+                    f"{tuple(overlap_gate_prev.shape)} must be "
+                    f"({batch}, {ratio}, {self.head_dim})"
+                )
+            new_kv[:, 0, :ratio] = overlap_kv_prev.to(new_kv.dtype)
+            new_gate[:, 0, :ratio] = overlap_gate_prev.to(new_gate.dtype)
+
+        # Softmax over the 2*compress_rate intra-window slots in fp32 for
+        # stability (HF line 671-675) — matches HCA's fp32 softmax reason.
+        softmax_w = new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)
+        compressed = (new_kv * softmax_w).sum(dim=2)               # [B, n_windows, D]
+        compressed = _weighted_rms_norm(compressed, self.norm.weight, self.rms_eps)
+        # Compress-rope at window positions; caller pre-computes cos_win, sin_win.
+        compressed = apply_partial_rope(
+            compressed.unsqueeze(1), cos_win, sin_win, unsqueeze_dim=1
+        )                                                          # [B, 1, n_win, D]
+
+        # Persist the Ca slice of *this* call's last window for the next call.
+        new_overlap_kv = chunk_kv[:, -1, :, : self.head_dim].clone()
+        new_overlap_gate = chunk_gate[:, -1, :, : self.head_dim].clone()
+
+        return compressed, new_overlap_kv, new_overlap_gate
+
+
+class _LightningIndexerHead(nn.Module):
+    """DSv4-Flash CSA Lightning Indexer (paper §2.3.1 eq. 13-17).
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py``:
+
+      * ``DeepseekV4Indexer.__init__`` (lines 493-505) — same 6-tensor
+        wrapper-tree layout: an inner overlap-aware compressor at
+        ``index_head_dim``, a per-head Q_B projection from ``q_lora_rank``
+        to ``index_n_heads * index_head_dim``, and the scorer's
+        per-head weight projection ``weights_proj`` from ``hidden_size``
+        to ``index_n_heads``.
+      * ``DeepseekV4Indexer.forward`` (lines 507-586) — the overlap
+        compressor at index_head_dim, RoPE on both compressed keys (window
+        positions) and queries (per-token positions), scorer inner product
+        with ReLU + fp32 softmax scale, top-``index_topk`` selection with
+        the ``-1`` sentinel for indices that would violate per-query causality.
+      * ``DeepseekV4IndexerScorer.forward`` (lines 455-459) — the
+        ``∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)`` reduction:
+        ``scores * (index_head_dim**-0.5)`` scaled by ``(index_n_heads**-0.5)``
+        weight normalisation.
+
+    Owns 7 wrapper-tree tensors (matches the HF layer subtree
+    verbatim on disk under ``layers.<i>.attn.indexer.``):
+
+      * ``compressor.wkv.weight``   [2 * index_head_dim, hidden_size]  BF16
+      * ``compressor.wgate.weight`` [2 * index_head_dim, hidden_size]  BF16
+      * ``compressor.ape``          [compress_rate, 2 * index_head_dim]  BF16
+      * ``compressor.norm.weight``  [index_head_dim]                  BF16
+      * ``wq_b.weight`` [index_n_heads * index_head_dim, q_lora_rank] FP8
+        (on-disk paired ``.scale`` companion follows the same UE8M0
+        convention as the outer MQA weights.)
+      * ``weights_proj.weight``     [index_n_heads, hidden_size]      BF16
+
+    Forward returns ``(top_k_indices, new_overlap_kv, new_overlap_gate)``:
+
+      * ``top_k_indices [B, S, K]`` int64 — indices into the compressed KV
+        axis to gather per query.  ``K = min(index_topk, compressed_len)``.
+        Entries whose selected index would violate the query's causality
+        threshold ``(position_ids + 1) // compress_rate`` are replaced with
+        the ``-1`` sentinel (HF line 583-584); the CSA block's `block_bias`
+        scatter drops them.
+      * ``new_overlap_kv / new_overlap_gate [B, compress_rate, index_head_dim]``
+        — the indexer's own overlap state, structurally identical to the
+        outer CSA compressor's overlap state but at ``index_head_dim`` (128)
+        instead of ``head_dim`` (512).  This is the second aliased state
+        pair the CSA block declares under ``state_cache_specs``.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        self.layer_idx = layer_idx
+        self.hidden_size = int(src.hidden_size)
+        self.q_lora_rank = int(src.q_lora_rank)
+        self.head_dim = int(src.index_head_dim)
+        self.num_heads = int(src.index_n_heads)
+        self.index_topk = int(src.index_topk)
+        self.qk_rope_head_dim = int(src.qk_rope_head_dim)
+        self.rms_eps = float(src.rms_norm_eps)
+        ratio = int(src.compress_ratios[layer_idx])
+        if ratio != 4:
+            raise ValueError(
+                f"_LightningIndexerHead requires compress_ratios[{layer_idx}]=4 "
+                f"(CSA); got {ratio}. Only CSA layers own an indexer per HF "
+                "COMPRESSOR_CLASSES table (modeling_deepseek_v4.py:748-752)."
+            )
+        self.compress_rate = ratio
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+
+        # Softmax scale for the inner product (HF line 451): head_dim**-0.5.
+        self.softmax_scale = self.head_dim ** -0.5
+        # Weight normalisation for the sum over heads (HF line 452):
+        # index_n_heads**-0.5.  Applied to weights_proj output, not to inputs.
+        self.weights_scaling = self.num_heads ** -0.5
+
+        # Inner compressor at index_head_dim — same overlap-aware Ca/Cb
+        # scheme as the outer CSA compressor, minus the outer's larger
+        # head_dim.
+        self.compressor = _CSAOverlapCompressor(
+            hidden_size=self.hidden_size,
+            head_dim=self.head_dim,
+            compress_rate=self.compress_rate,
+            rms_eps=self.rms_eps,
+            dtype=dtype,
+        )
+        # Q_B projection: q_residual [B, S, q_lora_rank] →
+        # [B, S, index_n_heads * index_head_dim].  This is separate from the
+        # outer MQA's Q_B (which projects to num_attention_heads * head_dim);
+        # the shared piece is q_residual (post Q_A + q_norm), computed once
+        # by the outer MQA and threaded in here.
+        self.wq_b = nn.Linear(
+            self.q_lora_rank,
+            self.num_heads * self.head_dim,
+            bias=False,
+            dtype=dtype,
+        )
+        # Scorer's per-head weight projection.
+        self.weights_proj = nn.Linear(
+            self.hidden_size,
+            self.num_heads,
+            bias=False,
+            dtype=dtype,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,             # [B, S, hidden]
+        q_residual: torch.Tensor,                # [B, S, q_lora_rank]
+        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,              # [B, S]
+        overlap_kv_prev: torch.Tensor | None = None,
+        overlap_gate_prev: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute per-query top-``K = min(index_topk, compressed_len)`` indices.
+
+        Composability contract: the outer CSA block passes the *same*
+        `cos, sin, cos_win, sin_win` tables to both this method and its own
+        main-attention path.  HF collapses the two rope tables into a single
+        `{"main", "compress"}` dict and every CSA-family caller (outer
+        compressor, indexer, main attention) reads the same `"compress"`
+        entry from it; that is why the same rope frame keeps queries and
+        compressed keys inner-product-comparable.
+
+        Returns
+        -------
+        top_k_indices : [B, S, K] int64 — the per-query selected compressed
+            entries, with ``-1`` sentinel for causality-violating picks.
+        new_overlap_kv, new_overlap_gate : [B, compress_rate, index_head_dim]
+            — indexer's own Ca overlap state for the next forward call.
+        """
+        batch, seq, _ = hidden_states.shape
+        # Indexer's inner compressor emits [B, 1, n_win, index_head_dim].
+        compressed_kv_bh, new_overlap_kv, new_overlap_gate = self.compressor.compress(
+            hidden_states,
+            cos_win,
+            sin_win,
+            overlap_kv_prev=overlap_kv_prev,
+            overlap_gate_prev=overlap_gate_prev,
+        )
+        # HF's scorer sees compressed_kv as [B, T, D] (line 455-459: it does
+        # `compressed_kv.transpose(-1, -2).float().unsqueeze(1)` giving
+        # [B, 1, D, T]).  We match by squeezing the head axis.
+        compressed_kv = compressed_kv_bh.squeeze(1)                # [B, T, D]
+        compressed_len = compressed_kv.shape[1]
+
+        # Q_B projection + partial RoPE at per-source-token positions (HF
+        # lines 563-565).  q has shape [B, S, H_idx, D_idx]; rope is applied
+        # via `apply_partial_rope` with unsqueeze_dim=1 (adds head-broadcast
+        # axis to cos/sin) on the [B, H_idx, S, D_idx] transpose, then
+        # transposed back to [B, S, H_idx, D_idx] per HF.
+        q_flat = self.wq_b(q_residual)                             # [B, S, H*D]
+        q = q_flat.view(batch, seq, self.num_heads, self.head_dim)
+        q = apply_partial_rope(q.transpose(1, 2), cos, sin).transpose(1, 2)
+        # After transpose-back q is [B, S, H_idx, D_idx].  HF's scorer expects
+        # exactly this layout — `matmul(q.float(), compressed_kv...)`.
+
+        # Scorer: `∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)`
+        # Inner product q · K per head: q [B, S, H, D] × K [B, T, D]^T → [B, S, H, T].
+        # HF line 456: `matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))`
+        # ``compressed_kv.transpose(-1, -2).unsqueeze(1)`` → [B, 1, D, T]; broadcasts
+        # over the H axis of `q`.  fp32 for numerical stability of ReLU + softmax scale.
+        if compressed_len == 0:
+            top_k = min(self.index_topk, compressed_len)
+            # Return empty top_k of shape [B, S, 0].
+            return (
+                torch.zeros(
+                    (batch, seq, top_k), dtype=torch.int64, device=q.device
+                ),
+                new_overlap_kv,
+                new_overlap_gate,
+            )
+        q_fp32 = q.float()
+        k_fp32 = compressed_kv.transpose(-1, -2).float().unsqueeze(1)   # [B, 1, D, T]
+        scores = torch.matmul(q_fp32, k_fp32)                           # [B, S, H, T]
+        scores = F.relu(scores) * self.softmax_scale
+        weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+        # weights: [B, S, H] → [B, S, H, 1] for broadcast.
+        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)      # [B, S, T]
+
+        top_k = min(self.index_topk, compressed_len)
+        # Per-query causality — the same threshold the outer CSA compressor's
+        # block_bias uses (HF lines 577-584).  Entries at cache position `w`
+        # cover source positions `[w*ratio, (w+1)*ratio)`; a query at absolute
+        # position `t` may only see them once `t >= w*ratio + ratio - 1` i.e.
+        # `w < (t + 1) // ratio`.
+        causal_threshold = (position_ids + 1) // self.compress_rate     # [B, S]
+        entry_indices = torch.arange(
+            compressed_len, device=index_scores.device
+        )
+        future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+        index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+        # `topk` — HF line 582; picks that still land ≥ causal_threshold
+        # (only possible when there are fewer legal entries than K) are
+        # tagged with the ``-1`` sentinel HF line 583-584 defines.
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices        # [B, S, k]
+        invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+        top_k_indices = torch.where(
+            invalid, torch.full_like(top_k_indices, -1), top_k_indices
+        )
+        return top_k_indices.to(torch.int64), new_overlap_kv, new_overlap_gate
+
+
+class _CSABlock(nn.Module):
+    """DSv4-Flash Compressed Sparse Attention block (paper §2.3.1).
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py``:
+
+      * ``DeepseekV4Attention.forward`` (lines 801-873) restricted to the
+        ``layer_type == "compressed_sparse_attention"`` branch.
+        Note the CSA branch uses the *same* ``"compress"`` RoPE frame as
+        HCA (line 776-777: ``self.rope_layer_type = "compress"`` for any
+        non-``sliding_attention`` layer).
+      * ``DeepseekV4CSACompressor.forward`` (lines 623-702) — the outer
+        compressor, driven by :class:`_CSAOverlapCompressor` at
+        ``head_dim=512``.  Its returned ``block_bias`` (line 700-702) is
+        the *indexer-gated* top-K mask (built from the Lightning Indexer's
+        top_k_indices), NOT the HCA-style pure causality mask.
+      * ``DeepseekV4Indexer.forward`` (lines 507-586) — the Lightning
+        Indexer, driven by :class:`_LightningIndexerHead`.
+
+    Composability with :class:`_MQABlock`.  CSA is the most complex family
+    but the shared boundary is identical to HCA's — the block reuses the
+    MQA hooks (``project_q``, ``project_kv``, ``attend_and_project``)
+    verbatim.  Two new mechanisms sit on top:
+
+      1. **Overlap-state aliasing.**  The outer CSA compressor and the
+         indexer's inner compressor each own a pair of ``(overlap_kv,
+         overlap_gate)`` tensors of shape ``[B, compress_rate, head_dim]``.
+         Both are declared under :meth:`state_cache_specs` for NxDI's
+         ``input_output_aliases`` at NEFF wiring time — same alias-pair
+         mechanism GLM-5.3-Flash's KDA uses for its recurrent state (see
+         ``glm53_flash/neuron_wrapper.py::_KDABlock.state_cache_specs``).
+         A misaligned aliasing wire would silently corrupt every decode
+         step's compressed entries — this is the load-bearing new
+         verification discipline for CSA.
+      2. **Lightning Indexer top-K gating.**  Only the top-``K =
+         min(index_topk, compressed_len)`` compressed entries per query
+         are visible; the rest are pushed to ``-inf`` in the extended
+         attention mask.  The reduction over the compressed axis becomes
+         O(K * S) instead of O(T_c * S).
+
+    Wrapper-tree keys (verified against the HF layer subtree; disk names
+    for the ``indexer.*`` subtree match HF's checkpoint spelling
+    verbatim, not the HF *class* attribute names).  For one CSA layer i:
+
+      * 8 MQA params under ``mqa.<one of PARAM_KEYS>``
+      * 4 CSA compressor params under ``compressor.<one of PARAM_KEYS>``
+      * 4 indexer inner-compressor params under
+        ``indexer.compressor.<one of PARAM_KEYS>``
+      * 2 indexer projection params: ``indexer.wq_b.weight``,
+        ``indexer.weights_proj.weight``
+      * Total: 8 + 4 + 4 + 2 = 18 params per CSA layer (plus the sibling
+        ``layers.<i>.attn_norm.weight`` owned at the decoder-layer level).
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        got = src.layer_types[layer_idx]
+        if got != "compressed_sparse_attention":
+            raise ValueError(
+                f"_CSABlock requires compressed_sparse_attention at "
+                f"layer_idx={layer_idx}; got layer_types[{layer_idx}]={got!r}. "
+                "The frozen HF schedule places CSA only at the '4' entries of "
+                "compress_ratios (paper §2.3.1)."
+            )
+        ratio = int(src.compress_ratios[layer_idx])
+        if ratio != 4:
+            raise ValueError(
+                f"_CSABlock requires compress_ratios[{layer_idx}]=4 (CSA); "
+                f"got {ratio}."
+            )
+        self.layer_idx = layer_idx
+        self.head_dim = int(src.head_dim)
+        self.compress_rate = ratio
+        self.compress_rope_theta = float(src.compress_rope_theta)
+        self.qk_rope_head_dim = int(src.qk_rope_head_dim)
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+        # Same wrapper-tree convention as _HCABlock: `mqa` + `compressor` +
+        # (new for CSA) `indexer`.  The state-dict lands under
+        # `layers.<i>.attn.{mqa|compressor|indexer}.*` when the wrapper is
+        # walked by NxDI's state-dict traversal (verified against
+        # `test_hca_1layer.py::test_hca_wrapper_tree_key_set` — the same
+        # walk logic applies here).
+        self.mqa = _MQABlock(config, layer_idx=layer_idx)
+        self.compressor = _CSAOverlapCompressor(
+            hidden_size=int(src.hidden_size),
+            head_dim=self.head_dim,
+            compress_rate=self.compress_rate,
+            rms_eps=float(src.rms_norm_eps),
+            dtype=dtype,
+        )
+        self.indexer = _LightningIndexerHead(config, layer_idx=layer_idx)
+
+    def state_cache_specs(
+        self, batch: int, seq_len: int
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Aliased state this CSA layer owns, in graph input/output order.
+
+        Same alias-pair contract GLM-5.3-Flash uses for its KDA state (see
+        ``glm53_flash/neuron_wrapper.py::_KDABlock.state_cache_specs``):
+        each entry becomes an ``nn.Parameter`` on the caller side that NxDI
+        aliases via ``input_output_aliases`` — the entry is read as an
+        argument to the graph, updated inside forward, and written back to
+        the same slot on the output.  The mechanism is identical whether
+        the payload is a linear-attention recurrent state (KDA) or an
+        overlap Ca-slice (CSA); what matters is that the state-dict spelling
+        stays stable across graph rewiring and that the aliased dtype
+        matches this class's compute dtype.
+
+        CSA overlap state is *sequence-length independent* — it is a fixed
+        ``[compress_rate, head_dim]`` window slice, not a growing per-position
+        buffer.  Dropping the ``seq_len`` argument mirrors KDA's contract.
+        """
+        del seq_len  # CSA overlap size is fixed by compress_rate, not seq_len.
+        return [
+            (
+                "compressor_overlap_kv",
+                (batch, self.compress_rate, self.head_dim),
+                self._dtype,
+            ),
+            (
+                "compressor_overlap_gate",
+                (batch, self.compress_rate, self.head_dim),
+                self._dtype,
+            ),
+            (
+                "indexer_overlap_kv",
+                (batch, self.compress_rate, self.indexer.head_dim),
+                self._dtype,
+            ),
+            (
+                "indexer_overlap_gate",
+                (batch, self.compress_rate, self.indexer.head_dim),
+                self._dtype,
+            ),
+        ]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,             # [B, S, hidden]
+        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,              # [B, S]
+        attention_mask: torch.Tensor | None = None,
+        overlap_state: dict[str, torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """CSA block forward with two overlap-state aliased pairs.
+
+        ``overlap_state`` is an optional dict with keys:
+          * ``compressor_overlap_kv``, ``compressor_overlap_gate`` — the outer
+            CSA compressor's Ca slice from the *previous* forward call.
+          * ``indexer_overlap_kv``, ``indexer_overlap_gate`` — the indexer's
+            own Ca slice from the previous forward call.
+
+        Any missing / ``None`` key means "no prior window" — that branch's
+        window-0 first half stays zero-kv / -inf-gate (softmax weight 0),
+        matching the very-first-call semantics HF's cache initialiser
+        provides (``self.overlap_kv[name] = None``).
+
+        Returns ``(output, new_overlap_state)`` where ``new_overlap_state``
+        carries the four next-call Ca slices under the same keys.  The
+        NxDI-wired NEFF caller pushes them back to the aliased parameters
+        after the forward; the CPU-portable smoke test in
+        ``tests/test_csa_1layer.py`` uses the dict directly.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_CSABlock expects hidden_states [B, S, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        if position_ids.shape != (batch, seq):
+            raise ValueError(
+                f"_CSABlock expects position_ids shape ({batch}, {seq}); got "
+                f"{tuple(position_ids.shape)}"
+            )
+        overlap_state = overlap_state or {}
+        comp_kv_prev = overlap_state.get("compressor_overlap_kv")
+        comp_gate_prev = overlap_state.get("compressor_overlap_gate")
+        idx_kv_prev = overlap_state.get("indexer_overlap_kv")
+        idx_gate_prev = overlap_state.get("indexer_overlap_gate")
+
+        # 1. Q + main KV via _MQABlock hooks.  Q_A + q_norm gives q_residual,
+        # which the indexer *reuses* (avoids recomputing Q_A twice per layer).
+        q, q_residual = self.mqa.project_q(hidden_states, cos, sin)
+        kv_main = self.mqa.project_kv(hidden_states, cos, sin)       # [B, 1, S, D]
+
+        # 2. CSA compressor emits [B, 1, T_c, head_dim] compressed KV +
+        # new overlap-state tensors for the next forward call.
+        compressed_kv, new_comp_kv, new_comp_gate = self.compressor.compress(
+            hidden_states,
+            cos_win,
+            sin_win,
+            overlap_kv_prev=comp_kv_prev,
+            overlap_gate_prev=comp_gate_prev,
+        )
+        t_compressed = compressed_kv.shape[2]
+
+        # 3. Lightning Indexer top-K gating over compressed entries.
+        top_k_indices, new_idx_kv, new_idx_gate = self.indexer(
+            hidden_states,
+            q_residual,
+            cos,
+            sin,
+            cos_win,
+            sin_win,
+            position_ids,
+            overlap_kv_prev=idx_kv_prev,
+            overlap_gate_prev=idx_gate_prev,
+        )                                                             # [B, S, K]
+
+        # 4. Build indexer-gated per-query block_bias (HF lines 693-702).
+        # `valid` marks non-sentinel picks; `safe_indices` clamps sentinels
+        # into a padding column that the trailing slice drops.  Scatter 0
+        # onto the K valid columns and leave every other slot at -inf.
+        if t_compressed > 0:
+            valid = top_k_indices >= 0
+            safe_indices = torch.where(
+                valid,
+                top_k_indices,
+                torch.full_like(top_k_indices, t_compressed),
+            )
+            block_bias = compressed_kv.new_full(
+                (batch, 1, seq, t_compressed + 1), float("-inf")
+            )
+            block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+            block_bias = block_bias[..., :t_compressed]
+        else:
+            block_bias = None
+
+        # 5. Cat compressed KV onto main KV axis (HF line 832) + extend mask.
+        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)      # [B, 1, S+T_c, D]
+        if attention_mask is not None:
+            if block_bias is not None:
+                extended_mask = torch.cat(
+                    [attention_mask, block_bias.to(attention_mask.dtype)], dim=-1
+                )
+            else:
+                extended_mask = F.pad(
+                    attention_mask, (0, t_compressed), value=0.0
+                )
+        else:
+            if block_bias is not None:
+                zeros_prefix = hidden_states.new_zeros(
+                    (batch, 1, seq, kv_main.shape[2])
+                )
+                extended_mask = torch.cat(
+                    [zeros_prefix, block_bias.to(zeros_prefix.dtype)], dim=-1
+                )
+            else:
+                extended_mask = None
+
+        # 6. Delegate to _MQABlock.attend_and_project — inherits the
+        # per-head attention-sink softmax, the -sin conjugate rotation on
+        # the output rope slice (using the same "compress" rope), and the
+        # grouped output projection.  Compressed slots outside the top-K
+        # gate get logit -inf via block_bias → softmax weight 0.
+        output = self.mqa.attend_and_project(
+            q, kv_extended, cos, sin, attention_mask=extended_mask
+        )
+        new_state = {
+            "compressor_overlap_kv": new_comp_kv,
+            "compressor_overlap_gate": new_comp_gate,
+            "indexer_overlap_kv": new_idx_kv,
+            "indexer_overlap_gate": new_idx_gate,
+        }
+        return output, new_state
+
+
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
         return
@@ -1363,31 +2102,6 @@ if _NXDI_AVAILABLE:
             raise NotImplementedError(
                 "_SlidingOnlyAttentionBlock is Round 2.  Composes _MQABlock + "
                 "sliding-window causal mask over `sliding_window=128` KV positions."
-            )
-
-    class _CSABlock(nn.Module):
-        """Compressed Sparse Attention (paper §2.3.1).
-
-        Composes:
-          * ``_MQABlock`` (main attention math shared).
-          * Sliding-window K=V branch (window=128, always).
-          * **Compressor with overlap state** (m=4, learned pool weights):
-            per-window aliased overlap buffer of shape [B, m-1, D] carries
-            across forward calls.  This is the largest new mechanism in the
-            port and has no GLM-5.3-Flash analogue.
-          * Lightning Indexer (paper eq. 13-17): scores queries against
-            pooled entries, gathers top ``index_topk=512`` blocks per query.
-            Mostly reusable from GLM-5.3-Flash `_DSAIndexerBlock` after
-            index-topk / index-head-dim constants are re-pinned.
-        """
-
-        def __init__(self, config: Any, *, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_idx = layer_idx
-            self._config = config
-            raise NotImplementedError(
-                "_CSABlock is Round 2.  Blocker for first NEFF fire: compressor "
-                "overlap-state aliasing (per user memory / enablement-draft §3-5)."
             )
 
     class _HashMoEBlock(nn.Module):
@@ -1688,8 +2402,11 @@ __all__ = [
     "DeepseekV4FlashNeuronInferenceConfig",
     "FORBIDDEN_FP8_KV_KEYS",
     "NeuronDeepseekV4FlashForCausalLM",
+    "_CSABlock",
+    "_CSAOverlapCompressor",
     "_HCABlock",
     "_HCACompressor",
+    "_LightningIndexerHead",
     "_MQABlock",
     "apply_partial_rope",
     "build_main_rope_cos_sin",
