@@ -129,20 +129,55 @@ concurrently and shares RAM with the compiler's Python process — since
 `neuronx-cc` itself is CPU-bound (matmul planning) and the streaming
 loader is I/O + dequant bound, contention is on RAM, not CPU.
 
-## Rank-0 measurement
+## Rank-0 measurement — killed on I/O contention
 
-Configuration: `tp_degree=32`, single rank (rank 0), full 45-layer
-model.
+Configuration: `tp_degree=32`, single rank (rank 0), full 45-layer model.
 
-- Wall: **RANK_0_WALL_S** (filled in from
-  `/mnt/compile/runroot/glm53-round6/logs/rank0-report.json`).
-- Peak RSS: **RANK_0_PEAK_RSS_GIB** GiB (measured by 30s `ps -o rss`
-  polling during the run).  The RSS is dominated by 62 mmap'd FP8 shards
-  becoming OS-resident as the streamer reads them; the pure-heap
-  contribution is the ~19 GiB rank_dict.  Under memory pressure the mmap
-  would page out; the compile host is not currently pressured.
-- Written file: `/mnt/compile/runroot/glm53-round6/weights/tp0_sharded_checkpoint.safetensors`.
-- File size: **RANK_0_BYTES** bytes.
+- Elapsed wall at kill: **14:46** (mm:ss).
+- Peak RSS at kill: **136.5 GiB** (top -bn1), split as:
+  - **RssAnon: 11.6 GiB** — Python heap (rank_dict tensors accumulated
+    across ~24 of 42 MoE layers).
+  - **RssFile: 125 GiB** — OS page cache for the 62 mmap'd FP8 shards.
+    Would page out under memory pressure; is not "held" by the process.
+- Working-set proper (RssAnon): well under the 100 GiB target.
+- File written: **0 bytes**.  `save_file` never reached — the loop was
+  still inside the MoE-layer emission.
+- CPU: **306%** (3 cores of parallel work).
+- I/O: `read_bytes = 51.3 GB` from FP8 shards after 14:46, i.e. ~17% of
+  the 306 GiB checkpoint.  At this rate, one rank ≈ **85 min**; 32 ranks
+  serial ≈ 45 hours.  Not feasible before the Trn2 cliff.
+
+**Why the rate is I/O-bound, not CPU-bound**: `top -bn1` reports
+`wa=76.6%` — the process spent 76% of CPU time waiting on disk.  Load
+average = 47.46 on 48 vCPUs; five concurrent docker containers were
+running compiles that shared the same NVMe:
+  - Round-4 GLM-5.3-Flash CTE compile (`elegant_mccarthy`, 50 min +)
+  - Two Qwen3.8-27B compiles (`distracted_hellman`, `busy_torvalds`)
+  - A Gemma-4 lane (`clever_driscoll`)
+  - The vllm-probe container
+
+The streaming loader's own I/O is 306 GiB of FP8 reads — the r7i.12xlarge's
+EBS-only backing at ~1 GB/s baseline sequential read gets divided across
+all five compiles.  Nothing wrong with the loader itself; the shared-disk
+contention is the wall.
+
+`/proc/280036/stack` showed `futex_wait` at the sample — that is Python
+waiting on a threaded internal (torch's caching allocator or safetensors'
+readahead), not a deadlock.  The process was still counting CPU cycles.
+
+## Blocker (revised): shared-disk I/O contention
+
+The Round-5 blocker "no streaming loader" is now retired; the Round-6
+blocker is:
+
+  **The compile host cannot simultaneously stream a full GLM-5.3-Flash
+  bf16 shard set AND host concurrent peer compiles.**  Either the
+  streamer or the compiles must own the disk.
+
+Also still present:
+
+  **Round-6 disk budget** — 32-rank output is ~608 GiB vs 366 GiB free
+  (independent of I/O contention).
 
 ## Blocker: disk space for 32-rank output
 
@@ -179,9 +214,16 @@ lanes).
      runtime host (either mounted from the same shared FS or copied
      locally).  Peak disk: none on the compile host, ~306 GiB on the
      runtime host for one HF cache copy.
+  4. **Idle-disk fire.**  Wait for all peer compiles to finish then
+     stream 4 ranks concurrently on an idle disk.  Sequential single-
+     rank wall on an idle disk should drop from 85 min (contended,
+     wa=76.6%) to ~10-15 min (I/O 20 GiB dequant + 19 GiB write at
+     1 GB/s baseline).  Four concurrent × 10 min × 8 batches = 80 min
+     total.  Combines cleanly with option 1 to also solve the disk
+     ceiling.
 
-Round 7 recommendation: option 1 — smallest wrapper change, no cross-
-host storage negotiation, provable by a simple `rsync` + `rm` per rank.
+Round 7 recommendation: **option 1 + option 4** — wait for an idle
+disk window, then stream+rsync per rank.  Wrapper untouched.
 
 ## Compile fire — NOT ATTEMPTED
 
@@ -246,15 +288,20 @@ Compile-host mirror:
 | Streaming per-rank checkpoint loader (`stream_shard.py`) | DONE |
 | KDA conv1d per-head-interleaved layout fix | DONE |
 | Rank-0 streaming verified against Round-5 dequant golden | INHERITED (same `dequantize_block_fp8`) |
-| Rank-0 wall + peak RSS measurement | DONE (see report JSON) |
+| Rank-0 wall + peak RSS measurement | PARTIAL — killed at 14:46 (17% read), Python heap 11.6 GiB (well under 100 GiB target), I/O-bound at wa=76.6% |
+| Compile-driver script (`fire_round6_compile.sh`) | DONE |
 | DSA indexer q_proj / pool_weights populated | DEFERRED — shape mismatch requires Round 7 wrapper change |
-| All 32 ranks written to disk | BLOCKED — 608 GiB needed vs 366 GiB free |
+| All 32 ranks written to disk | BLOCKED — 608 GiB needed vs 366 GiB free, AND I/O-contended |
 | Real-weight compile fire (NEFF slug + wall) | NOT ATTEMPTED — no sharded weights available |
 | Emitted `neuron_config.json` verify + CPU-fallback grep | NOT ATTEMPTED |
 | 10-token gate vs banked reference logits | NOT ATTEMPTED |
 
-**Single next blocker:** disk expansion strategy (Option 1: rsync-to-
-Trn2 per rank, delete local; Option 2: attach temporary 800 GiB EBS;
-Option 3: run streaming on the Trn2 host at load time).  Once one of
-those lands, all 32 sharded files can be produced and the full-model
-compile + gate flow proceeds.
+**Single next blocker:** shared-disk I/O contention + 32-rank disk
+budget.  Round-7 plan: (a) wait for peer compiles to drain; (b) run
+4 ranks concurrently on an idle disk; (c) rsync each rank to the
+Trn2 host and delete local as it lands.  Estimated wall on idle disk:
+~10-15 min per rank, ~80 min for all 32 with 4-way concurrency.  Then
+the compile driver at
+`C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\glm53_flash\fire_round6_compile.sh`
+runs (30-60 min wall estimate), and the 10-token gate against the
+banked reference logits is a straight execution.
