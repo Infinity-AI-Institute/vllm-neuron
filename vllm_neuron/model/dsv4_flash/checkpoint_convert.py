@@ -851,6 +851,151 @@ def _convert_mqa_block(
     return converted
 
 
+# ---------------------------------------------------------------------------
+# HCA compressor subtree layout (source-cited).
+#
+# Verified against ``model.safetensors.index.json`` @ HF SHA
+# ``7872f01b1d1fe23eabc4c98b48bffcef5a386062`` and shard header of
+# ``model-00005-of-00048.safetensors`` (layer 3, the first HCA layer per the
+# frozen ``compress_ratios`` schedule):
+#
+#   layers.3.attn.compressor.ape          F32  [128, 512]  (compress_rate, head_dim)
+#   layers.3.attn.compressor.norm.weight  BF16 [512]       (head_dim)
+#   layers.3.attn.compressor.wgate.weight BF16 [512, 4096] (head_dim, hidden_size)
+#   layers.3.attn.compressor.wkv.weight   BF16 [512, 4096] (head_dim, hidden_size)
+#
+# All four are stored *dense* on disk (no ``.scale`` companion), so the
+# converter carries them through with a straight dtype cast — the HCA
+# compressor is not FP8-quantised in this snapshot.  This matches
+# transformers' ``_keep_in_fp32_modules`` for ``self_attn.compressor.kv_proj``
+# and ``.gate_proj`` (fp32-kept precision does NOT imply fp32 storage on
+# disk — it's a compute-precision hint the wrapper can honour at compile
+# time; our converter emits at the wrapper's module dtype, matching the
+# _MQABlock convention).
+# ---------------------------------------------------------------------------
+
+COMPRESSOR_PREFIX = "compressor."
+_HCA_COMPRESSOR_DENSE_NAMES: tuple[str, ...] = (
+    "wkv.weight",
+    "wgate.weight",
+    "ape",
+    "norm.weight",
+)
+
+
+def _convert_hca_block(
+    state_dict: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+    require_attn_sink: bool = True,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash HCA attention block HF -> wrapper module tree.
+
+    Fuses :func:`_convert_mqa_block` (the shared MQA attention subtree) with
+    the HCA-specific 4-tensor compressor subtree that lives under
+    ``layers.<i>.attn.compressor.*``.
+
+    Contract on the caller:
+      * ``src.layer_types[layer_idx]`` MUST equal
+        ``"heavily_compressed_attention"`` — refusing to load a mismatched
+        layer avoids silently mapping CSA weights (which live under the same
+        ``compressor.`` subtree but with different shapes and an added
+        ``indexer.`` sub-subtree) onto the HCA wrapper.
+      * ``src.compress_ratios[layer_idx]`` MUST equal 128.
+
+    Structure it produces (for one layer i under wrapper_prefix ""):
+
+      * 8 entries from :func:`_convert_mqa_block` (attention subtree) —
+        ``layers.<i>.attn.{wq_a.weight, wq_b.weight, q_norm.weight,
+        wkv.weight, kv_norm.weight, wo_a.weight, wo_b.weight, attn_sink}``.
+      * 1 sibling from :func:`_convert_mqa_block` (pre-attn RMSNorm) —
+        ``layers.<i>.attn_norm.weight``.
+      * 4 entries for the HCA compressor subtree —
+        ``layers.<i>.attn.compressor.{wkv.weight, wgate.weight, ape,
+        norm.weight}``.
+      * Total: 13 tensors per layer.
+
+    Shape assertions (fail-loud):
+
+      * wkv.weight   [head_dim, hidden_size]
+      * wgate.weight [head_dim, hidden_size]
+      * ape          [compress_rate=128, head_dim]
+      * norm.weight  [head_dim]
+
+    Fail-loud on any missing tensor — an HCA layer without its compressor
+    weights would silently degrade to plain MQA at that layer (all
+    compressed KV entries would be uninitialised parameter noise multiplied
+    by a random gate), producing plausible-looking logits that are quietly
+    wrong.  Identical failure mode to the ``attn_sink`` guard on the MQA
+    converter, escalated here to the 4 compressor tensors.
+    """
+    if src.layer_types[layer_idx] != "heavily_compressed_attention":
+        raise ValueError(
+            f"_convert_hca_block called for layer {layer_idx} but "
+            f"layer_types[{layer_idx}]={src.layer_types[layer_idx]!r} — "
+            "refusing to route a non-HCA layer through the HCA converter."
+        )
+    ratio = int(src.compress_ratios[layer_idx])
+    if ratio != 128:
+        raise ValueError(
+            f"_convert_hca_block requires compress_ratios[{layer_idx}]=128; "
+            f"got {ratio}."
+        )
+    dtype = dtype if dtype is not None else src.torch_dtype
+    hidden = int(src.hidden_size)
+    head_dim = int(src.head_dim)
+
+    # 1. Delegate the MQA subtree + sibling attn_norm to the MQA converter.
+    converted = _convert_mqa_block(
+        state_dict,
+        layer_idx,
+        src,
+        hf_prefix=hf_prefix,
+        wrapper_prefix=wrapper_prefix,
+        dtype=dtype,
+        require_attn_sink=require_attn_sink,
+    )
+
+    # 2. HCA-specific 4-tensor compressor subtree.  Every entry is dense
+    # on disk in the pinned snapshot (verified against shard 00005-of-00048
+    # header — see source-cited layout comment above); we cast to the
+    # wrapper's module dtype without dequant.
+    hf_base = (
+        f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    target = (
+        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    )
+    expected_compressor_shapes: dict[str, tuple[int, ...]] = {
+        "wkv.weight": (head_dim, hidden),
+        "wgate.weight": (head_dim, hidden),
+        "ape": (ratio, head_dim),
+        "norm.weight": (head_dim,),
+    }
+    for name in _HCA_COMPRESSOR_DENSE_NAMES:
+        hf_key = f"{hf_base}{name}"
+        raw = state_dict.get(hf_key)
+        if raw is None:
+            raise KeyError(
+                f"missing HCA compressor tensor {hf_key!r} for layer "
+                f"{layer_idx} — refusing to silently substitute zeros / "
+                "random init and degrade to plain MQA at this layer."
+            )
+        expected = expected_compressor_shapes[name]
+        if tuple(raw.shape) != expected:
+            raise ValueError(
+                f"{hf_key!r} shape {tuple(raw.shape)} disagrees with "
+                f"wrapper-expected {expected}"
+            )
+        converted[f"{target}{name}"] = raw.to(dtype)
+
+    return converted
+
+
 def _convert_dsv4_checkpoint(
     state_dict: dict[str, Any],
     src: DeepseekV4FlashInferenceConfig,
@@ -944,6 +1089,7 @@ def _convert_dsv4_checkpoint(
 __all__ = [
     "ATTN_NORM_KEY",
     "ATTN_PREFIX",
+    "COMPRESSOR_PREFIX",
     "DSV4_FP4_BLOCK_SIZE",
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
@@ -959,9 +1105,11 @@ __all__ = [
     "SHARED_EXPERTS_SUBTREE",
     "TEXT_LAYER_PREFIX",
     "_FP4_E2M1_TABLE",
+    "_HCA_COMPRESSOR_DENSE_NAMES",
     "_MQA_DENSE_NAMES",
     "_MQA_FP8_WEIGHT_NAMES",
     "_convert_dsv4_checkpoint",
+    "_convert_hca_block",
     "_convert_mqa_block",
     "_convert_routed_moe_layer",
     "_convert_shared_expert",

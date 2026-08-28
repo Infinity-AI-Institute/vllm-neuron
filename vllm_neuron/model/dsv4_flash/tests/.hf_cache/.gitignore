@@ -5,3 +5,8 @@
 # `dsv4_expert0_w2.safetensors`) stay checked-in because they fit under
 # the per-file review budget.
 dsv4_layer0_attn.safetensors
+# HCA-block layer-3 fixture is ~111 MB (same shape story: 5 FP8 attention
+# weights + scales + dense sinks + 4 compressor tensors).  Regenerated on
+# first run of `test_hca_1layer.py` from the same HF snapshot, shard
+# `model-00005-of-00048.safetensors`.
+dsv4_layer3_hca.safetensors
