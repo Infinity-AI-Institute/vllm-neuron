@@ -43,6 +43,8 @@ which change what may honestly be fired — see "The CTE wall".
 | Real 45-layer CTE HLO, s=2048 | PASS — 709.12 s, ~87 GB RSS |
 | Real 45-layer TKG NEFF, **TP=16** | **FAIL — `NCC_EVRF009`, 39.6 GB needed vs 24 GB** |
 | Real 45-layer NEFF, TP=16, CTE+TKG traced | FAIL — same `NCC_EVRF009`, byte-identical 39,644,174,584 |
+| **Real 45-layer TKG NEFF, TP=32, S=2048** | **PASS — `Compiler status PASS`, zero `NCC_EVRF009`** |
+| Real 45-layer CTE HLO, TP=32, bucket 512 | PASS — 163.39 s |
 
 Receipts on the host under `/mnt/compile/runroot/glm53-round4/`:
 `glm53-round4-<tag>.json` per run, `logs/<tag>.log`, and preserved
@@ -478,6 +480,25 @@ reference bindings, so both are fixable in Round 5 without touching the stack:
   never materialises `[B, Q, topk, H, D]` — at `topk >= L` the selection is
   the degenerate dense case anyway, so a prefill-specific path is available
   without changing the model.
+
+## What was fired
+
+| contract | TP / LNC | shape | outcome |
+|---|---|---|---|
+| TKG (decode) | 16 / 2 | `S=2048`, `B=1` | **refused by neuronx-cc** — `NCC_EVRF009`, 39.64 GB vs 24 GB |
+| CTE+TKG | 16 / 2 | `S=2048`, `B=1` | refused, byte-identical footprint |
+| **TKG (decode)** | **32 / 2** | `S=2048`, `B=1` | **`Compiler status PASS`, zero `NCC_EVRF009`** |
+| CTE (prefill) | 32 / 2 | bucket 512, KV window 2048, `B=1` | HLO 163.39 s; NEFF in flight |
+
+The CTE bucket is **512, not 2048**, and that is a measured choice rather than
+a concession: at 2048 the prefill costs 709 s of HLO generation and 16 GiB of
+transient DSA gather per layer, while at 512 it costs 163 s and 1 GiB. The KV
+window stays 2048 — `max_context_length` and `seq_len` are separate knobs, and
+Round 4 had to make them separate (`build_neuron_config` previously pinned
+`n_active_tokens` to `seq_len`, silently ignoring a narrowed prefill bucket).
+
+No spec-decode field appears in any contract, and the MTP module at layer 45 is
+dropped by the checkpoint converter for the same reason.
 
 ## Compile driver
 
