@@ -161,3 +161,42 @@ based on `src.layer_types[i]` and `src.mlp_layer_types[i]`).
 - `C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\dsv4_flash\tests\test_hca_1layer.py`
 - `C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\dsv4_flash\tests\test_csa_1layer.py`
 - `C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\dsv4_flash\tests\test_sliding_only_1layer.py`
+- `C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\dsv4_flash\kernel_dispatch.py` — **NEW 2026-08-28** (DSA v2 slug advertiser, `resolve_dsa_impl_slug`, `get_emitted_kernel_slugs`)
+- `C:\Users\apumu\research\InfinityAI\vllm-neuron-codex-alpha\vllm_neuron\model\dsv4_flash\tests\test_dsa_v2_wrapper_integration.py` — **NEW 2026-08-28** (13 tests, 13/13 PASS via direct-invoke)
+
+## Kernel-slug env-flip (2026-08-28)
+
+The DSv4-Flash CSA lane now advertises the DSA kernel slug via
+`DSA_KERNEL_IMPL` env-flip. Wire-up commit `2fea306` on branch
+`worker/dsv4-flash-enablement-scaffold-20260828`:
+
+| Env-var value | Advertised slug | Notes |
+|---|---|---|
+| unset / empty / `cpu` / `cpu_golden` / `v0` | `nki_v0_reference_lightning_indexer` | default; existing behaviour |
+| `nki_v2` / `v2` / `dsa_sparse_attention.nki_v2` | `dsa_sparse_attention.nki_v2` | v2 NKI device kernel (baremetal COMPILE PASS on r7i, 29.91s -- see `DSA-LIGHTNING-INDEXER-STATUS-2026-08-28.md` §3C) |
+| any other value | -- | `ValueError` (rejects typos so a stale-NEFF class of bug can't land) |
+
+Scope on DSv4-Flash: the env flip is a SLUG-ONLY advertisement -- DSv4
+does not structurally call `dsa_sparse_attention_forward` (the indexer's
+top-k is consumed by a `block_bias` mask feeding a dense softmax on the
+extended KV axis). The wire-up:
+
+1. Adds `_emitted_dsa_slug` to `_LightningIndexerHead.__init__` and
+   `_CSABlock.__init__` (bound to the env-resolved slug at construction
+   time; per-layer view for audit).
+2. Re-exports `get_emitted_kernel_slugs`, `DSA_CPU_GOLDEN_SLUG`,
+   `DSA_NKI_V2_SLUG` at the `neuron_wrapper` module top-level (single
+   import surface for the compile driver, parallel to the GLM-5.3-Flash
+   lane).
+3. When a future revision inlines a fused sparse-gather kernel, the env
+   flip is already the entrypoint.
+
+DSv4 has NO KDA layers (attention families are MQA + CSA + HCA +
+SlidingOnly), so there is NO KDA dispatch. `kernel_dispatch.py` deliberately
+does not export a KDA resolver -- the integration test
+(`test_dsv4_kernel_dispatch_has_no_kda_dispatch`) asserts against
+copy-paste drift.
+
+Parallel wire-up on GLM-5.3-Flash: `codex/glm53-flash-enablement@a3d56f6`.
+Cross-model integrated-status receipt at
+`C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\lanes\glm-5-2-5-3\KERNELS-INTEGRATED-2026-08-28.md`.
