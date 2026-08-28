@@ -1234,6 +1234,75 @@ def _convert_csa_block(
     return converted
 
 
+def _convert_sliding_only_block(
+    state_dict: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+    require_attn_sink: bool = True,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash sliding-only attention block HF -> wrapper.
+
+    Reuses :func:`_convert_mqa_block` verbatim — sliding-only layers own
+    exactly the same 8 attention parameters (``wq_a``, ``wq_b``, ``wkv``,
+    ``wo_a``, ``wo_b``, ``q_norm``, ``kv_norm``, ``attn_sink``) as CSA
+    and HCA layers, and no compressor / indexer subtree.  What
+    differentiates a sliding-only layer at forward time is:
+
+      * ``rope_layer_type = "main"`` (theta=10000) instead of the
+        "compress" rope (theta=160000) that CSA/HCA share.  This is a
+        FORWARD-TIME distinction on which rope table to pass in, NOT a
+        distinction in the on-disk parameter set.
+      * A sliding-window causal mask applied to the KV axis.
+
+    Both of those live in :class:`_SlidingOnlyAttentionBlock` (see
+    ``neuron_wrapper.py``); the checkpoint layout is identical to the
+    MQA subtree.
+
+    Contract on the caller:
+      * ``src.layer_types[layer_idx]`` MUST equal ``"sliding_attention"``.
+      * ``src.compress_ratios[layer_idx]`` MUST equal 0.
+
+    Refusing to route a non-sliding layer through this converter avoids
+    silently dropping the compressor subtree.
+
+    Structure it produces (for one layer i under wrapper_prefix ""):
+
+      * 8 entries from :func:`_convert_mqa_block` (attention subtree) —
+        ``layers.<i>.attn.{wq_a.weight, wq_b.weight, q_norm.weight,
+        wkv.weight, kv_norm.weight, wo_a.weight, wo_b.weight, attn_sink}``.
+      * 1 sibling from :func:`_convert_mqa_block` (pre-attn RMSNorm) —
+        ``layers.<i>.attn_norm.weight``.
+      * Total: 9 tensors per layer (contrast with 13 for HCA and 18 for
+        CSA — the delta is entirely in compressor / indexer tensors).
+    """
+    if src.layer_types[layer_idx] != "sliding_attention":
+        raise ValueError(
+            f"_convert_sliding_only_block called for layer {layer_idx} but "
+            f"layer_types[{layer_idx}]={src.layer_types[layer_idx]!r} — "
+            "refusing to route a non-sliding layer through the sliding-only "
+            "converter (which would silently drop the compressor subtree)."
+        )
+    ratio = int(src.compress_ratios[layer_idx])
+    if ratio != 0:
+        raise ValueError(
+            f"_convert_sliding_only_block requires compress_ratios"
+            f"[{layer_idx}]=0 (sliding-only); got {ratio}."
+        )
+    return _convert_mqa_block(
+        state_dict,
+        layer_idx,
+        src,
+        hf_prefix=hf_prefix,
+        wrapper_prefix=wrapper_prefix,
+        dtype=dtype,
+        require_attn_sink=require_attn_sink,
+    )
+
+
 def _convert_dsv4_checkpoint(
     state_dict: dict[str, Any],
     src: DeepseekV4FlashInferenceConfig,
@@ -1357,6 +1426,7 @@ __all__ = [
     "_convert_mqa_block",
     "_convert_routed_moe_layer",
     "_convert_shared_expert",
+    "_convert_sliding_only_block",
     "_dequant_expert_fp4_weight",
     "_dequant_or_cast",
     "_dequant_shared_fp8_weight",
