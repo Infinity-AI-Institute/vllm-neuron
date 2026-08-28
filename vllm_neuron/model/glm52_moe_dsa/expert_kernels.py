@@ -183,6 +183,8 @@ class Glm52RoutedExperts(nn.Module):
             expert_gate_up_weights=self.gate_up_proj,
             expert_down_weights=self.down_proj,
             expert_affinities=affinities,
+            # PR #13 audit: safe kernel-ABI narrowing after the router has
+            # normalized to int64 and dense_glm52_affinities validated >= 0.
             expert_index=expert_indices.to(torch.int32),
             is_all_expert=True,
             rank_id=rank_id,
@@ -219,6 +221,8 @@ class Glm52RoutedExperts(nn.Module):
             expert_affinities_masked=expert_affinities_masked,
             gate_up_proj_weight=self.gate_up_proj,
             down_proj_weight=self.down_proj,
+            # PR #13 audit: these signed blockwise-mapper IDs are not TopK
+            # outputs; int32 preserves the -1 padding sentinel consumed below.
             token_position_to_id=token_position_to_id.to(torch.int32),
             block_to_expert=block_to_expert.to(torch.int32),
             block_size=self.block_size,

@@ -212,10 +212,11 @@ class Glm52FullIndexer(nn.Module):
             # At the 2,048-token baseline, GLM's index_topk equals the full
             # context. Selecting every position does not require ranking them.
             # Avoid torch.topk(k == context), whose full-sort HLO is unsupported
-            # on Trn2, and preserve the same complete index set in logical order.
+            # on Trn2, preserve logical order, and keep the signed-int64 index
+            # invariant required by the PR #13 sentinel-wrap fix.
             indices = torch.arange(
                 selected,
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=scores.device,
             )
             leading_ones = (1,) * (scores.ndim - 1)
