@@ -9,6 +9,12 @@ Branch: `codex/glm53-flash-enablement` · commit `c6e10b0` (local only, not push
 GLM-5.3-Flash graph traces, lowers, and compiles under NxDI `e05466c` in
 container `sha256:011d49c7`.
 
+**The 4-layer coverage smoke that adds the DSA and MoE paths FAILS** (native
+abort, `double free or corruption`, during CTE HLO generation). Root-caused to
+my own token-major MoE dispatch materialising ~6 GB of expert slabs at 128
+tokens — see "Coverage smoke" below. So: KDA + dense compiles; DSA + routed-MoE
+does not yet.
+
 Two results worth separating from the compile itself:
 
 - **The KDA torch port is bit-exact against the numpy CPU golden** — max abs
@@ -41,6 +47,54 @@ Compile log evidence: HLOs generated for both `context_encoding_model` and
 `token_generation_model` (1.52 s), priority HLO compiled in 14.77 s,
 `Compilation Successfully Completed for model.MODULE_0f71aa9105a640304070+8f34053f`,
 weight layout optimized, dry-run artifacts written.
+
+## Coverage smoke (KDA + DSA + MoE in one graph) — FAIL, and the failure is useful
+
+The passing smoke above is **1 layer of KDA + dense**. It says nothing about the
+DSA or routed-MoE paths, so `build_kernel_coverage_smoke_config` traces the real
+layer-0..3 prefix — 3 × KDA+dense, then layer 3 = DSA + 288-expert sparse MoE —
+putting all three bound kernels in one graph.
+
+**Result: native abort during CTE HLO generation.**
+
+```
+INFO:Neuron:generating HLO: context_encoding_model, input example shape = torch.Size([1, 128])
+double free or corruption (!prev)
+bash: line 1:     8 Aborted                 (core dumped) python .../smoke_round3.py
+```
+
+Receipt: `/mnt/compile/runroot/glm53-smoke/glm53-coverage-result.json`
+(stages 1–5 PASS; the process aborted inside stage 6 before writing its result).
+
+### Diagnosis: the routed-MoE dispatch does not scale to prefill
+
+This is my own code, and the caveat was written into
+`moe_gather_dispatch_torch`'s docstring before it was measured — now it is
+measured. The dispatch is **token-major**: it gathers the `top_k` selected
+expert weight slabs *per token*, materialising `[B*L*top_k, hidden, inter]`.
+
+| shape | slab size (bf16, TP=8) |
+|---|---|
+| decode, `B*L = 1` | `8 × 4096 × 256` ≈ **16 MB** — fine |
+| CTE, `B*L = 128` | `1024 × 4096 × 256` ≈ **2.1 GB per slab**, ×3 ≈ **6.4 GB** |
+| CTE, `B*L = 2048` | ≈ **34 GB per slab** — hopeless |
+
+The abort is the XLA tracer's allocator giving up on that. The asymptotics are
+right (O(top_k), not O(288)), but the *constant* is a full weight-slab copy per
+token, which prefill cannot afford.
+
+### Fix (top code item for Round 4)
+
+Stop hand-rolling the routed dispatch. Route it through NxDI's own
+`ExpertMLPs` / blockwise-MoE module so the fused NKI kernel does the
+capacity dispatch, which is what `moe_dispatch.py`'s `MoEDispatchConfig` and
+`enable_moe_fused_dispatch` were always meant to drive — the config identity is
+already built and Tier-1-validated at construction. The token-major gather
+should survive only as the decode-path reference.
+
+An expert-major masked loop is the obvious intermediate, but at 288 experts it
+unrolls to 288 matmul pairs in the traced graph, so it trades an allocator abort
+for a compile-time blowup. Not worth doing as a stepping stone.
 
 ## Root cause of the lowering failure (worth recording — the error message misleads)
 
@@ -219,14 +273,15 @@ forward and return it after the logits in alias order.
 
 ## Ordered next steps
 
-1. **Resolve the `blockwise_matmul_config` rejection** (see MoE findings) — the
-   flag is currently being dropped, and without it the MoE compile hits the
-   raising stub. Blocks any MoE compile.
-2. **Recompute the HBM budget** given that `[128,128]` block scales dequantize
+1. ~~Resolve the `blockwise_matmul_config` rejection~~ — **done**, see above
+   (`MoENeuronConfig`).
+2. **Replace the hand-rolled routed-MoE dispatch** — see "Coverage smoke"
+   below. This is now the top code item.
+3. **Recompute the HBM budget** given that `[128,128]` block scales dequantize
    to bf16 in the expert path. The `306 GiB / 16 ranks ≈ 19 GiB/chip` figure in
    the Round-3 plan does not hold for the experts.
-3. **Wire KDA state aliasing** (above). Blocks a correct TKG.
-4. Then author `/mnt/compile/shared-images/glm53-flash-command.sh` and fire
+4. **Wire KDA state aliasing** (above). Blocks a correct TKG.
+5. Then author `/mnt/compile/shared-images/glm53-flash-command.sh` and fire
    CTE + TKG.
 
 ## Not done (and why)
@@ -314,12 +369,15 @@ verify before the full compile, and it is *measurement-pending*, not settled.
   `Failed to import blockwise_mm_baseline_shard_hidden: No module named
   'neuronxcc.nki._private.blockwise_mm'` — the nkilib module behind the stub
   simply was not shipped in this build.
-- **Open**: `NeuronConfig` logs `Unexpected keyword arguments:
-  {'blockwise_matmul_config': …}`, i.e. this rev does not accept it as a base
-  `NeuronConfig` ctor kwarg, even though the field is real further down the
-  stack. Given finding 1, this must be resolved before any MoE compile — as it
-  stands the flag is being silently dropped and the compile would hit the
-  raising stub. Investigating which config class actually owns the field.
+- **RESOLVED**: `NeuronConfig` was logging `Unexpected keyword arguments:
+  {'blockwise_matmul_config': …}` and **silently dropping the flag** — which,
+  per finding 1, would have driven the MoE compile straight into the raising
+  stub. Cause: `blockwise_matmul_config` is popped and frozen at
+  `models/config.py:837-839`, which is inside **`MoENeuronConfig`** (declared
+  `:798`, next class `:849`) — *not* the base `NeuronConfig` (`:84`).
+  `build_neuron_config` now constructs `MoENeuronConfig` and asserts the flag
+  survived construction, so a future regression fails at config-build time
+  instead of deep inside the compile.
 - `skip_dma_token` changes the input-padding path
   (`augment_inputs_for_padded_blockwise_matmul`), not only DMA behaviour.
 - Host disk: 574 GB free on `/` (shared with `/mnt/compile`); weights are 306 GB
