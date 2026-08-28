@@ -87,27 +87,56 @@ def _torch_dtype(value: Any) -> torch.dtype:
 def validate_ue8m0_scale(scale: torch.Tensor | int, name: str) -> torch.Tensor:
     """Enforce the MXFP4/FP8 UE8M0 block-scale contract.
 
-    UE8M0 is an unsigned 8-bit exponent — value 0 maps to 2**0=1.0, value
-    255 maps to 2**255 (saturation).  The dequantization multiplier is
-    ``2**exp``, NEVER a raw float multiplication.  A caller that reads
-    the scale field as an fp32/fp16 tensor and multiplies is silently
-    off by an enormous factor.  This validator refuses anything with
-    non-integer dtype or values out of the [0, 255] range.
+    UE8M0 (a.k.a. ``float8_e8m0fnu``) is an unsigned 8-bit exponent.  Raw
+    code X decodes to the multiplier ``2**(X - 127)`` when reinterpreted
+    through the ``float8_e8m0fnu`` dtype (verified 2026-08-28 against the
+    HF snapshot at ``deepseek-ai/DeepSeek-V4-Flash-0731@7872f01b``: e.g.
+    a routed-expert scale block with raw byte 120 casts to ``2**-7 ==
+    0.0078125`` via ``.to(torch.float32)``).  Code 255 is reserved for
+    NaN in the ``fnu`` variant and MUST be refused: it means the encoder
+    could not represent that block.
+
+    The dequantization multiplier is ``2**exp``, NEVER a raw-float
+    multiplication.  A caller that reads the scale field as an fp32/fp16
+    tensor and multiplies is silently off by an enormous factor.  This
+    validator refuses:
+
+      * a ``float8_e8m0fnu`` tensor that carries any NaN (raw byte 255);
+      * any other floating-point dtype (fp16/bf16/fp32/e4m3/…) — those
+        are never valid UE8M0 storage;
+      * an integer tensor whose values are outside [0, 255].
+
+    ``float8_e8m0fnu`` is treated as the canonical storage; integer
+    dtypes (uint8/int8/int32/int64) are accepted only for legacy
+    hand-crafted synthetic tensors and are interpreted with the *same*
+    E8M0 bias convention (X → 2**(X-127)) — see
+    :func:`ue8m0_scale_to_fp32_multiplier`.
     """
     if scale is None:
         raise ValueError(f"{name} must have a non-None UE8M0 scale tensor")
     value = scale if isinstance(scale, torch.Tensor) else torch.tensor(scale)
-    # Accept int8/uint8/int32/int64 — the HF checkpoint typically stores
-    # as uint8 but some conversions widen to int32.  Refuse floats.
-    if not value.dtype.is_floating_point:
-        pass  # good: integral or bool
-    else:
-        raise TypeError(
-            f"{name} must be an integer tensor holding UE8M0 exponents; "
-            f"got dtype {value.dtype}"
-        )
     if value.numel() == 0:
         raise ValueError(f"{name} must be non-empty")
+    if value.dtype == torch.float8_e8m0fnu:
+        # Only NaN codes (raw byte 255) are pathological; every other
+        # code maps to a finite positive multiplier.  Cast to fp32 for the
+        # NaN check — the raw-byte view would spuriously pass.
+        as_fp32 = value.to(torch.float32)
+        if torch.isnan(as_fp32).any():
+            n_nan = int(torch.isnan(as_fp32).sum().item())
+            raise ValueError(
+                f"{name} carries {n_nan} NaN entries (raw byte 255) in a "
+                "float8_e8m0fnu tensor; the encoder failed on those blocks "
+                "and we refuse to broadcast NaN into every element they "
+                "cover."
+            )
+        return value
+    if value.dtype.is_floating_point:
+        raise TypeError(
+            f"{name} must be either a float8_e8m0fnu tensor (raw UE8M0 "
+            f"storage) or an integer tensor holding UE8M0 exponent codes; "
+            f"got dtype {value.dtype}"
+        )
     ivalue = value.to(torch.int64)
     if int(ivalue.min().item()) < 0 or int(ivalue.max().item()) > 255:
         raise ValueError(
@@ -115,6 +144,32 @@ def validate_ue8m0_scale(scale: torch.Tensor | int, name: str) -> torch.Tensor:
             f"got min={int(ivalue.min())}, max={int(ivalue.max())}"
         )
     return value
+
+
+def ue8m0_scale_to_fp32_multiplier(scale: torch.Tensor) -> torch.Tensor:
+    """Decode a UE8M0 block-scale tensor to its fp32 multiplier form.
+
+    * ``float8_e8m0fnu`` storage: cast via ``.to(torch.float32)`` — PyTorch
+      already applies the E8M0 bias (raw byte X → ``2**(X - 127)``) and
+      converts NaN codes to fp32 NaN.  We rely on
+      :func:`validate_ue8m0_scale` to have refused any NaN before we get
+      here.
+    * integer storage (uint8/int8/int32/int64): the caller writes the raw
+      E8M0 code and expects the SAME bias — ``X → 2**(X - 127)``.
+      Implemented via ``torch.ldexp(ones, X - 127)`` for exactness (a
+      single integer shift of the fp32 exponent field, no rounding).
+    """
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.to(torch.float32)
+    if scale.dtype.is_floating_point:
+        raise TypeError(
+            "ue8m0_scale_to_fp32_multiplier: refusing dtype "
+            f"{scale.dtype} — only float8_e8m0fnu or integer dtypes carry "
+            "raw E8M0 codes"
+        )
+    exp_biased = scale.to(torch.int32)
+    ones = torch.ones_like(exp_biased, dtype=torch.float32)
+    return torch.ldexp(ones, exp_biased - 127)
 
 
 @dataclass
@@ -398,5 +453,6 @@ __all__ = [
     "DeepseekV4FlashInferenceConfig",
     "DeepseekV4QuantizationConfig",
     "DeepseekV4RopeScalingConfig",
+    "ue8m0_scale_to_fp32_multiplier",
     "validate_ue8m0_scale",
 ]

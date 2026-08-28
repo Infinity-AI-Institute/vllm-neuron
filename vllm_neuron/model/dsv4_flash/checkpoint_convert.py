@@ -44,6 +44,7 @@ import torch
 from .config import (
     DeepseekV4FlashInferenceConfig,
     HF_SNAPSHOT_SHA,
+    ue8m0_scale_to_fp32_multiplier,
     validate_ue8m0_scale,
 )
 
@@ -63,6 +64,30 @@ EXPECTED_HF_TOTAL_SIZE_BYTES = 166_878_536_440
 
 SCALE_SUFFIX = ".scale"
 _LAYER_RE = re.compile(r"^layers\.(\d+)\.(.*)$")
+
+# ---------------------------------------------------------------------------
+# FP4-E2M1 codebook (source-cited).
+#
+# Copied byte-for-byte from the DeepSeek-V4-Flash HF inference reference
+# ``inference/convert.py::FP4_TABLE`` (repo
+# ``deepseek-ai/DeepSeek-V4-Flash-0731`` @ HF SHA
+# ``7872f01b1d1fe23eabc4c98b48bffcef5a386062``, lines 11-14).  The table is
+# the standard OCP MXFP4 / IEEE-style FP4-E2M1 codebook (1 sign bit, 2
+# exponent bits, 1 mantissa bit; bias=1) — magnitudes ``{0, ±0.5, ±1.0,
+# ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}``.  Nibble bit layout inside each stored
+# byte, mirroring ``inference/convert.py:30-33``::
+#
+#     x_uint8 = stored_byte
+#     low_nibble  = x_uint8 & 0x0F          # first FP4 value (lowest along K)
+#     high_nibble = (x_uint8 >> 4) & 0x0F   # second FP4 value (next along K)
+#     out = stack([TABLE[low], TABLE[high]], dim=-1).flatten(-2)  # doubles last dim
+#
+# Positive codes 0..7 are the first half, negative codes 8..15 are the
+# second half (sign bit = MSB of the nibble).
+_FP4_E2M1_TABLE = (
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
 
 # mHC parameters whose names contain "scale" but are NOT block scales.
 HC_PARAM_SUFFIXES = (
@@ -99,6 +124,22 @@ def is_block_scale_key(key: str) -> bool:
     return key.endswith(SCALE_SUFFIX)
 
 
+def _broadcast_block_scale(
+    scale_fp32: torch.Tensor,
+    block_size: tuple[int, int],
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    """Expand a ``[..., ceil(O/bo), ceil(I/bi)]`` fp32 block-scale
+    tensor to ``[..., O, I]`` by repeat-interleave over each tile axis
+    and then trimming the ragged edge.
+    """
+    block_out, block_in = block_size
+    return scale_fp32.repeat_interleave(block_out, dim=-2).repeat_interleave(
+        block_in, dim=-1
+    )[..., :out_features, :in_features]
+
+
 def dequantize_block_fp8_ue8m0(
     weight_fp8: torch.Tensor,
     scale_exp: torch.Tensor,
@@ -108,17 +149,22 @@ def dequantize_block_fp8_ue8m0(
     """Blockwise FP8-e4m3 -> ``out_dtype`` using UE8M0 (unsigned E8M0) block scales.
 
     ``weight_fp8`` is ``[..., out, in]`` in ``float8_e4m3fn``.  ``scale_exp``
-    is ``[..., ceil(out/bo), ceil(in/bi)]`` in an integer dtype holding
-    UE8M0 exponents (values 0..255).  Per-tile multiplier is ``2 **
-    scale_exp[o0, i0]``.  Shape agreement is asserted rather than
-    broadcast-guessed.
+    is ``[..., ceil(out/bo), ceil(in/bi)]`` in either ``float8_e8m0fnu``
+    (raw UE8M0 storage) or an integer dtype carrying the same raw code.
+    Per-tile multiplier is ``2 ** (raw_code - 127)`` — the standard E8M0
+    bias.  Shape agreement is asserted rather than broadcast-guessed.
 
-    Correctness contract (paper §2.4, "Dequantization"):
-      value = fp8_to_fp32(w) * (2 ** exp)
+    Correctness contract (DeepSeek-V4-Flash HF inference reference
+    ``inference/kernel.py::fp8_gemm_kernel`` @ HF SHA
+    ``7872f01b1d1fe23eabc4c98b48bffcef5a386062`` lines 244, 249: the
+    accumulator is ``C_local[i,j] * scale_a * scale_b`` where each scale
+    is the ``.to(FP32)`` of the E8M0 tensor)::
+
+        value = fp8_to_fp32(w) * ue8m0_to_fp32(scale)
 
     Direction of the scale is fixed — this is NOT a reciprocal.  A caller
-    that inverts it will see (2**-exp) for a positive exponent and
-    silently produce an underflowed all-zero tile.
+    that inverts it will see ``2**-(exp-127)`` for a positive exponent
+    and silently produce an underflowed all-zero tile.
     """
     if scale_exp is None:
         raise ValueError(
@@ -138,16 +184,20 @@ def dequantize_block_fp8_ue8m0(
             f"expected {expected}. Refusing to broadcast-guess."
         )
     value = weight_fp8.to(torch.float32)
-    exp = scale_exp.to(torch.int32)
-    # UE8M0 -> multiplier: 2**exp.  Use ldexp for numerical exactness (a
-    # single integer bit-shift of the exponent field, no rounding).
-    ones = torch.ones_like(exp, dtype=torch.float32)
-    scale = torch.ldexp(ones, exp)
-    # Expand each block scalar over its tile, then trim the ragged edge.
-    scale = scale.repeat_interleave(block_out, dim=-2).repeat_interleave(
-        block_in, dim=-1
-    )[..., :out_features, :in_features]
+    scale_fp32 = ue8m0_scale_to_fp32_multiplier(scale_exp)
+    scale = _broadcast_block_scale(
+        scale_fp32, block_size, out_features, in_features
+    )
     return (value * scale).to(out_dtype)
+
+
+def _fp4_codebook(device: torch.device) -> torch.Tensor:
+    """Return the FP4-E2M1 codebook (16 values) as fp32 on ``device``.
+
+    Kept as a module-level function so the tensor is allocated once per
+    device.  Ordering matches ``_FP4_E2M1_TABLE`` — do NOT re-order.
+    """
+    return torch.tensor(_FP4_E2M1_TABLE, dtype=torch.float32, device=device)
 
 
 def dequantize_block_fp4_ue8m0(
@@ -156,25 +206,138 @@ def dequantize_block_fp4_ue8m0(
     block_size: tuple[int, int],
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Blockwise FP4 (MXFP4-style, 2 nibbles per byte) -> ``out_dtype``.
+    """Blockwise FP4-E2M1 (packed 2 nibbles/byte) -> ``out_dtype`` using
+    UE8M0 (unsigned E8M0) block scales.
 
-    NOT YET IMPLEMENTED — pending decision on packing layout.  The HF
-    checkpoint's exact FP4 packing (nibble-lo-first vs lo-hi-interleaved
-    across the tile) is verified only by the 1-tensor smoke against a
-    real routed-expert shard.  Until that lands, the FP4 pathway is a
-    fail-loud stub.  See ``smoke_round1_one_tensor.py`` for the
-    verification harness.
+    ``weight_fp4_packed`` is ``[..., out, in_bytes]`` in one of
+    ``{torch.int8, torch.uint8, torch.float4_e2m1fn_x2}``.  The logical
+    FP4 shape is ``[..., out, in_bytes * 2]`` — packing is along the LAST
+    dim (K/in), low nibble first (bits 0..3 = index into
+    :data:`_FP4_E2M1_TABLE`), high nibble second (bits 4..7).  This is
+    the DeepSeek-V4-Flash checkpoint convention, verified byte-for-byte
+    against the HF inference reference (``inference/convert.py::
+    cast_e2m1fn_to_e4m3fn`` @ HF SHA ``7872f01b...``, lines 30-33)::
 
-    Reference for the packing convention: ``vllm_neuron/model/gpt_oss/
-    weight_loaders_mxfp4.py:_pack_fp4_x4_uint16`` and
-    ``mxfp4_gate_up_blocks_loader`` — that packs at load time, so the
-    inverse is what we need here at converter time.
+        x       = weight.view(torch.uint8)          # [..., O, in_bytes]
+        low     = x & 0x0F                          # nibble at bit 0..3
+        high    = (x >> 4) & 0x0F                   # nibble at bit 4..7
+        fp4vals = stack([TABLE[low], TABLE[high]], -1).flatten(-2)  # [..., O, 2*in_bytes]
+
+    ``scale_exp`` is ``[..., ceil(out/bo), ceil(in_logical/bi)]`` in
+    either ``float8_e8m0fnu`` (the HF storage format — verified against
+    ``layers.3.ffn.experts.0.w2.scale`` in ``model-00005-of-00048.safe-
+    tensors`` — every entry decodes to a finite positive multiplier via
+    ``.to(torch.float32)``) or an integer dtype carrying the same raw
+    E8M0 code.  Per-tile multiplier is ``2 ** (raw_code - 127)`` — same
+    bias as the FP8 path.
+
+    Correctness contract (DeepSeek-V4-Flash HF inference reference
+    ``inference/model.py:18``: ``fp4_block_size = 32``; and
+    ``inference/kernel.py::fp4_gemm_kernel`` lines 500-509: the FP4
+    weight scale is cast to fp32 and multiplied into the accumulator)::
+
+        w_fp32   = FP4_E2M1_TABLE[nibble]
+        scale_m  = ue8m0_to_fp32(scale)
+        bf16_val = (w_fp32 * scale_m).to(bfloat16)
+
+    For DSv4-Flash routed experts the block shape is ``(1, 32)`` — per
+    output row × per 32 logical input elements.  The function accepts
+    arbitrary ``block_size`` for offline verification; the caller
+    supplies ``(1, 32)`` for real weights (the top-level
+    ``quantization_config.weight_block_size`` field is ``(128, 128)``
+    which describes the NON-EXPERT FP8 pathway, not the routed-expert
+    FP4 pathway — the two are distinct even though the code lives in the
+    same converter).
+
+    Fail-loud checks (each is a silent-corruption defence):
+      * scale must be a UE8M0 tensor with no NaN (raw byte 255) — see
+        :func:`validate_ue8m0_scale`;
+      * weight dtype must be one of the three listed above — a bf16
+        weight would silently reinterpret its low byte as a nibble
+        packet and produce plausible garbage;
+      * ``in_bytes * 2`` must be an exact multiple of ``block_in`` —
+        anything else means the caller pasted an unexpected packing;
+      * scale shape must match ``ceil(out/bo), ceil(in_logical/bi)`` —
+        we refuse to broadcast-guess a mismatched scale.
     """
-    raise NotImplementedError(
-        "dequantize_block_fp4_ue8m0 is deferred to Round 2; see the module "
-        "docstring for the paper-cited dequant formula and the packing-"
-        "layout verification plan in smoke_round1_one_tensor.py"
+    if scale_exp is None:
+        raise ValueError(
+            "dequantize_block_fp4_ue8m0 requires an explicit non-None block-scale"
+        )
+    if weight_fp4_packed.dtype not in (
+        torch.int8,
+        torch.uint8,
+        torch.float4_e2m1fn_x2,
+    ):
+        raise TypeError(
+            "dequantize_block_fp4_ue8m0 refuses weight dtype "
+            f"{weight_fp4_packed.dtype}; expected int8/uint8/float4_e2m1fn_x2."
+        )
+    if weight_fp4_packed.ndim < 2:
+        raise ValueError(
+            f"weight must have at least 2 dims (got shape "
+            f"{tuple(weight_fp4_packed.shape)})"
+        )
+    validate_ue8m0_scale(scale_exp, "block_scale")
+
+    out_features = int(weight_fp4_packed.shape[-2])
+    in_bytes = int(weight_fp4_packed.shape[-1])
+    in_features = in_bytes * 2
+    block_out, block_in = block_size
+    if block_out <= 0 or block_in <= 0:
+        raise ValueError(f"block_size must be positive; got {block_size}")
+    if in_features % block_in != 0:
+        raise ValueError(
+            f"in_features={in_features} (2 * {in_bytes}) is not a multiple "
+            f"of block_in={block_in}; refusing to over-broadcast a partial tile."
+        )
+    expected_scale_tail = (
+        math.ceil(out_features / block_out),
+        math.ceil(in_features / block_in),
     )
+    if tuple(scale_exp.shape[-2:]) != expected_scale_tail:
+        raise ValueError(
+            f"block-scale shape {tuple(scale_exp.shape)} disagrees with "
+            f"packed weight {tuple(weight_fp4_packed.shape)} "
+            f"(logical in={in_features}) under block_size={block_size}; "
+            f"expected trailing shape {expected_scale_tail}. Refusing "
+            "to broadcast-guess."
+        )
+
+    # 1. Unpack nibbles.  ``.view(torch.uint8)`` reinterprets the storage
+    #    without a copy for int8/uint8/float4_e2m1fn_x2 — element_size==1
+    #    holds for all three.
+    x_uint8 = weight_fp4_packed.view(torch.uint8)
+    low = x_uint8 & 0x0F
+    high = (x_uint8 >> 4) & 0x0F
+    # Sanity: with 0x0F mask the nibbles are already in [0, 15]; assert
+    # the invariant so a future storage change is caught immediately.
+    if low.max().item() > 15 or high.max().item() > 15:
+        raise ValueError(
+            "internal invariant broken: unpacked nibble > 15 after 0x0F "
+            "mask; check the storage dtype path."
+        )
+    codebook = _fp4_codebook(x_uint8.device)
+    low_vals = codebook[low.long()]
+    high_vals = codebook[high.long()]
+    # Interleave along the last dim: [..., O, in_bytes, 2] -> [..., O, in_features]
+    fp4_fp32 = torch.stack([low_vals, high_vals], dim=-1).flatten(-2)
+
+    # 2. Decode the UE8M0 block scale to fp32 multiplier.
+    scale_fp32 = ue8m0_scale_to_fp32_multiplier(scale_exp)
+
+    # 3. Broadcast the block scale over its tile and multiply.
+    scale = _broadcast_block_scale(
+        scale_fp32, block_size, out_features, in_features
+    )
+    result = fp4_fp32 * scale
+
+    # 4. Cast to the requested output dtype.  For bf16 the cast is lossless
+    #    across the entire FP4 codebook × any single-bit E8M0 multiplier
+    #    (the product is either 0 or of the form ``m * 2**k`` with m in
+    #    {1, 1.5, 3} for magnitudes 6.0 → the bf16 mantissa carries it
+    #    exactly).  For fp16 / fp32 the caller opts in explicitly.
+    return result.to(out_dtype)
 
 
 def _dequant_or_cast(
@@ -315,6 +478,7 @@ __all__ = [
     "LM_HEAD_KEY",
     "SCALE_SUFFIX",
     "TEXT_LAYER_PREFIX",
+    "_FP4_E2M1_TABLE",
     "_convert_dsv4_checkpoint",
     "_dequant_or_cast",
     "dequantize_block_fp4_ue8m0",

@@ -46,17 +46,29 @@ from .checkpoint_convert import (
 def _golden_dequant_ue8m0(
     weight_fp8: torch.Tensor, scale_exp: torch.Tensor, block: tuple[int, int]
 ) -> torch.Tensor:
-    """Hand-rolled per-tile UE8M0 dequant; the reference for the library."""
+    """Hand-rolled per-tile UE8M0 dequant; the reference for the library.
+
+    Bias convention: raw byte X decodes to multiplier ``2**(X - 127)``.
+    This matches the E8M0 spec ``float8_e8m0fnu``, and matches the
+    library's :func:`ue8m0_scale_to_fp32_multiplier`.  For integer input
+    tensors the golden treats the byte as the raw code (same bias).
+    ``float8_e8m0fnu`` tensors go through PyTorch's own dtype conversion
+    which applies the bias for us.
+    """
     w = weight_fp8.to(torch.float32)
-    exp = scale_exp.to(torch.int32)
+    if scale_exp.dtype == torch.float8_e8m0fnu:
+        s_fp32 = scale_exp.to(torch.float32)
+    else:
+        exp = scale_exp.to(torch.int32) - 127
+        s_fp32 = torch.ldexp(torch.ones_like(exp, dtype=torch.float32), exp)
     out = torch.empty_like(w)
     bo, bi = block
     O, I = w.shape
     for i0 in range(0, O, bo):
         for j0 in range(0, I, bi):
             tile = w[i0 : i0 + bo, j0 : j0 + bi]
-            e = int(exp[i0 // bo, j0 // bi].item())
-            out[i0 : i0 + bo, j0 : j0 + bi] = tile * (2.0 ** e)
+            m = float(s_fp32[i0 // bo, j0 // bi].item())
+            out[i0 : i0 + bo, j0 : j0 + bi] = tile * m
     return out
 
 
@@ -67,14 +79,12 @@ def _synth_fp8_ue8m0(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Deterministic FP8 tensor + UE8M0 exponent tensor for offline exercise.
 
-    The exponent range is [-8, +8] rather than the full [0, 255] so that
-    ``value * 2**exp`` stays in a numerical range where bf16 rounding
-    is well-defined and the golden comparison is meaningful.  The
-    validator in ``dequantize_block_fp8_ue8m0`` requires exponents in
-    [0, 255] — we cast negatives to a positive-shift trick: subtract
-    a fixed 8 from the input tensor's fp32 scale before FP8 cast, so
-    ``exp - 8`` lands in [-8, 0] and the corresponding UE8M0 value
-    in [0, 8] cleanly.  This keeps the smoke's arithmetic honest.
+    Raw exponent range is [127-4, 127+4] (i.e. codes 123..131), which
+    decodes via the E8M0 bias to multipliers ``2**-4 .. 2**+4``.  That
+    keeps the ``value * multiplier`` product in a range where bf16
+    rounding is well defined and the golden comparison is meaningful
+    (a full [0, 255] sweep would drop into ``2**-127`` underflow at one
+    end and ``2**+128`` inf at the other).
     """
     torch.manual_seed(seed)
     O, I = shape
@@ -83,9 +93,10 @@ def _synth_fp8_ue8m0(
     values = torch.empty(O, I, dtype=torch.float32).uniform_(-1.0, 1.0)
     values = values.to(torch.float8_e4m3fn).to(torch.float32)
     fp8 = values.to(torch.float8_e4m3fn)
-    # Random UE8M0 exponents in [0, 8].  Multiplier 2**exp in [1, 256].
+    # Random UE8M0 raw codes in [123, 131].  Multiplier 2**(code-127)
+    # spans [2**-4, 2**4] = [0.0625, 16].
     exp = torch.randint(
-        0, 9, (math.ceil(O / bo), math.ceil(I / bi)), dtype=torch.uint8
+        123, 132, (math.ceil(O / bo), math.ceil(I / bi)), dtype=torch.uint8
     )
     return fp8, exp
 
