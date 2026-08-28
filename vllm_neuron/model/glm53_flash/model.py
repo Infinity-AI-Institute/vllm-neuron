@@ -61,8 +61,18 @@ class Glm53FlashDecoderLayer(nn.Module):
         return self.hc_mlp.post(mlp_output, residual_streams, post_mix, comb_mix)
 
 
-class NeuronGlm53FlashForCausalLM(nn.Module):
-    """Text-only, MTP-off GLM-5.3-Flash source reference."""
+class NeuronGlm53FlashForCausalLMImpl(nn.Module):
+    """Text-only, MTP-off GLM-5.3-Flash source reference.
+
+    The CPU-only source-qualification impl (autoregressive Python KV concat,
+    per-expert Python loop, reference-kernel dispatch).  It is not itself
+    traceable under torch/XLA; the tracing-shaped adapter lives in
+    ``neuron_wrapper.py`` (`NeuronGlm53FlashForCausalLM`, subclass of the
+    NxDI ``NeuronBaseForCausalLM``) which composes this class as the
+    reference oracle for round-2 correctness gating.  Every test in
+    ``tests/`` imports this class directly (via the backward-compat alias
+    at the bottom of this module) and exercises the pure CPU semantics.
+    """
 
     def __init__(self, config: Glm53FlashInferenceConfig) -> None:
         super().__init__()
@@ -89,7 +99,7 @@ class NeuronGlm53FlashForCausalLM(nn.Module):
     @classmethod
     def from_configs(
         cls, hf_config: Any, neuron_config: Any = None
-    ) -> NeuronGlm53FlashForCausalLM:
+    ) -> "NeuronGlm53FlashForCausalLMImpl":
         return cls(Glm53FlashInferenceConfig.from_configs(hf_config, neuron_config))
 
     @torch.no_grad()
@@ -179,4 +189,17 @@ def _is_fp8_scale_name(name: str) -> bool:
     )
 
 
-__all__ = ["Glm53FlashDecoderLayer", "NeuronGlm53FlashForCausalLM"]
+# Backward-compat alias: the CPU-reference tests (`tests/test_layer_dispatch.py`
+# and `tests/test_config_load.py`) import `NeuronGlm53FlashForCausalLM` from
+# this module and expect the pure-Python impl.  The NxDI-subclassing wrapper
+# with the same public name lives in `neuron_wrapper.py`; the package
+# `__init__.py` re-exports the wrapper as the top-level `NeuronGlm53FlashForCausalLM`
+# so NxDI dispatch picks up the traceable class.
+NeuronGlm53FlashForCausalLM = NeuronGlm53FlashForCausalLMImpl
+
+
+__all__ = [
+    "Glm53FlashDecoderLayer",
+    "NeuronGlm53FlashForCausalLM",
+    "NeuronGlm53FlashForCausalLMImpl",
+]
