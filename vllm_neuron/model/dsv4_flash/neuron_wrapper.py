@@ -752,6 +752,419 @@ class _MQANormParam(nn.Module):
         )
 
 
+class _HCACompressor(nn.Module):
+    """DSv4-Flash Heavily Compressed Attention compressor (paper §2.3.2).
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py::
+    DeepseekV4HCACompressor`` lines 362-443 (HF SHA
+    ``7872f01b1d1fe23eabc4c98b48bffcef5a386062``).
+
+    Owns the four HF layer-subtree tensors that live under
+    ``layers.<i>.attn.compressor.*`` (verified against
+    ``model.safetensors.index.json`` for the pinned snapshot; shard
+    ``model-00005-of-00048.safetensors`` for layer 3, all four keys
+    stored dense — no ``.scale`` companion):
+
+      * ``wkv.weight``   [head_dim, hidden_size]     (BF16 on disk;
+                                                       ``H·W^{KV}`` in eq. 20)
+      * ``wgate.weight`` [head_dim, hidden_size]     (BF16 on disk;
+                                                       ``H·W^Z`` in eq. 21 — the
+                                                       gate that will feed softmax)
+      * ``ape``          [compress_rate, head_dim]   (F32 on disk — the ``B``
+                                                       positional bias added to
+                                                       each window's gate before
+                                                       softmax; wrapper stores
+                                                       as bf16 to match module
+                                                       dtype, matches HF module
+                                                       cast from F32 → bf16 at
+                                                       ``__init__`` time)
+      * ``norm.weight``  [head_dim]                  (BF16; RMSNorm gain
+                                                       applied to the summed
+                                                       compressed vector)
+
+    Compression math per closed window (paper §2.3.2 eq. 22-23; HF
+    lines 412-422):
+
+      1. ``C = wkv(hidden_states)``,   shape ``[B, S, head_dim]``
+      2. ``Z = wgate(hidden_states)``, shape ``[B, S, head_dim]``
+      3. Trim ``S`` down to ``usable = (S // compress_rate) * compress_rate``
+         source tokens (stateless: HCA has non-overlapping windows and
+         the leftover would need cache-buffered persistence which is a
+         later-round concern).
+      4. Reshape ``C, Z`` to ``[B, n_windows, compress_rate, head_dim]``.
+      5. ``Z_bias = Z + ape``  — ape broadcasts across the window
+         axis (``[compress_rate, head_dim]`` broadcasts against the last
+         two dims of the reshaped tensor); this is HF line 415.
+      6. ``w = softmax(Z_bias, dim=window_axis, dtype=torch.float32)``
+         — softmax over the ``compress_rate=128`` intra-window axis, in
+         fp32 for numerical stability (HF line 417).
+      7. ``compressed = kv_norm( (C * w).sum(window_axis) )`` — the
+         convex combination becomes one entry per window, then RMSNorm
+         with the ``norm`` gain.
+      8. Apply the "compress" RoPE at deterministic window position
+         ``w_idx * compress_rate + first_window_position`` — HF lines
+         419-422.  The caller pre-computes ``cos_win, sin_win`` and
+         passes them in (same pattern as :class:`_MQABlock`); no state
+         is owned inside the compressor, so ``first_window_position`` is
+         a caller argument that stays 0 in the stateless smoke path.
+
+    Returns ``[B, 1, n_windows, head_dim]`` — ready to cat onto
+    :meth:`_MQABlock.project_kv`'s output on the KV axis.
+
+    HCA has **no overlap state** (contrast :class:`_CSABlock`'s
+    ``overlap_kv``/``overlap_gate``) and **no indexer** (contrast
+    ``_CSAIndexer``): every closed window emits one entry, and every
+    query whose position has reached that window can attend to it.  The
+    caller builds the causal ``block_bias`` via
+    :meth:`build_block_bias`.
+    """
+
+    # State-dict spelling under this module — matches HF layer subtree
+    # verbatim.  Kept as a class attribute so the converter and the test
+    # can share the list of names.
+    PARAM_KEYS: tuple[str, ...] = (
+        "wkv.weight",
+        "wgate.weight",
+        "ape",
+        "norm.weight",
+    )
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        self.layer_idx = layer_idx
+        self.hidden_size = int(src.hidden_size)
+        self.head_dim = int(src.head_dim)
+        self.qk_rope_head_dim = int(src.qk_rope_head_dim)
+        # HCA is the "128" bucket of the compress_ratios schedule (paper §2.3.2).
+        # We refuse to instantiate the compressor at a layer whose ratio is not
+        # 128 — pinning this here catches a caller that accidentally reused this
+        # class for a CSA layer (where compress_rate=4) or a sliding layer
+        # (where the block has no compressor at all).
+        ratio = int(src.compress_ratios[layer_idx])
+        if ratio != 128:
+            raise ValueError(
+                f"_HCACompressor requires compress_ratios[{layer_idx}]=128 "
+                f"(HCA/heavily_compressed_attention); got {ratio}. HCA is the "
+                "non-overlapping m'=128 pool per paper §2.3.2 — refusing to "
+                "silently reinterpret a CSA (4) or sliding (0) schedule as HCA."
+            )
+        self.compress_rate = ratio
+        self.rms_eps = float(src.rms_norm_eps)
+        self.compress_rope_theta = float(src.compress_rope_theta)
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+
+        # Weight tensors — plain nn.Parameter so this class is CPU-portable
+        # (same rationale documented on _MQABlock).  Names are chosen to
+        # match the HF layer subtree byte-for-byte: `wkv.weight`,
+        # `wgate.weight`, `ape`, `norm.weight`.
+        self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        self.wgate = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        # Absolute Position Encoding — the paper's ``B_j`` positional-bias
+        # per intra-window position.  Broadcasts against the last two dims
+        # of ``chunk_gate.view(B, n_windows, compress_rate, head_dim)``.
+        self.ape = nn.Parameter(
+            torch.zeros(self.compress_rate, self.head_dim, dtype=dtype),
+            requires_grad=False,
+        )
+        # RMSNorm gain for the compressed vector.
+        self.norm = _MQANormParam(self.head_dim, dtype)
+
+    def compress(
+        self,
+        hidden_states: torch.Tensor,             # [B, S, hidden]
+        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+    ) -> torch.Tensor:
+        """Emit compressed KV entries — one per closed non-overlapping window.
+
+        Returns ``[B, 1, n_windows, head_dim]`` — the KV axis is single-headed
+        (matching :meth:`_MQABlock.project_kv`) so it cats cleanly onto the
+        main KV along ``dim=2``.
+
+        Stateless: leftover source tokens shorter than one window are
+        dropped.  The caller must feed sequences of length divisible by
+        ``compress_rate`` (or accept the tail truncation — the smoke test
+        uses ``S=256`` = 2 × 128 so no tail is dropped).
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_HCACompressor.compress expects [B, S, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        usable = (seq // self.compress_rate) * self.compress_rate
+        if usable == 0:
+            return hidden_states.new_zeros((batch, 1, 0, self.head_dim))
+
+        chunk = hidden_states[:, :usable]
+        kv = self.wkv(chunk)                                          # [B, U, D]
+        gate = self.wgate(chunk)                                      # [B, U, D]
+        n_windows = usable // self.compress_rate
+
+        # Reshape into per-window tiles.  ``self.ape`` broadcasts across the
+        # (batch, n_windows) leading dims to match the [compress_rate, D]
+        # trailing shape — same broadcast HF relies on at line 415.
+        kv_r = kv.view(batch, n_windows, self.compress_rate, self.head_dim)
+        gate_r = gate.view(batch, n_windows, self.compress_rate, self.head_dim) + self.ape
+
+        # Softmax over the intra-window axis in fp32 for stability (HF line
+        # 417).  Cast back to kv's dtype for the weighted sum so the
+        # accumulator dtype tracks the source-tensor dtype.
+        softmax_w = gate_r.softmax(dim=2, dtype=torch.float32).to(kv_r.dtype)
+        compressed = (kv_r * softmax_w).sum(dim=2)                    # [B, n_windows, D]
+
+        # RMSNorm with the learned gain.
+        compressed = _weighted_rms_norm(compressed, self.norm.weight, self.rms_eps)
+
+        # Apply the compressor's own RoPE at window positions.  The KV axis
+        # is single-headed here — unsqueeze a head axis so
+        # ``apply_partial_rope`` (which expects [B, H, S, D] with
+        # ``unsqueeze_dim=1``) broadcasts cleanly.  Result is
+        # [B, 1, n_windows, D] which is exactly the shape the outer
+        # attention wants on its KV axis.
+        return apply_partial_rope(
+            compressed.unsqueeze(1), cos_win, sin_win, unsqueeze_dim=1
+        )
+
+    def build_block_bias(
+        self,
+        position_ids: torch.Tensor,              # [B, S]
+        compressed_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Additive-log-space bias forbidding queries from seeing compressed
+        entries whose source window has not yet closed at that query's
+        position.
+
+        Source-cited: ``modeling_deepseek_v4.py:435-443`` — for query at
+        position ``t``, compressed entry index ``w`` is visible iff
+        ``w < (t + 1) // compress_rate`` (equivalently: entry ``w`` covers
+        source tokens ``[w*compress_rate, (w+1)*compress_rate)``, so a
+        query cannot legally see it until ``t`` has reached the end of
+        that window — the source information the entry aggregates is
+        strictly the *past* from that query's viewpoint).
+
+        Returns ``[B, 1, S, compressed_len]`` with ``0.0`` on visible
+        slots and ``-inf`` on forbidden slots, or ``None`` when there is
+        nothing to attend to (or single-token decode where HF short-
+        circuits to ``None`` at line 432).
+        """
+        if compressed_len == 0:
+            return None
+        batch, seq = position_ids.shape
+        if seq == 1:
+            # HF line 432 short-circuits decode-of-one to a None block_bias
+            # because the single-query case cannot violate the constraint —
+            # there is only one row and either the entry is visible or it
+            # is not, resolved by the top-k logic HF uses for CSA.  For HCA
+            # there is no indexer, so we mirror the None return; the caller
+            # then simply cats the compressed entries with no additive bias
+            # and the causal step lands in the outer attention mask.
+            #
+            # For prefill (seq > 1) we build the full [S, T] mask.
+            return None
+        entry_indices = torch.arange(compressed_len, device=device)
+        causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+        block_bias = torch.zeros(
+            (batch, 1, seq, compressed_len), dtype=dtype, device=device
+        )
+        block_bias = block_bias.masked_fill(
+            entry_indices.view(1, 1, 1, -1)
+            >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+            float("-inf"),
+        )
+        return block_bias
+
+
+class _HCABlock(nn.Module):
+    """DSv4-Flash Heavily Compressed Attention block — the composability
+    check for what :class:`_MQABlock` just landed.
+
+    Source-cited byte-for-byte against
+    ``transformers/models/deepseek_v4/modeling_deepseek_v4.py::
+    DeepseekV4Attention.forward`` lines 801-873 restricted to the
+    ``layer_type == "heavily_compressed_attention"`` branch
+    (``self.compressor = DeepseekV4HCACompressor(...)``,
+    ``self.rope_layer_type = "compress"``).
+
+    Composes:
+      * :class:`_MQABlock` — reuses its ``project_q``, ``project_kv``,
+        ``attend_and_project`` boundaries verbatim.  No fork of the MQA
+        math.
+      * :class:`_HCACompressor` — emits ``[B, 1, n_windows, head_dim]``
+        compressed KV entries and the ``[B, 1, S, T_compressed]``
+        block_bias that keeps every query causal with respect to the
+        window it just closed.
+
+    HCA-specific arrangement (HF lines 828-844):
+
+      1. ``q = mqa.project_q(hidden_states, cos_compress, sin_compress)``
+      2. ``kv_main = mqa.project_kv(hidden_states, cos_compress, sin_compress)``
+         — both use the "compress" rope (θ = 160 000) because the
+         compressor emits KV entries pre-rotated with that same rope, so
+         the inner-product ``q · k`` needs to be in the same rotation
+         frame.  This is the ONLY reason the outer Q/KV use compress rope
+         on HCA layers even though they see per-source-token positions,
+         not window positions — matching frames matters more than
+         matching theta scale.
+      3. ``compressed_kv = compressor.compress(hidden_states, cos_win, sin_win)``
+         — shape ``[B, 1, T_c, head_dim]`` with the compressor's own
+         "compress" rope applied at window positions.
+      4. ``kv_extended = cat([kv_main, compressed_kv], dim=2)`` — HF line
+         832.  The extension is on the KV/time axis.
+      5. Attention-mask extension: cat ``block_bias`` onto whatever the
+         caller passed (or synthesise a full-visibility mask over
+         ``kv_main`` if the caller passed None) — HF lines 840-844.
+      6. ``mqa.attend_and_project(q, kv_extended, cos_compress,
+         sin_compress, attention_mask=extended)`` — inherits the
+         per-head attention sink softmax + the ``-sin`` conjugate
+         rotation on the output rope slice + the grouped output
+         projection unchanged from :class:`_MQABlock`.
+
+    **No overlap state, no indexer, no input-id side channel** — HCA is
+    the simplest attention family beyond sliding-only, and by
+    construction the smallest exercise of the ``_MQABlock`` boundary
+    that adds a new mechanism (the compressor's per-window pool + causal
+    block_bias).
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            src = config
+        # Verify the layer_type schedule pins HCA at this index.  Fail-loud;
+        # a mismatched call is a caller bug that would compose the wrong
+        # attention math without complaint (an HCA compressor with the CSA
+        # `_MQABlock` main-rope choice would silently break the inner-product
+        # rotation frame).
+        got = src.layer_types[layer_idx]
+        if got != "heavily_compressed_attention":
+            raise ValueError(
+                f"_HCABlock requires heavily_compressed_attention at "
+                f"layer_idx={layer_idx}; got layer_types[{layer_idx}]={got!r}. "
+                "The frozen HF schedule places HCA only at the '128' entries "
+                "of compress_ratios (paper §2.3.2)."
+            )
+        self.layer_idx = layer_idx
+        # The wrapper module-tree spells the attention subtree as `attn` so
+        # the state-dict lands under `layers.<i>.attn.*` (matching the HF
+        # snapshot's on-disk names verbatim).  Storing _MQABlock and
+        # _HCACompressor as siblings here means the compressor lives under
+        # `layers.<i>.attn.compressor.*` — again matching HF byte-for-byte.
+        self.mqa = _MQABlock(config, layer_idx=layer_idx)
+        self.compressor = _HCACompressor(config, layer_idx=layer_idx)
+        self.compress_rate = self.compressor.compress_rate
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,             # [B, S, hidden]
+        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,              # [B, S]
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Full HCA block forward — see class docstring for the source-cited
+        step-by-step decomposition."""
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_HCABlock expects hidden_states [B, S, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        if position_ids.shape != (batch, seq):
+            raise ValueError(
+                f"_HCABlock expects position_ids shape ({batch}, {seq}); got "
+                f"{tuple(position_ids.shape)}"
+            )
+
+        # 1. Q + main KV via _MQABlock hooks.
+        q, _q_residual = self.mqa.project_q(hidden_states, cos, sin)
+        kv_main = self.mqa.project_kv(hidden_states, cos, sin)       # [B, 1, S, D]
+
+        # 2. HCA compressor emits [B, 1, T_c, D] compressed KV entries.
+        compressed_kv = self.compressor.compress(hidden_states, cos_win, sin_win)
+        t_compressed = compressed_kv.shape[2]
+
+        # 3. Build the block-bias over the compressed slots (per-query
+        # causality — early queries cannot see later-window entries).
+        block_bias = self.compressor.build_block_bias(
+            position_ids,
+            t_compressed,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # 4. Cat compressed KV entries onto the main KV axis (HF line 832).
+        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)      # [B, 1, S+T_c, D]
+
+        # 5. Extend the attention mask.  Contract mirrors HF lines 840-844:
+        #    * If the caller passed an attention_mask AND block_bias exists
+        #      → cat block_bias onto the trailing KV axis (in the caller's
+        #        dtype).
+        #    * If the caller passed an attention_mask AND block_bias is None
+        #      → pad zeros for the new slots (they are all visible).
+        #    * If the caller passed NO attention_mask AND block_bias exists
+        #      → synthesise a zero prefix over kv_main and cat block_bias so
+        #        the compressed slots still receive the causality bias.
+        #        This matches HF's behaviour when the caller passes
+        #        `attention_mask=None`: the full mask is zero over kv_main
+        #        (no masking) but block_bias must still apply.
+        if attention_mask is not None:
+            if block_bias is not None:
+                extended_mask = torch.cat(
+                    [attention_mask, block_bias.to(attention_mask.dtype)], dim=-1
+                )
+            else:
+                extended_mask = F.pad(
+                    attention_mask, (0, t_compressed), value=0.0
+                )
+        else:
+            if block_bias is not None:
+                zeros_prefix = hidden_states.new_zeros(
+                    (batch, 1, seq, kv_main.shape[2])
+                )
+                extended_mask = torch.cat(
+                    [zeros_prefix, block_bias.to(zeros_prefix.dtype)], dim=-1
+                )
+            else:
+                extended_mask = None
+
+        # 6. Delegate to _MQABlock.attend_and_project — inherits the
+        # attention-sink softmax, the -sin conjugate rotation on the output
+        # rope slice (using the same "compress" rope), and the grouped
+        # output projection.  Note that the -sin conjugate rotation is only
+        # applied to `attn_output` in the *outer* attention math; the
+        # compressor's internal rope on `compressed_kv` is a K-side rotation
+        # that participates in the inner-product with q's rotation, and the
+        # conjugate on the output re-aligns the head-space direction of
+        # every KV entry — main and compressed alike — to be a relative-
+        # distance function of the query position, per paper eq. 26.
+        return self.mqa.attend_and_project(
+            q, kv_extended, cos, sin, attention_mask=extended_mask
+        )
+
+
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
         return
@@ -975,26 +1388,6 @@ if _NXDI_AVAILABLE:
             raise NotImplementedError(
                 "_CSABlock is Round 2.  Blocker for first NEFF fire: compressor "
                 "overlap-state aliasing (per user memory / enablement-draft §3-5)."
-            )
-
-    class _HCABlock(nn.Module):
-        """Heavily Compressed Attention (paper §2.3.2).
-
-        Composes:
-          * ``_MQABlock`` (main attention math shared).
-          * Sliding-window K=V branch (window=128, always).
-          * **Compressor without overlap** (m'=128): non-overlapping
-            pool; no indexer — every pooled entry is potentially visible
-            once its window has closed.
-        """
-
-        def __init__(self, config: Any, *, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_idx = layer_idx
-            self._config = config
-            raise NotImplementedError(
-                "_HCABlock is Round 2.  Simpler than _CSABlock (no indexer, no "
-                "overlap), still needs compressor pool aliasing."
             )
 
     class _HashMoEBlock(nn.Module):
@@ -1295,6 +1688,8 @@ __all__ = [
     "DeepseekV4FlashNeuronInferenceConfig",
     "FORBIDDEN_FP8_KV_KEYS",
     "NeuronDeepseekV4FlashForCausalLM",
+    "_HCABlock",
+    "_HCACompressor",
     "_MQABlock",
     "apply_partial_rope",
     "build_main_rope_cos_sin",
