@@ -89,6 +89,7 @@ from .nki_bindings import (
     dsa_attend_from_scores,
     dsa_scores_from_qidx,
     glm53_route,
+    glm53_route_affinities,
     kda_state_forward_torch,
     moe_gather_dispatch_torch,
 )
@@ -116,6 +117,12 @@ try:
         ParallelEmbedding as _NxdParallelEmbedding,
         RowParallelLinear as _NxdRowParallelLinear,
     )
+    # Round 4: the routed-expert branch now runs on NxDI's own blockwise-MoE
+    # module instead of a hand-rolled token-major gather.  See `_MoEBlock`.
+    from neuronx_distributed.modules.moe.expert_mlps import (
+        ExpertMLPs as _NxdExpertMLPs,
+    )
+    from neuronx_distributed.modules.moe.model_utils import GLUType as _NxdGLUType
     _NXDI_AVAILABLE = True
     _NXDI_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - CPU-only guard
@@ -130,6 +137,8 @@ except Exception as exc:  # pragma: no cover - CPU-only guard
     _NxdColumnParallelLinear = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdRowParallelLinear = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NxdParallelEmbedding = _NxdiUnavailable  # type: ignore[assignment,misc]
+    _NxdExpertMLPs = _NxdiUnavailable  # type: ignore[assignment,misc]
+    _NxdGLUType = _NxdiUnavailable  # type: ignore[assignment,misc]
     _NXDI_AVAILABLE = False
     _NXDI_IMPORT_ERROR = exc
 
@@ -330,16 +339,19 @@ if _NXDI_AVAILABLE:
             return 0
 
     def _aliased_kv_parameters(model: nn.Module) -> list[torch.Tensor]:
-        """The KV-cache parameters NxDI will alias, in alias order.
+        """The state parameters NxDI will alias, in alias order.
 
         Mirrors ``DecoderModelInstance.get()`` (model_wrapper.py:1614-1619):
         prefer ``kv_mgr.past_key_values``, else the model's own
-        ``past_key_values``.  Returns an empty list when neither exists, in
-        which case there are no aliases to honour.
+        ``past_key_values``.  GLM-5.3-Flash sets ``kv_mgr = None`` and owns the
+        second branch — see ``_NeuronGlm53FlashModel.init_inference_optimization``
+        for why a plain ``KVCacheManager`` cannot describe a hybrid KDA/DSA
+        stack.  Returns an empty list when neither exists.
 
         Note that *unused example inputs* need no such handling — torch_neuronx
         filters those to an ``exclude`` list with a warning
-        (hlo_conversion.py:465-485).  Only the alias list is unfiltered.
+        (hlo_conversion.py:465-485).  Only the alias list is unfiltered, which
+        is why an aliased-but-unread parameter aborts lowering.
         """
         kv_mgr = getattr(model, "kv_mgr", None)
         if kv_mgr is not None:
@@ -389,6 +401,97 @@ if _NXDI_AVAILABLE:
                     "sparse positions on every rank."
                 ) from exc
             return x
+
+    def _sequence_carry(
+        position_ids: torch.Tensor, dtype: torch.dtype, ndim: int
+    ) -> torch.Tensor:
+        """``0`` when this window starts a fresh sequence, ``1`` otherwise.
+
+        Every aliased state buffer is multiplied by this before use.  It does
+        two jobs at once, and the second is what makes the first safe:
+
+        1. **Correct reset.**  A context-encoding window that begins at
+           position 0 must not inherit the previous sequence's KDA state or KV
+           cache.  Deriving the reset from ``position_ids`` rather than from
+           the static bucket length also handles the general case (a window
+           that continues an existing sequence keeps its state) instead of
+           hard-coding "CTE means fresh".
+
+        2. **A read the compiler cannot fold away.**  The alias list is
+           appended to ``input_parameter_numbers`` *without* the ``-1`` filter
+           (hlo_conversion.py:490-496), so every aliased parameter must appear
+           in the lowering context or the trace aborts with "parameter not
+           found in lowering context".  Writing the reset as ``state * 0`` or
+           ``torch.zeros_like(state)`` does not satisfy that: a literal-zero
+           multiply is algebraically foldable and ``zeros_like`` reads only
+           metadata, so in both cases the parameter can vanish from the graph.
+           This factor is a *runtime* value derived from a graph input, so the
+           multiply survives to the lowered HLO by construction.
+
+        The first Round-4 KDA+dense trace died exactly this way, with the same
+        error message Round 3 had already chased once.
+        """
+        carry = (position_ids.to(torch.int64).amin(dim=-1) > 0).to(dtype)
+        return carry.view(-1, *([1] * (ndim - 1)))
+
+    def _write_positions(
+        cache: torch.Tensor,        # [B, S, ...]
+        new: torch.Tensor,          # [B, L, ...]
+        position_ids: torch.Tensor,  # [B, L] int64
+    ) -> torch.Tensor:
+        """Return ``cache`` with ``new`` written at ``position_ids``.
+
+        Functional, not in-place: mutating an aliased ``nn.Parameter`` inside
+        ``forward`` is exactly the pattern torch_neuronx refuses to lower
+        ("attempted in-place operation, or ... nn.Parameter.data").  The
+        updated tensor is returned and handed back as a graph output, which is
+        what makes the alias a real read-modify-write on device.
+
+        Two trace-time shapes, selected by the *static* bucket length — NxDI
+        traces CTE and TKG as separate graphs, so the branch is on a
+        compile-time constant.  Both branches blend the old cache in through a
+        *runtime-derived* mask, so the aliased parameter is genuinely read in
+        either graph (see ``_sequence_carry``).
+
+        * ``L > 1`` — prefill.  The window occupies positions ``0..span-1``;
+          the write is a pad on the sequence axis and the untouched tail keeps
+          its previous contents.  ``span`` comes from ``position_ids``, so the
+          "keep" mask is a runtime tensor rather than a foldable constant.
+        * ``L == 1`` — decode.  A one-hot write over the ``S`` axis, which
+          costs ``B*S*D`` multiply-adds (~8 MFLOP for the largest GLM cache at
+          S=2048) and keeps the tracer free of dynamic indexing.
+        """
+        length = int(new.shape[1])
+        seq = int(cache.shape[1])
+        value = new.to(cache.dtype)
+        base = cache * _sequence_carry(position_ids, cache.dtype, cache.ndim)
+        arange = torch.arange(seq, device=cache.device, dtype=torch.int64)
+
+        if length > 1:
+            span = position_ids.to(torch.int64).amax(dim=-1) + 1     # [B]
+            covered = (arange.view(1, seq) < span.view(-1, 1)).to(cache.dtype)
+            keep = (1.0 - covered).view(
+                -1, seq, *([1] * (cache.ndim - 2))
+            )
+            pad = (0, 0) * (value.ndim - 2) + (0, seq - length)
+            return F.pad(value, pad) + base * keep
+
+        batch = cache.shape[0]
+        trailing = tuple(cache.shape[2:])
+        onehot = (
+            position_ids[:, :1].to(torch.int64).unsqueeze(-1)
+            == arange.view(1, 1, seq)
+        ).to(cache.dtype)                                    # [B, 1, S]
+        flat_base = base.reshape(batch, seq, -1)
+        flat_new = value.reshape(batch, 1, -1)
+        update = torch.einsum("bls,bld->bsd", onehot, flat_new)
+        keep = (1.0 - onehot.sum(dim=1)).unsqueeze(-1)       # [B, S, 1]
+        merged = flat_base * keep + update
+        return merged.reshape(batch, seq, *trailing)
+
+    def _is_prefill_length(length: int) -> bool:
+        """True when this graph is a context-encoding (prefill) trace."""
+        return int(length) > 1
 
     class _NoPeMLABlock(nn.Module):
         """All-NoPE MLA projections lowered to NxDI parallel primitives.
@@ -444,6 +547,9 @@ if _NXDI_AVAILABLE:
                     f"({self.num_heads}) divisible by TP degree ({tp_degree}); "
                     "Round-3 will add head-padded fallback."
                 )
+            self.tp_degree = tp_degree
+            self.heads_per_rank = self.num_heads // tp_degree
+            self.state_dtype = dtype
             # Q_A / KV_A are latent-rank projections: ColumnParallelLinear with
             # gather_output=True so every rank observes the full latent and
             # feeds Q_B / KV_B (which shard along heads) with the correct input.
@@ -626,6 +732,25 @@ if _NXDI_AVAILABLE:
                     "the loader rather than reshaping to make it fit."
                 )
 
+        def project_index_k(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Index-K for the *current* window, ``[B, L, H_idx, D_idx]``.
+
+            Split out of ``forward`` in Round 4 because the indexer scores a
+            query against the index-K of every *past* position, not just the
+            current window.  Round 3 recomputed index-K from the current
+            hidden states only, which is correct for a prefill-from-zero graph
+            and silently wrong for decode — at ``L == 1`` the indexer would
+            rank a one-position context.  The caller now writes this into the
+            aliased index-K cache and scores against the full cache.
+
+            ``gather_output=True`` on ``k_proj`` keeps this replicated, so the
+            top-k is bit-identical on every rank by construction.
+            """
+            batch, length, _ = hidden_states.shape
+            return self.k_proj(hidden_states).view(
+                batch, length, self.index_n_heads, self.index_head_dim
+            )
+
         def forward(
             self,
             hidden_states: torch.Tensor,
@@ -634,6 +759,7 @@ if _NXDI_AVAILABLE:
             kv_cache_k: torch.Tensor,
             kv_cache_v: torch.Tensor,
             key_lengths: torch.Tensor,
+            index_k_cache: torch.Tensor,
             *,
             return_lse: bool = False,
         ):
@@ -652,11 +778,10 @@ if _NXDI_AVAILABLE:
             """
             batch, length, _ = hidden_states.shape
 
-            # Index-K side: replicated (gather_output=True), so this is the
-            # full [B, L, index_n_heads, index_head_dim] cache on every rank.
-            index_k = self.k_proj(hidden_states).view(
-                batch, length, self.index_n_heads, self.index_head_dim
-            )
+            # Index-K side: the caller supplies the *cache*, already updated
+            # with this window's positions, so the indexer ranks every past
+            # position and not just the current one.
+            index_k = index_k_cache
 
             # Query side: rank-local contraction, then sum across ranks.
             q_flat = query.reshape(batch, query.shape[1], -1)
@@ -701,47 +826,106 @@ if _NXDI_AVAILABLE:
             self.mla = _NoPeMLABlock(config, layer_idx=layer_idx)
             self.indexer = _DSAIndexerBlock(config, layer_idx=layer_idx)
 
+        def state_cache_specs(
+            self, batch: int, seq_len: int
+        ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+            """Aliased caches this layer owns, in graph input/output order.
+
+            Three, not two: DSA's lightning indexer scores against its own
+            projected index-K, which has to be cached alongside K and V or a
+            decode step ranks a one-position context.  Index-K is replicated
+            (``gather_output=True`` on ``k_proj``), so it is full-width on
+            every rank — that is what keeps the sparse selection identical
+            across ranks holding different head shards.
+            """
+            mla, idx = self.mla, self.indexer
+            dtype = mla.state_dtype
+            return [
+                (
+                    "k_cache",
+                    (batch, seq_len, mla.heads_per_rank, mla.qk_nope_head_dim),
+                    dtype,
+                ),
+                (
+                    "v_cache",
+                    (batch, seq_len, mla.heads_per_rank, mla.v_head_dim),
+                    dtype,
+                ),
+                (
+                    "index_k_cache",
+                    (batch, seq_len, idx.index_n_heads, idx.index_head_dim),
+                    dtype,
+                ),
+            ]
+
         def forward(
             self,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
-            kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+            caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
             key_lengths: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            """Round-3 bound DSA layer: All-NoPE MLA + indexer-selected sparse attn.
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            """Round-4 DSA layer: All-NoPE MLA + cached indexer + sparse attn.
 
-            When ``kv_cache`` is supplied the sparse gather runs against the
-            full cached context; otherwise K/V come from the current window,
-            which is the correct prefill/self-attention behaviour and the
-            shape the 1-layer smoke exercises.
+            Takes and returns the three aliased caches this layer owns —
+            ``(k_cache, v_cache, index_k_cache)`` — as graph input/output
+            pairs.  Round 3 threaded no cache at all (``kv_cache`` was always
+            ``None``), so K/V and index-K came from the current window only.
+            That is exactly right for a prefill-from-zero CTE graph and
+            **silently wrong for decode**: a single-token TKG step would attend
+            to a one-position context and still produce plausible logits.  The
+            aliasing is what makes the TKG graph mean what it says.
+
+            ``key_lengths`` is derived from ``position_ids``, not from
+            ``attention_mask``: the mask describes the *current window*, while
+            the sparse gather needs the number of valid *cache* positions.  At
+            decode the mask would say 1 and the cache holds ``p+1``.
             """
+            k_cache, v_cache, index_k_cache = caches
             query, key, value = self.mla.project(hidden_states)
-            if kv_cache is not None:
-                key, value = kv_cache
-            batch = hidden_states.shape[0]
-            context_len = key.shape[1]
-            if key_lengths is None:
-                # No attention_mask supplied — every position is valid.
-                key_lengths = torch.full(
-                    (batch,),
-                    context_len,
-                    dtype=torch.int64,
-                    device=hidden_states.device,
-                )
-            else:
-                key_lengths = key_lengths.to(torch.int64).clamp(max=context_len)
-            attn, _topk = self.indexer(
+            index_k = self.indexer.project_index_k(hidden_states)
+
+            new_k = _write_positions(k_cache, key, position_ids)
+            new_v = _write_positions(v_cache, value, position_ids)
+            new_index_k = _write_positions(index_k_cache, index_k, position_ids)
+
+            context_len = int(new_k.shape[1])
+            valid = position_ids.to(torch.int64).amax(dim=-1) + 1
+            if key_lengths is not None and _is_prefill_length(
+                int(hidden_states.shape[1])
+            ):
+                # Prefill only: a right-padded window spans more positions than
+                # it has real tokens, and the mask is the tighter bound.  At
+                # decode the mask describes a 1-token window while the cache
+                # holds p+1 valid positions, so the mask must NOT be consulted
+                # — doing so would collapse every decode step to a 1-position
+                # context, which is precisely the silent-wrongness this round
+                # exists to remove.
+                valid = torch.minimum(valid, key_lengths.to(torch.int64))
+            key_lengths = valid.clamp(min=1, max=context_len)
+
+            # `dsa_attend_from_scores(..., return_lse=False)` returns the
+            # attention output alone.  Round 3 unpacked it as a 2-tuple, which
+            # never fired because no Round-3 smoke ever executed the DSA
+            # forward — the 1-layer smoke is KDA+dense, and the coverage smoke
+            # aborted in the MoE branch first.  Surfaced by actually running
+            # the layer in stage 7.
+            attn = self.indexer(
                 hidden_states,
                 position_ids,
                 query,
-                key,
-                value,
+                new_k,
+                new_v,
                 key_lengths,
+                new_index_k,
             )
+            if isinstance(attn, tuple):
+                attn = attn[0]
             batch, length = attn.shape[0], attn.shape[1]
-            return self.mla.o_proj(
+            out = self.mla.o_proj(
                 attn.reshape(batch, length, -1).to(hidden_states.dtype)
             )
+            return out, (new_k, new_v, new_index_k)
 
     class _KDABlock(nn.Module):
         """Kimi Delta Attention (KDA) projections + state-kernel wrapper.
@@ -906,6 +1090,25 @@ if _NXDI_AVAILABLE:
             )
             self.state_dtype = dtype
 
+        def state_cache_specs(
+            self, batch: int, seq_len: int
+        ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+            """Aliased state this layer owns, in graph input/output order.
+
+            KDA is a linear-attention recurrence, so its "cache" is a fixed
+            ``[HV, V, K]`` state matrix per slot rather than a growing
+            per-position buffer — it does not scale with ``seq_len``, which is
+            the whole point of the mechanism.  The short-conv history
+            (``kernel_size - 1`` columns) is the second piece of state and is
+            just as load-bearing: dropping it re-runs the depthwise conv with
+            zero history on every decode step.
+            """
+            del seq_len  # KDA state is sequence-length independent
+            return [
+                ("kda_state", (batch,) + self.kda_state_shape, self.state_dtype),
+                ("conv_state", (batch,) + self.conv_state_shape, self.state_dtype),
+            ]
+
         def _local_heads(self) -> slice:
             """Rank-local head slice for the checkpoint-width small params."""
             rank = _tp_rank()
@@ -940,9 +1143,10 @@ if _NXDI_AVAILABLE:
         def forward(
             self,
             hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
             kda_state: torch.Tensor | None = None,
             conv_state: torch.Tensor | None = None,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Round-3 bound KDA forward.
 
             Kernel identity: ``KDA_KERNEL_SLUG_V2``
@@ -975,11 +1179,24 @@ if _NXDI_AVAILABLE:
                 batch, length, heads, self.head_dim
             )
 
+            # A window that starts at position 0 begins a fresh sequence and
+            # must not inherit the previous sequence's state; a window that
+            # starts later continues one.  `_sequence_carry` encodes exactly
+            # that, and — being derived from `position_ids` at runtime — also
+            # guarantees the aliased parameter survives into the lowered HLO.
+            # See its docstring: `state * 0` and `torch.zeros_like(state)` both
+            # let the parameter vanish, which aborts the trace with "parameter
+            # not found in lowering context".
+            prefill = _is_prefill_length(length)
             if conv_state is None:
                 conv_state = torch.zeros(
                     (batch,) + self.conv_state_shape,
                     dtype=self.state_dtype,
                     device=hidden_states.device,
+                )
+            else:
+                conv_state = conv_state * _sequence_carry(
+                    position_ids, conv_state.dtype, conv_state.ndim
                 )
             query, key, value, new_conv_state = self._short_conv(
                 query, key, value, conv_state
@@ -1001,6 +1218,14 @@ if _NXDI_AVAILABLE:
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
+            else:
+                # The aliased buffer is stored bf16 (the KDA_KERNEL_SLUG_V2
+                # `bf16_state` identity); the recurrence runs in fp32 and
+                # re-quantizes at the store boundary each step, so promoting
+                # here loses nothing.  Same carry factor as the conv state.
+                kda_state = kda_state.to(torch.float32) * _sequence_carry(
+                    position_ids, torch.float32, kda_state.ndim
+                )
 
             output, new_state = kda_state_forward_torch(
                 kda_state,
@@ -1018,23 +1243,22 @@ if _NXDI_AVAILABLE:
 
             # State hand-off is FUNCTIONAL, not a buffer mutation.
             #
-            # Reassigning `self.kda_state` / `self.conv_state` inside forward
-            # is exactly the pattern torch_neuronx refuses to lower:
+            # Reassigning `self.kda_state` inside forward is exactly the
+            # pattern torch_neuronx refuses to lower:
             #   "Unable to lower HLO: parameter not found in lowering context.
             #    This is likely caused by an attempted in-place operation, or
             #    an attempted access of nn.Parameter.data or nn.Buffer.data."
-            # The recurrence therefore leaves its updated state on plain
-            # Python attributes, which the tracer ignores, and the caller
-            # reads them to thread state between graph invocations.
             #
-            # NOTE (next blocker, tracked in the Round-3 status doc): making
-            # the state survive across *decode steps* on device needs NxDI's
-            # `input_output_aliases` state wireup, so the state tensor becomes
-            # a real graph input/output pair rather than a Python attribute.
-            # Until that lands, a CTE (prefill-from-zero) graph is exact and a
-            # multi-step TKG graph would silently restart from zero state —
-            # which is why the TKG contract must not be declared correct until
-            # the aliasing is wired.
+            # Round 4 makes the state survive across decode steps by returning
+            # it: the caller holds the state as an `nn.Parameter` that NxDI
+            # aliases via `input_output_aliases`, reads it in as an argument,
+            # and returns the updated tensor after the logits in alias order —
+            # the same input/output-pair contract the KV cache uses
+            # (kv_cache_manager.py:152-162, model_wrapper.py:1614-1619).  Round
+            # 3 left the update on a Python attribute, which the tracer
+            # ignores, so a multi-step TKG graph restarted from zero state
+            # every step: it compiled, ran, and benchmarked cleanly while being
+            # wrong.
             self._new_kda_state = new_state
             self._new_conv_state = new_conv_state
 
@@ -1045,7 +1269,11 @@ if _NXDI_AVAILABLE:
             normed = normed * torch.sigmoid(gate.to(torch.float32)).to(
                 normed.dtype
             )
-            return self.o_proj(normed.flatten(-2))
+            return (
+                self.o_proj(normed.flatten(-2)),
+                new_state.to(self.state_dtype),
+                new_conv_state.to(self.state_dtype),
+            )
 
     class _DenseMLPBlock(nn.Module):
         """GLM-5.3-Flash dense MLP (first ``first_k_dense_replace`` layers).
@@ -1141,18 +1369,39 @@ if _NXDI_AVAILABLE:
     class _MoEBlock(nn.Module):
         """288-expert routed MoE (top-8) + one shared expert.
 
-        Routed-expert weights are fused across the expert axis:
-          gate: [n_routed_experts, hidden, moe_intermediate_size]
-          up:   [n_routed_experts, hidden, moe_intermediate_size]
-          down: [n_routed_experts, moe_intermediate_size, hidden]
-        Round-2 keeps these as replicated ``nn.Parameter`` tensors so the
-        blockwise-MoE loader can address them by expert index.  Round-3 will
-        introduce an expert-axis sharding via ExpertParallelism inside NxDI
-        once the container ships ``_call_shard_hidden_kernel`` unconditionally.
+        **Round 4 replaces the routed dispatch with NxDI's own
+        ``ExpertMLPs``.**  Round 3 hand-rolled a token-major top-k gather
+        (``moe_gather_dispatch_torch``).  Its FLOPs were right — O(top_k), not
+        O(288) — but its *memory* was not: it materialised one full expert
+        weight slab per token, ``[B*L*top_k, hidden, inter]``.  Measured, that
+        is ~2.1 GB per slab at 128 prefill tokens (~6.4 GB for gate/up/down)
+        and ~34 GB per slab at 2048, and it is what aborted the Round-3
+        4-layer coverage smoke with ``double free or corruption`` inside the
+        XLA tracer's allocator during CTE HLO generation.
 
-        Router gate is a small ``nn.Linear`` (replicated); routed dispatch is
-        deferred to Round 3 (blockwise MoE NKI kernel).  Shared expert MLP is
-        lowered here so the shared-branch compile-graph binds now.
+        ``ExpertMLPs`` owns the capacity dispatch instead: it holds the expert
+        weights as ``ExpertFusedColumnParallelLinear`` (gate+up fused,
+        ``stride=2``) and ``ExpertFusedRowParallelLinear``, both sharded on
+        the intermediate axis, and picks its own inference path from the token
+        count (``expert_mlps_v2.py:1407-1500``):
+
+          * ``seq_len == 1`` (TKG): ``T*top_k/E = 8/288 < 1.0`` so it takes
+            ``forward_selective_loading`` — only the 8 chosen expert slabs are
+            loaded, which is the decode behaviour we want.
+          * ``seq_len > 1`` (CTE): at ``T*top_k >= block_size`` (512) it takes
+            ``forward_blockwise``, i.e. the fused NKI blockwise kernel that
+            ``use_shard_on_intermediate_dynamic_while`` selects.
+
+        The routed output is **not** reduced inside ``ExpertMLPs``
+        (``Experts`` constructs ``down_proj`` with ``reduce_output=False``);
+        NxDI's own ``MoE.forward`` does the delayed all-reduce afterwards
+        (``modules/moe/model.py:238-245``).  This block reproduces that
+        contract explicitly — see ``forward``.
+
+        The shared expert stays a plain Column/Row-parallel MLP: its
+        ``down_proj`` is a ``RowParallelLinear`` with ``input_is_parallel``,
+        so it reduces itself and must be added *after* the routed reduce, not
+        before.
         """
 
         def __init__(self, config: Glm53FlashNeuronInferenceConfig) -> None:
@@ -1189,32 +1438,62 @@ if _NXDI_AVAILABLE:
                 bias=False,
                 dtype=router_dtype,
             )
-            self.gate = nn.Parameter(
-                torch.empty(
-                    self.n_routed_experts,
-                    self.hidden_size,
-                    self.moe_intermediate_per_tp,
-                    dtype=dtype,
-                ),
-                requires_grad=False,
+            # Routed experts: NxDI's blockwise-MoE module.  The GLM SwiGLU is
+            # `silu(clamp(gate, max=L)) * clamp(up, -L, L)`, which maps onto
+            # `GLUType.GLU` with `hidden_act="silu"`, `hidden_act_scaling_factor=1`
+            # and the four clamp limits — an exact spelling of `moe.py`'s
+            # reference expression, not an approximation of it.
+            #
+            # `normalize_top_k_affinities` carries GLM's `norm_topk_prob`.
+            # `routed_scaling_factor` is applied to the OUTPUT in `forward`,
+            # because applying it to the affinities would be cancelled by that
+            # same normalize (see `glm53_route_affinities`).
+            blockwise = getattr(
+                config.neuron_config, "blockwise_matmul_config", None
             )
-            self.up = nn.Parameter(
-                torch.empty(
-                    self.n_routed_experts,
-                    self.hidden_size,
-                    self.moe_intermediate_per_tp,
-                    dtype=dtype,
+            if blockwise is None or not getattr(
+                blockwise, "use_shard_on_intermediate_dynamic_while", False
+            ):
+                raise RuntimeError(
+                    "GLM-5.3-Flash routed MoE requires "
+                    "neuron_config.blockwise_matmul_config."
+                    "use_shard_on_intermediate_dynamic_while=True. Without it "
+                    "the LNC=2 dispatch (modules/moe/blockwise.py:1005-1017) "
+                    "falls into `_call_shard_hidden_kernel`, which is a stub "
+                    "that unconditionally raises on container sha256:011d49c7. "
+                    f"Got: {blockwise!r}"
+                )
+            lnc = int(getattr(config.neuron_config, "logical_nc_config", 2))
+            if lnc != 2:
+                raise NotImplementedError(
+                    "GLM-5.3-Flash MoE requires LNC=2 on this container: the "
+                    "LNC=1 branch of the blockwise dispatch raises "
+                    '"LNC_1 kernels not available in nkilib" '
+                    "(modules/moe/blockwise.py:1018). "
+                    f"Got logical_nc_config={lnc}."
+                )
+            self.expert_mlps = _NxdExpertMLPs(
+                num_experts=self.n_routed_experts,
+                top_k=self.num_experts_per_tok,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.moe_intermediate_size,
+                hidden_act=src.hidden_act,
+                glu_mlp=True,
+                glu_type=_NxdGLUType.GLU,
+                capacity_factor=None,          # dropless / full capacity
+                normalize_top_k_affinities=self.norm_topk_prob,
+                gate_clamp_upper_limit=self.swiglu_limit,
+                gate_clamp_lower_limit=None,
+                up_clamp_upper_limit=self.swiglu_limit,
+                up_clamp_lower_limit=-self.swiglu_limit,
+                early_expert_affinity_modulation=False,
+                dtype=dtype,
+                logical_nc_config=lnc,
+                use_shard_on_intermediate_dynamic_while=True,
+                skip_dma_token=bool(
+                    getattr(blockwise, "skip_dma_token", True)
                 ),
-                requires_grad=False,
-            )
-            self.down = nn.Parameter(
-                torch.empty(
-                    self.n_routed_experts,
-                    self.moe_intermediate_per_tp,
-                    self.hidden_size,
-                    dtype=dtype,
-                ),
-                requires_grad=False,
+                block_size=int(getattr(blockwise, "block_size", 512)),
             )
             self.shared_expert = _MoESharedExpert(config)
             # GLM's router uses a selection-only correction bias (see
@@ -1239,42 +1518,51 @@ if _NXDI_AVAILABLE:
             )
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            """Round-3 bound MoE: GLM routing + top-k gather dispatch + shared.
+            """Round-4 MoE: GLM routing + NxDI blockwise ExpertMLPs + shared.
 
-            Kernel identity: ``MOE_KERNEL_SLUG_V1``.  The routed branch is
-            O(top_k) FLOPs, not O(num_experts) — it gathers only the 8 selected
-            expert slabs per token, matching the fused NKI kernel's asymptotics
-            without its capacity-dispatch machinery.  ``self.dispatch_config``
-            carries the validated shape identity the fused kernel compiles to.
+            Kernel identity: ``MOE_KERNEL_SLUG_V1``.  ``self.dispatch_config``
+            still carries the Tier-1-validated shape identity (partition cap
+            288 < 16384, ``I_TP = 2048/16 = 128`` clears the ``%16`` wall,
+            ``top_k=8`` in the tested set); it is now a *gate* on the config
+            rather than the thing that does the dispatch.
 
             No fallback: there is no branch that silently drops to
-            ``torch_blockwise_matmul_inference`` or skips the routed half.
+            ``torch_blockwise_matmul_inference`` (``use_torch_block_wise``
+            stays False) or skips the routed half.
             """
+            shape = hidden_states.shape
+            length = shape[1] if hidden_states.ndim == 3 else 1
+            flat = hidden_states.reshape(-1, self.hidden_size)
+
             shared = self.shared_expert(hidden_states)
-            expert_indices, routing_weights = glm53_route(
+
+            affinities, expert_index = glm53_route_affinities(
                 hidden_states,
                 self.router.weight,
                 top_k=self.num_experts_per_tok,
                 scoring_func=self.scoring_func,
-                norm_topk_prob=self.norm_topk_prob,
-                routed_scaling_factor=self.routed_scaling_factor,
                 correction_bias=self.e_score_correction_bias,
             )
-            routed = moe_gather_dispatch_torch(
-                hidden_states,
-                expert_indices,
-                routing_weights,
-                self.gate,
-                self.up,
-                self.down,
-                swiglu_limit=self.swiglu_limit,
+            routed = self.expert_mlps(
+                hidden_states=flat,
+                expert_affinities=affinities.to(flat.dtype),
+                expert_index=expert_index,
+                seq_len=length,
             )
-            # `down` is sharded on the intermediate axis, so each rank produced
-            # a partial sum over its slice — the same RowParallelLinear
-            # contract the shared expert's `down_proj` gets for free.  Without
-            # this reduce every rank would emit 1/tp of the routed activation.
+            # `ExpertMLPs` builds `down_proj` with `reduce_output=False`, so
+            # each rank holds a partial sum over its intermediate slice.  NxDI's
+            # own `MoE.forward` does this reduce afterwards
+            # (modules/moe/model.py:238-245); this block is not that class, so
+            # it must do it here.  Without the reduce every rank would emit
+            # 1/tp of the routed activation — a silent correctness bug, not a
+            # crash.
             routed = _reduce_from_tp_region(routed)
-            return shared + routed.to(shared.dtype)
+            # GLM's `routed_scaling_factor`, applied to the output rather than
+            # to the affinities: the expert combination is linear in the
+            # affinities, and pre-scaling them would be cancelled by
+            # `normalize_top_k_affinities`.
+            routed = routed * self.routed_scaling_factor
+            return shared + routed.view(shape).to(shared.dtype)
 
     class _MHCBlock(nn.Module):
         """One mHC 4-stream pre/post mixer (Sinkhorn manifold projection).
@@ -1413,22 +1701,40 @@ if _NXDI_AVAILABLE:
             self.hc_attn = _MHCBlock(config)
             self.hc_mlp = _MHCBlock(config)
 
+        def state_cache_specs(
+            self, batch: int, seq_len: int
+        ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+            return self.self_attn.state_cache_specs(batch, seq_len)
+
         def forward(
             self,
             residual_streams: torch.Tensor,
             position_ids: torch.Tensor,
+            caches: tuple[torch.Tensor, ...],
             key_lengths: torch.Tensor | None = None,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+            """One layer + its aliased state, threaded in and back out.
+
+            ``caches`` is this layer's slice of the model's aliased parameter
+            list — 2 tensors for a KDA layer, 3 for a DSA layer — and the
+            second return value is the updated slice, in the same order.  The
+            model returns them all after the logits so NxDI's
+            ``input_output_aliases`` map turns each into an on-device
+            read-modify-write.
+            """
             post_mix, comb_mix, hidden_states = self.hc_attn.pre(residual_streams)
             normalized = _rms_norm(
                 hidden_states, self.input_norm_weight, self.rms_eps
             )
             if self.attn_kind == "dsa":
-                attn_out = self.self_attn(
-                    normalized, position_ids, key_lengths=key_lengths
+                attn_out, new_caches = self.self_attn(
+                    normalized, position_ids, caches, key_lengths=key_lengths
                 )
             else:
-                attn_out = self.self_attn(normalized)
+                attn_out, new_state, new_conv = self.self_attn(
+                    normalized, position_ids, caches[0], caches[1]
+                )
+                new_caches = (new_state, new_conv)
             residual_streams = self.hc_attn.post(
                 attn_out, residual_streams, post_mix, comb_mix
             )
@@ -1437,7 +1743,10 @@ if _NXDI_AVAILABLE:
                 hidden_states, self.post_attention_norm_weight, self.rms_eps
             )
             mlp_out = self.mlp(normalized)
-            return self.hc_mlp.post(mlp_out, residual_streams, post_mix, comb_mix)
+            return (
+                self.hc_mlp.post(mlp_out, residual_streams, post_mix, comb_mix),
+                new_caches,
+            )
 
     class _NeuronGlm53FlashModel(NeuronBaseModel):
         """Real per-layer NxDI-primitive GLM-5.3-Flash graph.
@@ -1498,6 +1807,75 @@ if _NXDI_AVAILABLE:
             )
             self.rms_eps = src.rms_norm_eps
 
+        def init_inference_optimization(self, config: Any) -> None:
+            """Replace NxDI's KV-cache manager with GLM-5.3's hybrid state cache.
+
+            ``KVCacheManager`` allocates a uniform ``2 x num_layers`` K/V set
+            shaped from ``num_key_value_heads`` and ``head_dim``.  GLM-5.3-Flash
+            is not that model: 34 of its 45 layers are KDA, whose state is a
+            fixed ``[HV, V, K]`` matrix plus a short-conv history and does not
+            grow with sequence length at all, and the 11 DSA layers need a
+            *third* buffer (the lightning indexer's index-K) that no
+            attention-shaped manager knows about.  A uniform manager would
+            therefore allocate the wrong tensors for 76% of the stack and still
+            leave the indexer uncached.
+
+            So ``kv_mgr`` is set to ``None`` and this model owns
+            ``self.past_key_values`` directly — the documented second branch of
+            ``DecoderModelInstance.get()`` (model_wrapper.py:1614-1619).  Every
+            entry becomes an ``input_output_aliases`` pair, is read as a graph
+            input in ``forward``, and is returned after the logits in the same
+            order.
+
+            The super() call still runs first: it builds the on-device sampler.
+            Its ``KVCacheManager`` is constructed and then dropped, which costs
+            a transient CPU allocation at build time and nothing on device.
+            """
+            super().init_inference_optimization(config)
+            neuron_config = config.neuron_config
+            if getattr(neuron_config, "is_prefix_caching", False):
+                raise NotImplementedError(
+                    "GLM-5.3-Flash state aliasing assumes a context-encoding "
+                    "graph starts a fresh sequence at position 0 (see "
+                    "`_write_positions`). Prefix caching breaks that "
+                    "assumption; refusing rather than writing the cache at the "
+                    "wrong offsets."
+                )
+            if getattr(neuron_config, "is_block_kv_layout", False):
+                raise NotImplementedError(
+                    "GLM-5.3-Flash does not implement a paged/block KV layout; "
+                    "its KDA state is per-slot and not per-block."
+                )
+            self.kv_mgr = None
+
+            batch = int(
+                getattr(neuron_config, "kv_cache_batch_size", None)
+                or neuron_config.max_batch_size
+            )
+            seq_len = int(neuron_config.seq_len)
+            self.state_cache_batch = batch
+            self.state_cache_seq_len = seq_len
+
+            specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+            self.layer_cache_slices: list[tuple[int, int]] = []
+            for layer_idx, layer in enumerate(self.layers):
+                layer_specs = layer.state_cache_specs(batch, seq_len)
+                start = len(specs)
+                specs.extend(
+                    (f"layer{layer_idx}.{name}", shape, dtype)
+                    for name, shape, dtype in layer_specs
+                )
+                self.layer_cache_slices.append((start, len(specs)))
+            self.state_cache_names = [name for name, _, _ in specs]
+            self.past_key_values = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.zeros(shape, dtype=dtype), requires_grad=False
+                    )
+                    for _, shape, dtype in specs
+                ]
+            )
+
         def forward(
             self,
             input_ids: torch.LongTensor,
@@ -1547,24 +1925,40 @@ if _NXDI_AVAILABLE:
             residual_streams = hidden_states.unsqueeze(-2).repeat(
                 1, 1, self.hc_mult, 1
             )
-            for layer in self.layers:
-                residual_streams = layer(
-                    residual_streams, positions, key_lengths=key_lengths
+            # Aliased state in, updated state out — one slice per layer.
+            caches_in = list(self.past_key_values)
+            caches_out: list[torch.Tensor] = []
+            for layer_idx, layer in enumerate(self.layers):
+                start, stop = self.layer_cache_slices[layer_idx]
+                residual_streams, updated = layer(
+                    residual_streams,
+                    positions,
+                    tuple(caches_in[start:stop]),
+                    key_lengths=key_lengths,
                 )
+                if len(updated) != stop - start:
+                    raise RuntimeError(
+                        f"layer {layer_idx} returned {len(updated)} state "
+                        f"tensors but declared {stop - start}; the alias list "
+                        "and the output list must agree exactly or lowering "
+                        "aborts with 'parameter not found in lowering context'"
+                    )
+                caches_out.extend(updated)
             hidden_states = residual_streams.mean(dim=-2)
             hidden_states = _rms_norm(
                 hidden_states, self.final_norm_weight, self.rms_eps
             )
             logits = self.lm_head(hidden_states)
 
-            # KV-cache alias contract.
+            # State alias contract.
             #
             # `DecoderModelInstance.get()` (model_wrapper.py:1614-1619) builds
-            # `input_output_aliases` from `kv_mgr.past_key_values` — real
-            # nn.Parameters — mapping each to output index
+            # `input_output_aliases` from `kv_mgr.past_key_values`, or — when
+            # `kv_mgr is None`, which is GLM-5.3-Flash's case — from the
+            # model's own `past_key_values`.  Each entry maps to output index
             # `num_output_from_trace + i`.  Unlike the example inputs, that
             # alias list is NOT filtered for -1 before `linearize_indices`
-            # (hlo_conversion.py:490-496), so a cache parameter that the graph
+            # (hlo_conversion.py:490-496), so a state parameter that the graph
             # aliases but never reads aborts lowering with
             # "parameter not found in lowering context".
             #
@@ -1572,12 +1966,25 @@ if _NXDI_AVAILABLE:
             # at all — the base `NeuronBaseModel.forward` reads the cache via
             # `kv_mgr.get_cache` and returns `outputs += updated_kv_cache`.
             # This graph keeps its own forward (GLM-5.3 is a hybrid KDA/DSA
-            # stack that the base decode loop does not model), so it must
-            # honour the same contract explicitly: read each cache parameter
-            # and return it directly after the logits, in alias order.
-            caches = _aliased_kv_parameters(self)
-            if caches:
-                return [logits] + list(caches)
+            # stack that the base decode loop does not model), so it honours
+            # the same contract explicitly.
+            #
+            # Round 4 returns the *updated* tensors here.  Round 3 returned the
+            # parameters themselves — which lowered cleanly and made every
+            # alias a no-op write, so a multi-step TKG graph restarted from
+            # zero KDA state and a one-position DSA context on every step.  The
+            # difference between those two is invisible in a benchmark and is
+            # the whole point of this round.
+            expected = len(self.past_key_values)
+            if len(caches_out) != expected:
+                raise RuntimeError(
+                    f"forward produced {len(caches_out)} state outputs but "
+                    f"{expected} parameters are aliased; NxDI maps alias i to "
+                    "output index num_output_from_trace + i, so the lists must "
+                    "be the same length and in the same order"
+                )
+            if expected:
+                return [logits] + caches_out
             return logits
 
     def _require_source_config(
@@ -1720,6 +2127,40 @@ if _NXDI_AVAILABLE:
             elif isinstance(config, Glm53FlashNeuronInferenceConfig):
                 self._source_config = config.source_config
             super().__init__(model_path, config=config, neuron_config=neuron_config)
+            self._apply_emit_phases()
+
+        def _apply_emit_phases(self) -> None:
+            """Honour ``NXDI_EMIT_PHASES`` by pruning ``self.models``.
+
+            Round 3 parsed this env var and stored it on ``self._emit_phases``
+            but never acted on it, so ``NXDI_EMIT_PHASES=TKG`` silently
+            compiled both graphs anyway — found while trying to probe the
+            45-layer decode contract without paying for the prefill trace.
+
+            NxDI has no config switch for this: ``NeuronBaseForCausalLM``
+            calls ``enable_context_encoding()`` unconditionally
+            (model_base.py:3062) and appends each wrapper to ``self.models``,
+            which is what ``compile()`` iterates.  Pruning that list is
+            therefore the intervention point.  The attributes themselves stay
+            in place so nothing downstream sees a half-built object; only the
+            compile set changes.
+            """
+            if self._emit_phases == "BOTH":
+                return
+            cte = getattr(self, "context_encoding_model", None)
+            tkg = getattr(self, "token_generation_model", None)
+            keep = cte if self._emit_phases == "CTE" else tkg
+            if keep is None:
+                raise RuntimeError(
+                    f"NXDI_EMIT_PHASES={self._emit_phases} but the "
+                    "corresponding model wrapper was never built"
+                )
+            self.models = [m for m in self.models if m is keep]
+            logger.info(
+                "NXDI_EMIT_PHASES=%s -> compiling only %s",
+                self._emit_phases,
+                getattr(keep, "tag", keep),
+            )
 
         def get_cpu_oracle(self) -> NeuronGlm53FlashForCausalLMImpl:
             """Materialize the CPU-reference impl for correctness gating.
@@ -1869,6 +2310,85 @@ if _NXDI_AVAILABLE:
                 ctx_batch_size=ctx_batch_size,
                 tkg_batch_size=tkg_batch_size,
                 seq_len=seq_len,
+            )
+
+        # Named reduced layer stacks for bisecting which bound kernel breaks a
+        # trace.  Each entry is an ordered list of (layer_type, mlp_type).
+        SMOKE_RECIPES: dict[str, tuple[tuple[str, str], ...]] = {
+            # KDA + dense only — the Round-3 passing baseline.
+            "kda-dense": (("linear_attention", "dense"),),
+            # Adds the 288-expert routed MoE, nothing else.
+            "kda-moe": (
+                ("linear_attention", "dense"),
+                ("linear_attention", "sparse"),
+            ),
+            # Adds the DSA indexer + sparse attention, nothing else.
+            "dsa-dense": (
+                ("linear_attention", "dense"),
+                ("deepseek_sparse_attention", "dense"),
+            ),
+            # The real layer-0..3 prefix: all three kernels in one graph.
+            "full": (
+                ("linear_attention", "dense"),
+                ("linear_attention", "dense"),
+                ("linear_attention", "dense"),
+                ("deepseek_sparse_attention", "sparse"),
+            ),
+        }
+
+        @classmethod
+        def build_recipe_smoke_config(
+            cls,
+            source_config: Glm53FlashInferenceConfig,
+            *,
+            recipe: str,
+            tp_degree: int = 16,
+            ctx_batch_size: int = 1,
+            tkg_batch_size: int = 1,
+            seq_len: int = 128,
+            **extra_neuron_kwargs: Any,
+        ) -> "Glm53FlashNeuronInferenceConfig":
+            """Reduced config for one named layer recipe (see ``SMOKE_RECIPES``).
+
+            Exists so a trace failure can be attributed to a *specific* bound
+            kernel instead of to "the 4-layer smoke".  Every recipe keeps the
+            frozen architecture constants (vocab, hidden, expert count, head
+            dims); only the layer stack shortens.
+            """
+            if recipe not in cls.SMOKE_RECIPES:
+                raise ValueError(
+                    f"unknown smoke recipe {recipe!r}; "
+                    f"have {sorted(cls.SMOKE_RECIPES)}"
+                )
+            stack = cls.SMOKE_RECIPES[recipe]
+            reduced = copy.deepcopy(source_config)
+            fields_dict = {
+                name: getattr(reduced, name)
+                for name in reduced.__dataclass_fields__
+            }
+            fields_dict["allow_reduced_shapes"] = True
+            fields_dict["num_hidden_layers"] = len(stack)
+            fields_dict["layer_types"] = tuple(a for a, _ in stack)
+            fields_dict["mlp_layer_types"] = tuple(m for _, m in stack)
+            fields_dict["indexer_types"] = ("full",) * len(stack)
+            linear = copy.deepcopy(reduced.linear_attn_config)
+            linear.kda_layers = tuple(
+                i for i, (a, _) in enumerate(stack) if a == "linear_attention"
+            )
+            linear.full_attn_layers = tuple(
+                i
+                for i, (a, _) in enumerate(stack)
+                if a == "deepseek_sparse_attention"
+            )
+            fields_dict["linear_attn_config"] = linear
+            slim = Glm53FlashInferenceConfig(**fields_dict)
+            return cls.build_inference_config(
+                slim,
+                tp_degree=tp_degree,
+                ctx_batch_size=ctx_batch_size,
+                tkg_batch_size=tkg_batch_size,
+                seq_len=seq_len,
+                **extra_neuron_kwargs,
             )
 
         @classmethod

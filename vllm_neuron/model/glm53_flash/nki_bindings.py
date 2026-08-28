@@ -334,6 +334,138 @@ def dsa_attend_from_scores(
     )
 
 
+def dsa_traceability_parity_check(*, seed: int = 3) -> dict[str, float]:
+    """Assert the Round-4 traceability edit to the DSA golden changed nothing.
+
+    Round 4 made three ``if all_neg_inf.any():`` guards in
+    ``dsa_lightning_indexer.dsa_sparse_attention_forward`` unconditional.
+    ``Tensor.any()`` inside a Python ``if`` forces the tracer to materialise a
+    data-dependent bool, which torch_neuronx reports as ``Unknown custom-call
+    API version enum value: 0 (API_VERSION_UNSPECIFIED)`` — the DSA graph could
+    not be lowered at all with the guards in place.
+
+    The edit is argued to be exact (a ``masked_fill`` under an ``.any()`` guard
+    is a no-op when the mask is all-False; the first guard's body was ``pass``).
+    Rather than take that argument on faith, this reconstructs the **pre-edit**
+    function by textually re-inserting the two guards into the golden's own
+    source, executes it as a separate module, and compares the two
+    implementations directly on identical inputs — including the degenerate
+    fully-masked row the guards exist for.  Anything other than bit-exact
+    agreement is a failure.
+
+    Comparing against ``full_attention_reference`` instead would be the wrong
+    test: the sparse gather sums the same terms in a different order, so it
+    differs from the dense path by fp32 reassociation (measured 1.2e-07) even
+    when the edit is a perfect no-op.
+    """
+    import types as _types
+
+    golden = load_reference_kernel("dsa")
+    source_path = getattr(golden, "__file__", None)
+    if not source_path:
+        raise RuntimeError("DSA golden has no __file__; cannot reconstruct it")
+    with open(source_path, encoding="utf-8") as handle:
+        source = handle.read()
+
+    patches = [
+        (
+            "    out = out.masked_fill(all_neg_inf.view(B, Q, 1, 1), 0.0)\n",
+            "    if all_neg_inf.any():\n"
+            "        out = out.masked_fill(all_neg_inf.view(B, Q, 1, 1), 0.0)\n",
+        ),
+        (
+            "        lse = lse.masked_fill(\n"
+            "            all_neg_inf.unsqueeze(-1),\n"
+            '            float("-inf"),\n'
+            "        )\n",
+            "        if all_neg_inf.any():\n"
+            "            lse = lse.masked_fill(\n"
+            "                all_neg_inf.unsqueeze(-1),\n"
+            '                float("-inf"),\n'
+            "            )\n",
+        ),
+    ]
+    restored = source
+    for before, after in patches:
+        if before not in restored:
+            raise AssertionError(
+                "cannot reconstruct the pre-Round-4 DSA golden: expected to "
+                f"find the unconditional form\n{before!r}\nin {source_path}. "
+                "The golden has drifted; re-derive this check rather than "
+                "skipping it."
+            )
+        restored = restored.replace(before, after, 1)
+
+    import sys as _sys
+
+    pre = _types.ModuleType("dsa_lightning_indexer_pre_round4")
+    pre.__file__ = source_path
+    # `@dataclass` resolves `sys.modules[cls.__module__]` while processing the
+    # class, so the module must be registered before exec or every dataclass in
+    # the golden dies with "'NoneType' object has no attribute '__dict__'".
+    _sys.modules[pre.__name__] = pre
+    try:
+        exec(
+            compile(restored, source_path + "<pre-round4>", "exec"),
+            pre.__dict__,
+        )
+    finally:
+        _sys.modules.pop(pre.__name__, None)
+
+    torch.manual_seed(seed)
+    batch, q_len, heads, dim, ctx = 2, 3, 2, 8, 5
+    query = torch.randn(batch, q_len, heads, dim, dtype=torch.float32)
+    key = torch.randn(batch, ctx, heads, dim, dtype=torch.float32)
+    value = torch.randn(batch, ctx, heads, dim, dtype=torch.float32)
+    position_ids = torch.arange(q_len).unsqueeze(0).expand(batch, -1) + (
+        ctx - q_len
+    )
+    indices = (
+        torch.arange(ctx, dtype=torch.int32)
+        .view(1, 1, ctx)
+        .expand(batch, q_len, ctx)
+        .contiguous()
+    )
+
+    errors: dict[str, float] = {}
+    for label, lengths in (
+        ("normal", torch.full((batch,), ctx, dtype=torch.int64)),
+        ("fully_masked_row0", torch.tensor([0, ctx], dtype=torch.int64)),
+    ):
+        args = (query, key, value, indices, position_ids, lengths)
+        kwargs = dict(topk=ctx, causal=True, return_lse=True)
+        new_out, new_lse = golden.dsa_sparse_attention_forward(*args, **kwargs)
+        old_out, old_lse = pre.dsa_sparse_attention_forward(*args, **kwargs)
+        out_err = float((new_out - old_out).abs().max())
+        # -inf - -inf is NaN, so compare LSE by exact equality instead.
+        lse_same = bool(torch.equal(new_lse, old_lse))
+        errors[f"{label}_out_max_abs_err"] = out_err
+        errors[f"{label}_lse_identical"] = 1.0 if lse_same else 0.0
+        if out_err != 0.0 or not lse_same:
+            raise AssertionError(
+                f"Round-4 DSA traceability edit changed behaviour in the "
+                f"{label!r} case: max |out| difference {out_err}, "
+                f"lse identical {lse_same}. The edit is NOT a no-op."
+            )
+
+    # The guard must still actually fire, or the comparison above would be
+    # vacuously satisfied by two equally-broken implementations.
+    lengths = torch.tensor([0, ctx], dtype=torch.int64)
+    out, lse = golden.dsa_sparse_attention_forward(
+        query, key, value, indices, position_ids, lengths,
+        topk=ctx, causal=True, return_lse=True,
+    )
+    errors["fully_masked_row_max_abs_out"] = float(out[0].abs().max())
+    if errors["fully_masked_row_max_abs_out"] != 0.0 or not bool(
+        torch.isneginf(lse[0]).all()
+    ):
+        raise AssertionError(
+            "the fully-masked-row guard does not fire in either "
+            "implementation, so the parity comparison proves nothing"
+        )
+    return errors
+
+
 def dsa_sparse_forward(
     query: torch.Tensor,           # [B, Q, H, D]
     indexer_q_proj: torch.Tensor,  # [H_idx, H*D, D_idx]
@@ -445,7 +577,9 @@ def glm53_route(
     selection = scores
     if correction_bias is not None:
         selection = scores + correction_bias.to(torch.float32)
-    indices = torch.topk(selection, k=top_k, dim=-1, sorted=False).indices
+    # `sorted=True` (default) — see `glm53_route_affinities`: `sorted=False`
+    # lowers to an unsupported `sort` on trn2.
+    _values, indices = torch.topk(selection, k=top_k, dim=-1)
     indices = indices.to(torch.int64)
     weights = torch.gather(scores, -1, indices)
     if norm_topk_prob:
@@ -454,6 +588,68 @@ def glm53_route(
         )
     weights = weights * routed_scaling_factor
     return indices, weights
+
+
+def glm53_route_affinities(
+    hidden_states: torch.Tensor,   # [B, L, hidden] or [T, hidden]
+    router_weight: torch.Tensor,   # [num_experts, hidden]
+    *,
+    top_k: int,
+    scoring_func: str,
+    correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GLM routing in the shape contract NxDI's ``ExpertMLPs`` expects.
+
+    ``ExpertMLPs.forward`` wants ``(expert_affinities[T, E], expert_index[T,
+    top_k])`` — the *full-width* per-expert score vector, not the gathered
+    top-k weights.  It then builds the top-k mask itself
+    (``get_expert_mask``), masks the affinities to the selected experts, and —
+    when ``normalize_top_k_affinities=True`` — L1-normalizes across them
+    (``get_expert_affinities_masked``).  That reproduces GLM's
+    ``norm_topk_prob`` exactly, so this function must NOT pre-normalize.
+
+    Two GLM specifics that survive the handoff:
+
+    * The learned correction bias moves *which* experts win top-k but must
+      never leak into the weights, so it is added to the selection score only
+      and the returned affinities are the raw sigmoid scores.
+    * ``routed_scaling_factor`` is deliberately NOT applied here.  Applying it
+      before ``ExpertMLPs`` would be cancelled by the L1 normalize.  Because
+      the expert combination ``sum_e a_e * MLP_e(x)`` is linear in ``a``,
+      scaling the *output* by the same constant is exactly equivalent — the
+      caller does that after ``ExpertMLPs`` returns.
+
+    Returns ``(affinities[T, E] fp32, expert_index[T, top_k] int64)``.
+    """
+    if scoring_func != "sigmoid":
+        raise NotImplementedError(
+            f"GLM-5.3-Flash router scoring_func={scoring_func!r}; only "
+            "'sigmoid' is qualified. Refusing to guess a softmax equivalent."
+        )
+    hidden = hidden_states.shape[-1]
+    flat = hidden_states.reshape(-1, hidden)
+    logits = F.linear(flat.to(torch.float32), router_weight.to(torch.float32))
+    scores = torch.sigmoid(logits)                      # [T, E]
+    selection = scores
+    if correction_bias is not None:
+        selection = scores + correction_bias.to(torch.float32)
+    # `sorted=True` (the default) is REQUIRED, not a preference.  With
+    # `sorted=False` torch_xla lowers top-k to a full `sort`, and neuronx-cc
+    # rejects it:
+    #   [NCC_EVRF029] Operation sort is not supported on trn2. Use supported
+    #   equivalent operation like TopK ...
+    # That is how the first Round-4 KDA+MoE TKG graph failed (neuronx-cc exit
+    # 70).  Every in-tree NxDI router calls `torch.topk` at the default
+    # `sorted=True` for the same reason.  The order of the returned indices is
+    # irrelevant here: `ExpertMLPs` turns them into a top-k-hot mask over the
+    # expert axis, and the expert combination is a sum.
+    # Unpack positionally rather than via `.indices`: under torch_neuronx's
+    # profiler `__torch_dispatch__` wrapper, `torch.topk` returns a plain list
+    # instead of a `return_types.topk` namedtuple, and attribute access fails
+    # with "'list' object has no attribute 'indices'".  Tuple unpacking works
+    # for both.
+    _values, indices = torch.topk(selection, k=top_k, dim=-1)
+    return scores, indices.to(torch.int64)
 
 
 def moe_gather_dispatch_torch(
@@ -523,7 +719,9 @@ __all__ = [
     "dsa_attend_from_scores",
     "dsa_scores_from_qidx",
     "dsa_sparse_forward",
+    "dsa_traceability_parity_check",
     "glm53_route",
+    "glm53_route_affinities",
     "kda_delta_step_torch",
     "kda_reference_parity_check",
     "kda_state_forward_torch",
