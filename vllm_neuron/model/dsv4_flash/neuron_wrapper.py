@@ -260,6 +260,498 @@ FORBIDDEN_FP8_KV_KEYS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Partial-RoPE helpers — CPU-portable pure-torch, ship in both NxDI and
+# CPU-only paths.  Source-cited against transformers 5.15.1
+# `deepseek_v4/modeling_deepseek_v4.py` @ HF SHA
+# `7872f01b1d1fe23eabc4c98b48bffcef5a386062`.
+# ---------------------------------------------------------------------------
+
+
+def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the interleaved even/odd pairs by 90 degrees.
+
+    Source-cited byte-for-byte against ``modeling_deepseek_v4.py:335-339``
+    (``def rotate_half``): given ``x`` with trailing dim ``d``, take
+    ``x1 = x[..., 0::2]``, ``x2 = x[..., 1::2]``, then interleave
+    ``stack((-x2, x1), dim=-1).flatten(-2)`` — i.e. every even index i gets
+    ``-x[..., i+1]`` and every odd index i+1 gets ``x[..., i]``.
+
+    This is DIFFERENT from Llama-style RoPE's ``rotate_half`` which splits
+    the head into two contiguous halves.  DeepSeek-V4 uses INTERLEAVED
+    pairs, so the ``inv_freq`` table only has ``rope_dim/2`` unique
+    entries — the ``repeat_interleave(2)`` inside :func:`apply_partial_rope`
+    is the mirror-image expansion that keeps the pair-wise rotation math
+    aligned.
+    """
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def apply_partial_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    """DeepSeek-V4 partial-RoPE applied to the trailing rope slice of ``x``.
+
+    Source-cited byte-for-byte against ``modeling_deepseek_v4.py:342-359``
+    (``def apply_rotary_pos_emb``).  ``cos`` / ``sin`` come in HALF-SIZED
+    (one entry per interleaved pair, from
+    ``DeepseekV4RotaryEmbedding.forward``).  This helper expands them to
+    the full rope dim with ``repeat_interleave(2, dim=-1)``, unsqueezes a
+    head-broadcast axis at ``unsqueeze_dim``, then rotates the last
+    ``2 * cos.shape[-1]`` channels of ``x`` with the standard
+    ``x*cos + rotate_half_interleaved(x)*sin`` formula in fp32 (up-cast to
+    keep the rotation numerically stable for bf16 inputs) and leaves the
+    leading NoPE channels untouched.
+
+    V4-Flash lays each head out as ``[nope | rope]`` with
+    ``rope_dim = 2 * cos.shape[-1] = qk_rope_head_dim = 64`` of
+    ``head_dim = 512``, matching the reference's ``x[..., -rd:]`` indexing.
+
+    Note the DIRECTION of ``sin``: the reference calls this same helper
+    on the ATTENTION OUTPUT with ``sin`` negated (``-sin``) so that the
+    contribution of each KV entry stays a function of the RELATIVE
+    distance between the query and the KV entry (paper eq. 26).  Callers
+    that need the conjugate rotation pass ``-sin`` explicitly here.
+    """
+    cos_expanded = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+    sin_expanded = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+    rope_dim = cos_expanded.shape[-1]
+    if x.shape[-1] < rope_dim:
+        raise ValueError(
+            f"apply_partial_rope: input trailing dim {x.shape[-1]} is smaller "
+            f"than rope_dim {rope_dim} — refusing to rotate a slice that "
+            "does not exist."
+        )
+    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    rotated = (
+        (rope.float() * cos_expanded)
+        + (_rotate_half_interleaved(rope).float() * sin_expanded)
+    ).to(x.dtype)
+    return torch.cat([nope, rotated], dim=-1)
+
+
+def build_main_rope_cos_sin(
+    positions: torch.Tensor,
+    *,
+    rope_dim: int,
+    rope_theta: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute half-sized (cos, sin) for DeepSeek-V4 main RoPE.
+
+    Source-cited against ``modeling_deepseek_v4.py:114-149``
+    (``compute_default_rope_parameters`` — the "main" branch, rope_type
+    defaults to "default" with no yarn scaling) and lines 151-168
+    (``DeepseekV4RotaryEmbedding.forward``).
+
+    ``positions`` has shape ``[B, S]``; the returned ``cos`` / ``sin`` have
+    shape ``[B, S, rope_dim // 2]`` — HALF-SIZED because DSv4 uses
+    interleaved pairs (one θ per pair).  :func:`apply_partial_rope` does
+    the ``repeat_interleave(2)`` expansion inside the rotation math.
+
+    ``rope_dim`` for V4-Flash main rope is
+    ``head_dim * partial_rotary_factor = 512 * 64/512 = 64``.
+    ``rope_theta`` for main-rope layers (``sliding_attention``) is
+    ``10000.0`` — CSA/HCA layers use the yarn-scaled "compress" rope with
+    ``rope_theta = 160000.0`` (see
+    ``config.DeepseekV4RopeScalingConfig``), for which a caller should
+    reach for a distinct helper (deferred to the CSA/HCA blocks).
+    """
+    if rope_dim <= 0 or rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim must be positive and even, got {rope_dim}")
+    if positions.ndim != 2:
+        raise ValueError(f"positions must be [B, S]; got shape {tuple(positions.shape)}")
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (
+            torch.arange(0, rope_dim, 2, dtype=torch.int64, device=positions.device)
+            .to(torch.float32)
+            / rope_dim
+        )
+    )  # [rope_dim/2]
+    inv_freq_expanded = (
+        inv_freq[None, :, None].expand(positions.shape[0], -1, 1)
+    )  # [B, rope_dim/2, 1]
+    positions_expanded = positions[:, None, :].to(torch.float32)  # [B, 1, S]
+    freqs = (inv_freq_expanded @ positions_expanded).transpose(1, 2)  # [B, S, rope_dim/2]
+    return freqs.cos().to(dtype), freqs.sin().to(dtype)
+
+
+def _weighted_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """DeepseekV4RMSNorm (weighted).
+
+    Cited against ``modeling_deepseek_v4.py:55-60`` — cast to fp32, divide
+    by rsqrt(mean(square) + eps), scale by weight, cast back to input
+    dtype.
+    """
+    input_dtype = x.dtype
+    value = x.to(torch.float32)
+    variance = value.pow(2).mean(-1, keepdim=True)
+    value = value * torch.rsqrt(variance + eps)
+    return weight * value.to(input_dtype)
+
+
+def _unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """DeepseekV4UnweightedRMSNorm.
+
+    Cited against ``modeling_deepseek_v4.py:66-72`` — pointwise
+    ``x * rsqrt(mean(x**2) + eps)`` with fp32 stats, output in input
+    dtype.  Applied to Q AFTER Q_B (per-head, over head_dim) and BEFORE
+    partial RoPE.
+    """
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
+
+
+class _MQABlock(nn.Module):
+    """Shared K=V Multi-Query Attention block for DeepSeek-V4-Flash.
+
+    Owns everything the ``layers.<i>.attn.*`` subtree holds (verified
+    against ``model.safetensors.index.json`` for HF snapshot
+    ``deepseek-ai/DeepSeek-V4-Flash-0731 @
+    7872f01b1d1fe23eabc4c98b48bffcef5a386062``):
+
+      * ``wq_a.weight`` [q_lora_rank, hidden_size]     (FP8-e4m3 on disk;
+                                                        dequant to bf16)
+      * ``wq_b.weight`` [num_heads * head_dim, q_lora_rank] (FP8→bf16)
+      * ``q_norm.weight`` [q_lora_rank]                (bf16 — the
+                                                        transformers name
+                                                        ``q_a_norm``)
+      * ``wkv.weight`` [head_dim, hidden_size]         (FP8→bf16;
+                                                        SHARED K=V single
+                                                        head)
+      * ``kv_norm.weight`` [head_dim]                  (bf16)
+      * ``wo_a.weight`` [o_groups * o_lora_rank,
+                         (num_heads * head_dim) // o_groups]  (FP8→bf16)
+      * ``wo_b.weight`` [hidden_size, o_groups * o_lora_rank]  (FP8→bf16)
+      * ``attn_sink`` [num_heads]                      (bf16 — per-head
+                                                        learnable logit)
+
+    Forward (source-cited byte-for-byte against
+    ``modeling_deepseek_v4.py:801-873``, the ``DeepseekV4Attention.forward``):
+
+      1. Q = ``rms_norm(wq_a @ x, q_norm) → wq_b →
+              view as [B, H, S, D] → unweighted_rms_norm (per-head, over D)
+              → partial_rope(cos, sin)``.
+      2. KV = ``rms_norm(wkv @ x, kv_norm) →
+              view as [B, 1, S, D] → partial_rope(cos, sin)``.
+              Single KV head; broadcast to all Q heads at attention time.
+      3. Attention with per-head sink (``eager_attention_forward``, lines
+         717-745): scale = ``1/sqrt(head_dim)``; scores = ``Q @ K^T *
+         scale + mask``; concat per-head sinks ``[B, H, S, 1]``; subtract
+         per-row max for BF16 stability; softmax over the extended
+         ``S_kv + 1`` axis; drop the sink column; multiply by V.
+      4. Undo K-side RoPE at the query position by re-applying partial
+         RoPE with sin negated on the attention output's rope slice
+         (line 868 — the paper's eq. 26 conjugate rotation that makes
+         K=V's contribution a relative-distance function).
+      5. Grouped output projection (``DeepseekV4GroupedLinear``, lines
+         303-332): reshape ``[B, S, H, D]`` as ``[B, S, o_groups,
+         num_heads * head_dim / o_groups]``, apply the block-diagonal
+         group-wise linear ``wo_a`` viewed as
+         ``[o_groups, o_lora_rank, (num_heads * head_dim / o_groups)]``,
+         flatten the last two dims to ``[B, S, o_groups * o_lora_rank]``,
+         then the plain linear ``wo_b`` to hidden_size.
+
+    Layer-role and cache: sliding_attention layers (0, 1, 40, 41, 42) use
+    just this block (composed by :class:`_SlidingOnlyAttentionBlock`);
+    compressed_sparse_attention layers (Round-2 :class:`_CSABlock`) and
+    heavily_compressed_attention layers (Round-2 :class:`_HCABlock`) call
+    :meth:`project_q_kv` and :meth:`attend_and_project` while inserting
+    their compressor's ``[B, 1, T_compressed, head_dim]`` KV entries
+    between the two.  The MQA block itself never sees a cache.
+
+    TP: this class stores parameters as plain ``nn.Parameter`` so it is
+    CPU-testable (the byte-clean 1-tensor smoke lives at
+    ``tests/test_mqa_1tensor.py``).  When NxDI is available a compile-time
+    integration hook (deferred to the CSA/HCA blocks' NEFF wiring) may
+    swap the ``nn.Parameter`` bearings for ColumnParallel/RowParallel
+    primitives with the same on-disk key names; the plain-tensor forward
+    stays as the CPU reference against which the compile-time forward is
+    gated.
+    """
+
+    # State-dict spelling under this module — matches HF layer subtree
+    # verbatim.  Kept as a class attribute so the converter and the test
+    # can share the list of names.
+    PARAM_KEYS: tuple[str, ...] = (
+        "wq_a.weight",
+        "wq_b.weight",
+        "q_norm.weight",
+        "wkv.weight",
+        "kv_norm.weight",
+        "wo_a.weight",
+        "wo_b.weight",
+        "attn_sink",
+    )
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        src = getattr(config, "source_config", None)
+        if src is None:
+            # Allow raw DeepseekV4FlashInferenceConfig too — the CPU smoke
+            # test does not need the NxDI InferenceConfig wrapping.
+            src = config
+        self.layer_idx = layer_idx
+        self.hidden_size = int(src.hidden_size)
+        self.num_heads = int(src.num_attention_heads)
+        self.num_kv_heads = int(src.num_key_value_heads)
+        self.head_dim = int(src.head_dim)
+        self.q_lora_rank = int(src.q_lora_rank)
+        self.qk_rope_head_dim = int(src.qk_rope_head_dim)
+        self.o_groups = int(src.o_groups)
+        self.o_lora_rank = int(src.o_lora_rank)
+        self.rms_eps = float(src.rms_norm_eps)
+        self.rope_theta = float(src.rope_theta)
+        self.scaling = self.head_dim ** -0.5
+        # DSv4-Flash freeze: single shared KV head; verify to fail loudly
+        # if a caller stripped that invariant off the frozen config.
+        if self.num_kv_heads != 1:
+            raise ValueError(
+                "_MQABlock is only valid for shared-KV MQA "
+                "(num_key_value_heads=1); got "
+                f"num_key_value_heads={self.num_kv_heads}"
+            )
+        # Grouped-output projection divisibility (fail loud, never guess).
+        if (self.num_heads * self.head_dim) % self.o_groups != 0:
+            raise ValueError(
+                f"grouped output projection requires num_heads*head_dim "
+                f"({self.num_heads * self.head_dim}) divisible by o_groups "
+                f"({self.o_groups})"
+            )
+        if self.o_lora_rank <= 0 or self.o_groups <= 0:
+            raise ValueError(
+                f"o_groups={self.o_groups}, o_lora_rank={self.o_lora_rank} "
+                "must be positive"
+            )
+        if self.qk_rope_head_dim <= 0 or self.qk_rope_head_dim > self.head_dim:
+            raise ValueError(
+                f"qk_rope_head_dim={self.qk_rope_head_dim} must be in "
+                f"(0, head_dim={self.head_dim}]"
+            )
+        if self.qk_rope_head_dim % 2 != 0:
+            raise ValueError(
+                f"qk_rope_head_dim={self.qk_rope_head_dim} must be even "
+                "(interleaved RoPE has one θ per pair)"
+            )
+        self._in_features_per_group = (self.num_heads * self.head_dim) // self.o_groups
+        dtype = getattr(config, "torch_dtype", None) or getattr(
+            getattr(config, "neuron_config", None), "torch_dtype", None
+        ) or src.torch_dtype
+        self._dtype = dtype
+
+        # Weights: stored as plain nn.Parameter so this class is CPU-portable
+        # (the smoke at tests/test_mqa_1tensor.py runs on a dev laptop
+        # without NxDI).  NxDI TP integration re-declares the same keys as
+        # ColumnParallel/RowParallel primitives at compile time; state-dict
+        # spelling is invariant across the two backings because both use
+        # trailing ``.weight``.
+        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False, dtype=dtype)
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype
+        )
+        self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        self.wo_a = nn.Linear(
+            self._in_features_per_group,
+            self.o_groups * self.o_lora_rank,
+            bias=False,
+            dtype=dtype,
+        )
+        self.wo_b = nn.Linear(
+            self.o_groups * self.o_lora_rank, self.hidden_size, bias=False, dtype=dtype
+        )
+        # RMSNorm gains — small, replicated across ranks under any TP.
+        self.q_norm = _MQANormParam(self.q_lora_rank, dtype)
+        self.kv_norm = _MQANormParam(self.head_dim, dtype)
+        # Per-head learnable sink (like GPT-OSS).  HF stores as
+        # ``layers.<i>.attn.attn_sink`` with shape ``[num_heads]``.
+        self.attn_sink = nn.Parameter(
+            torch.zeros(self.num_heads, dtype=dtype), requires_grad=False
+        )
+
+    # ------------------------------------------------------------------
+    # Reshape helpers — keep the block composable so _CSABlock / _HCABlock
+    # can splice compressor KV in without re-running Q or KV projections.
+    # ------------------------------------------------------------------
+
+    def project_q(
+        self, hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(q [B, H, S, D], q_residual [B, S, q_lora_rank])``.
+
+        ``q_residual`` is the post-Q_A + q_norm intermediate — the same
+        tensor the compressor's indexer contracts against for CSA layers
+        (paper §2.3.1).  Returning it lets ``_CSABlock`` share the Q_A
+        cost.  Matches ``modeling_deepseek_v4.py:816-819``.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_MQABlock expects [B, S, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        q_residual = _weighted_rms_norm(
+            self.wq_a(hidden_states), self.q_norm.weight, self.rms_eps
+        )
+        q_flat = self.wq_b(q_residual)                                       # [B, S, H*D]
+        q = q_flat.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        q = _unweighted_rms_norm(q, self.rms_eps)                            # per-head
+        q = apply_partial_rope(q, cos, sin)                                  # trailing rope slice
+        return q, q_residual
+
+    def project_kv(
+        self, hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the single-head KV tensor ``[B, 1, S, D]`` post-RoPE.
+
+        Shared K=V — the same tensor is read as both key and value in
+        :meth:`attend_and_project` (and :meth:`forward`).  Matches
+        ``modeling_deepseek_v4.py:821-822``.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                f"_MQABlock expects [B, S, hidden]; got shape "
+                f"{tuple(hidden_states.shape)}"
+            )
+        batch, seq, _ = hidden_states.shape
+        kv_flat = _weighted_rms_norm(
+            self.wkv(hidden_states), self.kv_norm.weight, self.rms_eps
+        )                                                                     # [B, S, D]
+        kv = kv_flat.view(batch, seq, 1, self.head_dim).transpose(1, 2)      # [B, 1, S, D]
+        kv = apply_partial_rope(kv, cos, sin)                                # SAME rope as Q
+        return kv
+
+    def attend_and_project(
+        self,
+        q: torch.Tensor,               # [B, H, S, D]
+        kv: torch.Tensor,              # [B, 1, T_kv, D] — SHARED K=V
+        cos: torch.Tensor,             # [B, S, rope_dim/2] — for the -sin conjugate on output
+        sin: torch.Tensor,             # [B, S, rope_dim/2]
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the attention math (with sink) + grouped output projection.
+
+        ``kv`` is [B, 1, T_kv, D] — a single KV head shared across all Q
+        heads (V4's MQA + shared K=V).  For CSA/HCA layers the caller
+        catenates compressor KV entries onto the ``T_kv`` axis BEFORE
+        calling this method (matching ``modeling_deepseek_v4.py:832``);
+        the compressor's ``block_bias`` should be catted onto
+        ``attention_mask`` in the same order.
+
+        Returns ``[B, S, hidden_size]`` — the ready-to-add-into-residual
+        block output.
+        """
+        batch, num_heads, seq, head_dim = q.shape
+        if head_dim != self.head_dim or num_heads != self.num_heads:
+            raise ValueError(
+                f"q shape {(batch, num_heads, seq, head_dim)} mismatches "
+                f"num_heads={self.num_heads}, head_dim={self.head_dim}"
+            )
+        if kv.shape[0] != batch or kv.shape[1] != 1 or kv.shape[-1] != head_dim:
+            raise ValueError(
+                f"kv shape {tuple(kv.shape)} must be [B={batch}, 1, T, D={head_dim}]"
+            )
+        t_kv = kv.shape[2]
+
+        # Broadcast the single KV head across the query heads.  We keep an
+        # explicit ``expand`` (no memory materialisation) rather than
+        # reshaping so the backward pass — should this class ever be
+        # trained — sees the correct grad-graph.  Same shape contract
+        # ``eager_attention_forward`` uses via ``repeat_kv``.
+        k = kv.expand(batch, num_heads, t_kv, head_dim)
+        v = k
+
+        # Attention scores + sink.  Scale is fp32-safe.
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [B, H, S, T_kv]
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        # Per-head sink participates in the softmax denominator, then is
+        # dropped from the weighted-value sum.  Matches
+        # ``eager_attention_forward`` (modeling_deepseek_v4.py:733-741).
+        sinks = self.attn_sink.reshape(1, num_heads, 1, 1).expand(batch, num_heads, seq, 1)
+        combined_logits = torch.cat([attn_scores, sinks.to(attn_scores.dtype)], dim=-1)
+        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+        attn_weights = probs[..., :-1]                                       # drop sink
+        attn_output = torch.matmul(attn_weights.to(v.dtype), v)              # [B, H, S, D]
+        attn_output = attn_output.transpose(1, 2).contiguous()               # [B, S, H, D]
+
+        # Undo K-side RoPE at the query position (paper eq. 26).  RoPE
+        # helper expects ``[B, S, H, D]`` (its ``unsqueeze_dim=1`` adds a
+        # head-broadcast axis to cos/sin).
+        attn_output = apply_partial_rope(attn_output, cos, -sin, unsqueeze_dim=2)
+
+        # Grouped output projection.  ``wo_a`` is stored as a plain
+        # ``nn.Linear`` with weight shape
+        # ``[o_groups * o_lora_rank, (num_heads * head_dim) / o_groups]``;
+        # DeepseekV4GroupedLinear (modeling_deepseek_v4.py:303-332) views
+        # it as ``[o_groups, o_lora_rank, in_per_group]`` and does a
+        # batched-matmul against grouped input.
+        input_shape = attn_output.shape[:-2]                                 # [B, S]
+        hidden_per_group = attn_output.shape[-1]                             # head_dim=512
+        # Reshape [B, S, H, D] → [B, S, o_groups, H*D/o_groups].
+        grouped_in = attn_output.reshape(*input_shape, self.o_groups, -1)    # [B, S, G, H*D/G]
+        # DeepseekV4GroupedLinear.forward viewed step-by-step:
+        w = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, self._in_features_per_group).transpose(1, 2)
+        # w now [G, in_per_group, o_lora_rank]
+        x = grouped_in.reshape(-1, self.o_groups, self._in_features_per_group).transpose(0, 1)
+        # x now [G, B*S, in_per_group]
+        y = torch.bmm(x, w).transpose(0, 1)                                  # [B*S, G, o_lora_rank]
+        grouped_out = y.reshape(*input_shape, self.o_groups, self.o_lora_rank)
+        # flatten the last two dims: [B, S, G*o_lora_rank]
+        grouped_out = grouped_out.flatten(2)
+        output = self.wo_b(grouped_out)                                      # [B, S, hidden]
+        del hidden_per_group  # only used for the shape-doc comment above
+        return output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Full MQA block forward for a sliding_attention layer.
+
+        Composes :meth:`project_q`, :meth:`project_kv`,
+        :meth:`attend_and_project`.  CSA/HCA layers wire the compressor
+        between project_kv and attend_and_project.
+        """
+        q, _q_residual = self.project_q(hidden_states, cos, sin)
+        kv = self.project_kv(hidden_states, cos, sin)
+        return self.attend_and_project(q, kv, cos, sin, attention_mask=attention_mask)
+
+
+class _MQANormParam(nn.Module):
+    """Trivial container so ``self.q_norm.weight`` matches the HF
+    state-dict spelling (``layers.<i>.attn.q_norm.weight``).
+
+    Kept intentionally minimal — no ``forward`` — because the RMSNorm math
+    is handled inline via :func:`_weighted_rms_norm` (identical to the way
+    ``glm53_flash/neuron_wrapper.py`` uses ``_rms_norm_weight`` +
+    ``_rms_norm``).
+    """
+
+    def __init__(self, hidden: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(hidden, dtype=dtype), requires_grad=False
+        )
+
+
 def _require_nxdi() -> None:
     if _NXDI_AVAILABLE:
         return
@@ -447,46 +939,6 @@ if _NXDI_AVAILABLE:
                     "produce wrong logits on every token."
                 ) from exc
             return x
-
-    class _MQABlock(nn.Module):
-        """Shared K=V MQA block — replaces GLM-5.3-Flash's `_NoPeMLABlock`.
-
-        DeepSeek-V4-Flash layout (paper §2.3 + transformers 5.15.1
-        DeepseekV4Attention):
-
-        * ``num_key_value_heads=1`` — one KV head shared across all 64
-          query heads.  ``kv_proj`` writes a single ``[hidden -> head_dim]``
-          projection that serves as BOTH K and V.
-        * ``q_lora_rank=1024`` — ``wq_a: [hidden, q_lora_rank]`` + norm +
-          ``wq_b: [q_lora_rank, num_heads * head_dim]``.
-        * Partial RoPE on ``qk_rope_head_dim=64`` of ``head_dim=512``
-          channels per head (12.5%), interleaved-pair, base
-          ``rope_theta=10000``.  Applied to query rope slice and key rope
-          slice.  Output rope slice rotated at position ``-i`` (paper eq. 26)
-          so the KV contribution stays a relative-distance function.
-        * Per-head learnable attention sink (``attn_sink``, paper eq. 27):
-          a constant logit that participates in the softmax denominator.
-        * Grouped Output Projection (o_groups=8, o_lora_rank=1024):
-          ``o_a: [num_heads * head_dim, o_groups * o_lora_rank]``
-          decomposed into 8 group-local ``[num_heads * head_dim,
-          o_lora_rank]`` blocks, followed by
-          ``o_b: [o_groups * o_lora_rank, hidden]``.
-
-        Sharded via ColumnParallel on the head axis for Q_A/Q_B and on
-        the group axis for o_a; RowParallel on o_b.
-        """
-
-        def __init__(self, config: Any, *, layer_idx: int) -> None:
-            super().__init__()
-            self.layer_idx = layer_idx
-            self._config = config
-            raise NotImplementedError(
-                "_MQABlock is Round 2.  Fields required at init time: partial-RoPE "
-                "geometry (qk_rope_head_dim=64/head_dim=512), per-head attention-sink "
-                "parameter shape [num_heads], grouped output projection axis order "
-                "(o_groups=8, o_lora_rank=1024).  See ENABLEMENT-DRAFT §2 for the "
-                "block-by-block delta vs _NoPeMLABlock."
-            )
 
     class _SlidingOnlyAttentionBlock(nn.Module):
         """Sliding-only attention (bootstrap layers 0, 1): window=128, no compressor."""
@@ -843,6 +1295,9 @@ __all__ = [
     "DeepseekV4FlashNeuronInferenceConfig",
     "FORBIDDEN_FP8_KV_KEYS",
     "NeuronDeepseekV4FlashForCausalLM",
+    "_MQABlock",
+    "apply_partial_rope",
+    "build_main_rope_cos_sin",
     "build_neuron_config",
     "dsv4_reference_router_forward",
     "dsv4_route_affinities",
