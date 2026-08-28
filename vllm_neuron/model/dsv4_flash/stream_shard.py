@@ -298,9 +298,11 @@ def stream_shard_dsv4_checkpoint(
     weights_dir = os.path.join(compiled_model_path, "weights")
     os.makedirs(weights_dir, exist_ok=True)
     weight_map = _load_hf_index(hf_model_path)
-    required = {"embed_tokens.weight", "norm.weight"}
+    # The pinned DeepSeek-V4 snapshot spells the top-level leaves `embed`
+    # and `head`; the converter emits the wrapper spellings below.
+    required = {"embed.weight", "norm.weight"}
     if not src.tie_word_embeddings:
-        required.add("lm_head.weight")
+        required.add("head.weight")
     missing = sorted(required - weight_map.keys())
     if missing:
         raise KeyError(f"HF index is missing required top-level keys: {missing}")
@@ -321,14 +323,14 @@ def stream_shard_dsv4_checkpoint(
     }
     try:
         top_state = _MmapState(weight_map, handles, {key for key in weight_map if not key.startswith("layers.")})
-        embed = top_state.get("embed_tokens.weight")
+        embed = top_state.get("embed.weight")
         final_norm = top_state.get("norm.weight")
-        lm_head = top_state.get("lm_head.weight")
+        lm_head = top_state.get("head.weight")
         if embed is None or final_norm is None:
-            raise KeyError("embed_tokens.weight and norm.weight are required")
+            raise KeyError("embed.weight and norm.weight are required")
         if lm_head is None:
             if not src.tie_word_embeddings:
-                raise KeyError("lm_head.weight is required when tie_word_embeddings=False")
+                raise KeyError("head.weight is required when tie_word_embeddings=False")
             lm_head = embed
 
         for rank in ranks_iter:
