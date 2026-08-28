@@ -1,5 +1,5 @@
 {
-  "contract_slug": "tp32-lnc2-b1c1-s4096-bf16-shard_intermediate-skip_dma-cont_batch",
+  "contract_slug": "tp16-lnc2-b1c1-s4096-bf16-shard_intermediate-skip_dma-cont_batch",
   "model": {
     "repo_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
@@ -8,7 +8,7 @@
     "container_digest": "public.ecr.aws/neuron/pytorch-inference-neuronx@sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1"
   },
   "compile": {
-    "tp": 32,
+    "tp": 16,
     "logical_nc_config": 2,
     "ctx_batch_size": 1,
     "tkg_batch_size": 1,
