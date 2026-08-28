@@ -182,5 +182,5 @@ def test_full_context_selection_bypasses_topk_and_preserves_all_positions() -> N
         position_ids=torch.tensor([[0], [0]]),
     )
 
-    expected = torch.arange(4, dtype=torch.int32).reshape(1, 1, 4).expand(2, -1, -1)
+    expected = torch.arange(4, dtype=torch.int64).reshape(1, 1, 4).expand(2, -1, -1)
     torch.testing.assert_close(indices, expected)

@@ -59,6 +59,10 @@ def select_glm52_experts(
             sorted=False,
         ).indices
 
+    # PR #13 fix: normalize every top-k backend's indices to signed int64
+    # immediately, before gather or any downstream narrowing.
+    expert_indices = expert_indices.to(torch.int64)
+
     routing_weights = torch.gather(router_scores, -1, expert_indices)
     routing_weights = routing_weights / routing_weights.sum(
         dim=-1,

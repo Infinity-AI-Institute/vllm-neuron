@@ -77,7 +77,9 @@ def test_neuron_backend_uses_rotational_topk_without_changing_semantics(
                 "rank": rank,
             }
         )
-        return torch.topk(tensor, k=k, dim=dim)
+        values, indices = torch.topk(tensor, k=k, dim=dim)
+        # Model the narrower index dtype returned by the Trn2 TopK lowering.
+        return values, indices.to(torch.int32)
 
     monkeypatch.setitem(
         sys.modules,
@@ -120,6 +122,7 @@ def test_neuron_backend_uses_rotational_topk_without_changing_semantics(
     ]
     torch.testing.assert_close(actual_indices, expected_indices)
     torch.testing.assert_close(actual_weights, expected_weights)
+    assert actual_indices.dtype is torch.int64
 
 
 def test_rejects_unknown_topk_backend() -> None:

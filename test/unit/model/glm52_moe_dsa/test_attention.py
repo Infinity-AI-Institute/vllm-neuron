@@ -58,7 +58,7 @@ def test_index_topk_excludes_future_when_k_fits_history() -> None:
         position_ids=position_ids,
     )
 
-    assert indices.dtype is torch.int32
+    assert indices.dtype is torch.int64
     assert set(indices[0, 0].tolist()) == {0, 1}
 
 
