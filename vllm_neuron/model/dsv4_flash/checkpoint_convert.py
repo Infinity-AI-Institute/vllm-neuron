@@ -711,6 +711,207 @@ def _convert_routed_moe_layer(
     return report
 
 
+# HF hash-MoE-specific keys.
+HASH_TID2EID_KEY = "ffn.gate.tid2eid"
+
+
+def _convert_hash_moe_block(
+    state_dict: dict[str, Any],
+    converted: dict[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    hf_prefix: str = "",
+    wrapper_prefix: str = "",
+    dtype: torch.dtype | None = None,
+) -> dict[str, Any]:
+    """Convert one DSv4-Flash hash-MoE bootstrap layer HF -> wrapper module tree.
+
+    Hash-MoE is the bootstrap MoE for layers ``[0, num_hash_layers)`` (the
+    first 3 layers of DSv4-Flash).  It replaces both the dense MLP AND the
+    routed-MoE that lands at layer 3 onwards.  Key differences from
+    :func:`_convert_routed_moe_layer`:
+
+      * Reads ``layers.<i>.ffn.gate.tid2eid`` — an ``int32`` lookup table of
+        shape ``[vocab_size, num_experts_per_tok]`` that selects the top-k
+        experts per input token id.  Frozen (``requires_grad=False`` in HF).
+        This tensor does NOT exist in routed-MoE layers.
+      * Does NOT read ``layers.<i>.ffn.gate.bias`` — HF sets
+        ``Gate.bias = None`` in hash mode (``inference/model.py`` line 565).
+        A checkpoint that carries such a key at a hash-MoE layer means the
+        layer schedule drifted between the config and the checkpoint; the
+        converter refuses loudly.
+      * Otherwise identical to :func:`_convert_routed_moe_layer`: same
+        router weight, same 1 + 256 shared/routed experts (FP4-UE8M0 at
+        block ``(1, 32)``), same fused ``[E, hidden, 2*I]`` /
+        ``[E, I, hidden]`` NxDI-shaped stacked output tensors.
+
+    Structure it produces (for one layer i under wrapper_prefix ""):
+
+      * ``layers.<i>.mlp.router.weight``                            fp32
+      * ``layers.<i>.mlp.tid2eid``                                  int32
+      * ``layers.<i>.mlp.shared_expert.gate_proj.weight``           dtype
+      * ``layers.<i>.mlp.shared_expert.up_proj.weight``             dtype
+      * ``layers.<i>.mlp.shared_expert.down_proj.weight``           dtype
+      * ``layers.<i>.mlp.expert_mlps.mlp_op.gate_up_proj.weight``   dtype
+            shape [n_routed_experts, hidden, 2*moe_intermediate_size]
+      * ``layers.<i>.mlp.expert_mlps.mlp_op.down_proj.weight``      dtype
+            shape [n_routed_experts, moe_intermediate_size, hidden]
+
+    Total: 7 wrapper-tree keys (same count as routed MoE — the swap is
+    ``tid2eid`` in place of ``e_score_correction_bias``).
+
+    Also stashes a per-layer conversion report under
+    ``_hash_moe_reports[layer_idx]`` on the ``converted`` dict for
+    debugging + smoke-test consumption.  The report includes the
+    ``tid2eid`` shape/dtype and per-expert stacked shapes.
+    """
+    dtype = dtype if dtype is not None else src.torch_dtype
+    if src.mlp_layer_types[layer_idx] != "hash_moe":
+        raise ValueError(
+            f"_convert_hash_moe_block called for layer {layer_idx} but "
+            f"mlp_layer_types[{layer_idx}]="
+            f"{src.mlp_layer_types[layer_idx]!r} — refusing to route a "
+            "non-hash-MoE layer through the hash-MoE converter (which would "
+            "silently drop the correction_bias needed by the routed router)."
+        )
+    hidden = src.hidden_size
+    inter = src.moe_intermediate_size
+    n_experts = src.n_routed_experts
+    top_k = src.num_experts_per_tok
+    vocab_size = src.vocab_size
+    block_fp8 = tuple(src.quantization_config.weight_block_size)
+
+    hf_base = f"{hf_prefix}layers.{layer_idx}."
+    target = f"{wrapper_prefix}layers.{layer_idx}.mlp."
+
+    # ---- router ----
+    router_key = f"{hf_base}{ROUTER_KEY}"
+    router = state_dict.get(router_key)
+    if router is None:
+        raise KeyError(f"missing router weight {router_key!r}")
+    if tuple(router.shape) != (n_experts, hidden):
+        raise ValueError(
+            f"router weight {router_key!r} shape {tuple(router.shape)} "
+            f"disagrees with expected ({n_experts}, {hidden})"
+        )
+    # Router lives in fp32 in the wrapper — cast at conversion so no cast
+    # is inserted at forward time.
+    converted[f"{target}router.weight"] = router.to(torch.float32)
+
+    # ---- tid2eid lookup ----
+    tid_key = f"{hf_base}{HASH_TID2EID_KEY}"
+    tid2eid = state_dict.get(tid_key)
+    if tid2eid is None:
+        raise KeyError(
+            f"missing tid2eid lookup {tid_key!r} — hash-MoE layer requires "
+            "the frozen [vocab_size, num_experts_per_tok] int32 lookup"
+        )
+    if tuple(tid2eid.shape) != (vocab_size, top_k):
+        raise ValueError(
+            f"tid2eid {tid_key!r} shape {tuple(tid2eid.shape)} disagrees "
+            f"with expected ({vocab_size}, {top_k})"
+        )
+    # Enforce int32 dtype for round-trip fidelity with HF.
+    if tid2eid.dtype != torch.int32:
+        raise ValueError(
+            f"tid2eid {tid_key!r} dtype {tid2eid.dtype!r} is not int32 — "
+            "hash-MoE lookup dtype drift would break the wrapper's frozen "
+            "buffer contract (HF stores it as int32 per model.py:564)"
+        )
+    # Refuse out-of-range expert indices (an off-by-one from a mis-encoded
+    # tid2eid would silently route every affected token to expert 0 or to
+    # a non-existent expert index).
+    tid_min = int(tid2eid.min().item())
+    tid_max = int(tid2eid.max().item())
+    if tid_min < 0 or tid_max >= n_experts:
+        raise ValueError(
+            f"tid2eid {tid_key!r} contains out-of-range expert indices "
+            f"[{tid_min}, {tid_max}] outside [0, {n_experts})"
+        )
+    converted[f"{target}tid2eid"] = tid2eid.contiguous().clone()
+
+    # ---- correction bias MUST be absent (hash mode) ----
+    bias_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
+    if state_dict.get(bias_key) is not None:
+        raise ValueError(
+            f"hash-MoE layer {layer_idx} carries {bias_key!r} but HF sets "
+            "Gate.bias=None in hash mode (model.py:565) — layer schedule "
+            "drift between config and checkpoint"
+        )
+
+    # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
+    _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
+
+    # ---- routed experts (FP4-UE8M0, block (1, 32)) ----
+    # Same layout as the routed-MoE per-layer helper — the two paths
+    # deliberately produce byte-compatible stacked tensors so a Round-6
+    # subclass can bind the SAME `_NxdExpertMLPs` bearing under both.
+    gate_stack: list[torch.Tensor] = []
+    up_stack: list[torch.Tensor] = []
+    down_stack: list[torch.Tensor] = []
+    for e in range(n_experts):
+        base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
+        gate = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w1.weight", dtype
+        )
+        up = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w3.weight", dtype
+        )
+        down = _dequant_expert_fp4_weight(
+            state_dict, f"{base_e}w2.weight", dtype
+        )
+        if tuple(gate.shape) != (inter, hidden):
+            raise ValueError(
+                f"expert {e} w1 (gate) shape {tuple(gate.shape)} != "
+                f"({inter}, {hidden}); layer {layer_idx}"
+            )
+        if tuple(up.shape) != (inter, hidden):
+            raise ValueError(
+                f"expert {e} w3 (up) shape {tuple(up.shape)} != "
+                f"({inter}, {hidden}); layer {layer_idx}"
+            )
+        if tuple(down.shape) != (hidden, inter):
+            raise ValueError(
+                f"expert {e} w2 (down) shape {tuple(down.shape)} != "
+                f"({hidden}, {inter}); layer {layer_idx}"
+            )
+        gate_stack.append(gate)
+        up_stack.append(up)
+        down_stack.append(down)
+
+    gate_stacked = torch.stack(gate_stack, dim=0)         # [E, I, H]
+    up_stacked = torch.stack(up_stack, dim=0)             # [E, I, H]
+    down_stacked = torch.stack(down_stack, dim=0)         # [E, H, I]
+    gate_up_stacked = torch.cat([gate_stacked, up_stacked], dim=1)  # [E, 2I, H]
+    gate_up_stacked = gate_up_stacked.transpose(1, 2).contiguous()  # [E, H, 2I]
+    down_stacked = down_stacked.transpose(1, 2).contiguous()        # [E, I, H]
+
+    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = (
+        gate_up_stacked
+    )
+    converted[f"{target}expert_mlps.mlp_op.down_proj.weight"] = down_stacked
+
+    report = {
+        "layer_idx": layer_idx,
+        "layer_type": "hash_moe",
+        "n_routed_experts": n_experts,
+        "num_experts_per_tok": top_k,
+        "vocab_size": vocab_size,
+        "hidden": hidden,
+        "moe_intermediate": inter,
+        "gate_up_shape": tuple(gate_up_stacked.shape),
+        "down_shape": tuple(down_stacked.shape),
+        "tid2eid_shape": tuple(tid2eid.shape),
+        "tid2eid_dtype": str(tid2eid.dtype),
+        "dtype": str(dtype),
+        "block_size_fp4": DSV4_FP4_BLOCK_SIZE,
+        "block_size_fp8_shared": block_fp8,
+    }
+    converted.setdefault("_hash_moe_reports", {})[layer_idx] = report
+    return report
+
+
 ATTN_PREFIX = "attn."
 ATTN_NORM_KEY = "attn_norm.weight"
 # MQA-block-owned parameter names (mirror of `_MQABlock.PARAM_KEYS` in
@@ -1404,6 +1605,7 @@ __all__ = [
     "EXPECTED_HF_TOTAL_SIZE_BYTES",
     "FFN_PREFIX",
     "FINAL_NORM_KEY",
+    "HASH_TID2EID_KEY",
     "HC_PARAM_SUFFIXES",
     "LM_HEAD_KEY",
     "ROUTED_EXPERTS_SUBTREE",
@@ -1422,6 +1624,7 @@ __all__ = [
     "_MQA_FP8_WEIGHT_NAMES",
     "_convert_csa_block",
     "_convert_dsv4_checkpoint",
+    "_convert_hash_moe_block",
     "_convert_hca_block",
     "_convert_mqa_block",
     "_convert_routed_moe_layer",
