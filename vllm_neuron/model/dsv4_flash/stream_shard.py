@@ -179,7 +179,15 @@ def _wrapper_key(key: str) -> str:
     return key
 
 
-def _convert_one_layer(state: Mapping[str, torch.Tensor], layer_idx: int, src: DeepseekV4FlashInferenceConfig) -> dict[str, torch.Tensor]:
+def _convert_one_layer(
+    state: Mapping[str, torch.Tensor],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    expert_chunk_size: int = 8,
+    rank: int | None = None,
+    tp_degree: int | None = None,
+) -> dict[str, torch.Tensor]:
     layer_state = dict(state)
     layer_type = src.layer_types[layer_idx]
     if layer_type == "sliding_attention":
@@ -197,12 +205,62 @@ def _convert_one_layer(state: Mapping[str, torch.Tensor], layer_idx: int, src: D
         raise KeyError(f"missing {ffn_norm_key!r}")
     converted[ffn_norm_key] = ffn_norm.to(src.torch_dtype)
     mlp_type = src.mlp_layer_types[layer_idx]
-    if mlp_type == "hash_moe":
-        _convert_hash_moe_block(layer_state, converted, layer_idx, src)
-    elif mlp_type == "moe":
-        _convert_routed_moe_layer(layer_state, converted, layer_idx, src)
-    else:  # pragma: no cover
+    if mlp_type not in {"hash_moe", "moe"}:
         raise ValueError(f"unsupported MLP layer type {mlp_type!r} at {layer_idx}")
+    if expert_chunk_size <= 0:
+        raise ValueError(f"expert_chunk_size must be positive; got {expert_chunk_size}")
+
+    # Dequantize only a small expert group at a time.  The converter's normal
+    # full-layer path is retained for CPU correctness tests; this path keeps
+    # peak host memory bounded while producing the same fused [E,H,2I] and
+    # [E,I,H] tensors for the selected rank.
+    expert_key = (
+        f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+    )
+    down_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"
+    gate_chunks: list[torch.Tensor] = []
+    down_chunks: list[torch.Tensor] = []
+    for start in range(0, src.n_routed_experts, expert_chunk_size):
+        indices = list(
+            range(start, min(start + expert_chunk_size, src.n_routed_experts))
+        )
+        partial: dict[str, Any] = {}
+        if mlp_type == "hash_moe":
+            _convert_hash_moe_block(
+                layer_state,
+                partial,
+                layer_idx,
+                src,
+                expert_indices=indices,
+            )
+        else:
+            _convert_routed_moe_layer(
+                layer_state,
+                partial,
+                layer_idx,
+                src,
+                expert_indices=indices,
+            )
+        gate_chunk = partial.pop(expert_key)
+        down_chunk = partial.pop(down_key)
+        if rank is not None or tp_degree is not None:
+            if rank is None or tp_degree is None:
+                raise ValueError("rank and tp_degree must be provided together")
+            gate_chunk = _target_shard(expert_key, gate_chunk, rank, tp_degree)
+            down_chunk = _target_shard(down_key, down_chunk, rank, tp_degree)
+        gate_chunks.append(gate_chunk)
+        down_chunks.append(down_chunk)
+        if start == 0:
+            converted.update(partial)
+        elif partial:
+            raise RuntimeError(
+                "chunked DSv4 expert conversion emitted unexpected duplicate "
+                f"keys at layer {layer_idx}: {sorted(partial)}"
+            )
+        del partial
+        gc.collect()
+    converted[expert_key] = torch.cat(gate_chunks, dim=0).contiguous()
+    converted[down_key] = torch.cat(down_chunks, dim=0).contiguous()
     return {
         _wrapper_key(key): value
         for key, value in converted.items()
@@ -283,9 +341,27 @@ def stream_shard_dsv4_checkpoint(
             for layer_idx in range(src.num_hidden_layers):
                 layer_keys = {key for key in weight_map if key.startswith(f"layers.{layer_idx}.")}
                 state = _MmapState(weight_map, handles, layer_keys)
-                converted = _convert_one_layer(state, layer_idx, src)
+                converted = _convert_one_layer(
+                    state,
+                    layer_idx,
+                    src,
+                    rank=rank,
+                    tp_degree=tp_degree,
+                )
                 report["peak_layer_key_count"] = max(report["peak_layer_key_count"], len(converted))
-                rank_dict.update({key: _target_shard(key, value, rank, tp_degree) for key, value in converted.items()})
+                rank_dict.update(
+                    {
+                        key: value
+                        if key.endswith(
+                            (
+                                "expert_mlps.mlp_op.gate_up_proj.weight",
+                                "expert_mlps.mlp_op.down_proj.weight",
+                            )
+                        )
+                        else _target_shard(key, value, rank, tp_degree)
+                        for key, value in converted.items()
+                    }
+                )
                 del converted, state
                 gc.collect()
             output_path = os.path.join(weights_dir, f"tp{rank}_sharded_checkpoint.safetensors")

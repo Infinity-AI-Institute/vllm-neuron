@@ -548,6 +548,7 @@ def _convert_routed_moe_layer(
     hf_prefix: str = "",
     wrapper_prefix: str = "",
     dtype: torch.dtype | None = None,
+    expert_indices: range | list[int] | None = None,
 ) -> dict[str, Any]:
     """Convert one DSv4-Flash routed-MoE layer HF -> wrapper module tree.
 
@@ -648,10 +649,11 @@ def _convert_routed_moe_layer(
     # 288-expert case because DSv4's moe_intermediate_size (2048) is the
     # same and n_experts is one fewer.  Streaming would still be Round 3
     # material; for the per-layer smoke we do it in-memory.
+    experts = range(n_experts) if expert_indices is None else expert_indices
     gate_stack: list[torch.Tensor] = []
     up_stack: list[torch.Tensor] = []
     down_stack: list[torch.Tensor] = []
-    for e in range(n_experts):
+    for e in experts:
         base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
         gate = _dequant_expert_fp4_weight(
             state_dict, f"{base_e}w1.weight", dtype
@@ -724,6 +726,7 @@ def _convert_hash_moe_block(
     hf_prefix: str = "",
     wrapper_prefix: str = "",
     dtype: torch.dtype | None = None,
+    expert_indices: range | list[int] | None = None,
 ) -> dict[str, Any]:
     """Convert one DSv4-Flash hash-MoE bootstrap layer HF -> wrapper module tree.
 
@@ -847,10 +850,11 @@ def _convert_hash_moe_block(
     # Same layout as the routed-MoE per-layer helper — the two paths
     # deliberately produce byte-compatible stacked tensors so a Round-6
     # subclass can bind the SAME `_NxdExpertMLPs` bearing under both.
+    experts = range(n_experts) if expert_indices is None else expert_indices
     gate_stack: list[torch.Tensor] = []
     up_stack: list[torch.Tensor] = []
     down_stack: list[torch.Tensor] = []
-    for e in range(n_experts):
+    for e in experts:
         base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
         gate = _dequant_expert_fp4_weight(
             state_dict, f"{base_e}w1.weight", dtype
