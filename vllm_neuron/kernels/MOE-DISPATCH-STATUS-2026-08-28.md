@@ -12,7 +12,8 @@
 |---|---|---:|
 | `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\moe_dispatch.py` | Fused MoE dispatch NKI kernel: router + expert-combine, three shape families | ~330 |
 | `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\tests\test_moe_dispatch_correctness.py` | Tier-1a CPU-simulate golden reference test suite | ~310 |
-| `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\gemma4_cpu_fallback_replacement.py` | CPU-fallback trigger coverage + head_dim sign-off block | ~280 |
+| `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\gemma4_no_fallback_mitigations.py` | PR #172 adapter shim (triggers #1/#2) + local stopgaps (triggers #3/#4) — renamed 2026-08-28 from `gemma4_cpu_fallback_replacement.py` | ~260 |
+| `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\tests\test_no_cpu_fallback.py` | Universal no-CPU-fallback assertion tests (grep + NEFF-content + runtime probe) | ~380 |
 | `C:\Users\apumu\research\InfinityAI\gemma4-trn2-handoff\harness-v2\staging\reference-sweep-20260826T2150Z\kernels\MOE-DISPATCH-STATUS-2026-08-28.md` | This document | — |
 
 ---
@@ -47,7 +48,13 @@
 
 ---
 
-## 4. Head_dim discrepancy — BLOCKED on operator sign-off
+## 4. Head_dim discrepancy — RESOLVED by AWS PR #172 (2026-08-28)
+
+**Update 2026-08-28:** AWS PR #172 pins the Gemma-4-26B-A4B geometry at HF revision `24548b62aa021d562695c04aaf7758a1ea47990b`.  Per PR #172 `README.md` line 22-32: `hidden_size=2816`, 16 attention heads, 8 KV heads (GQA 2:1), heterogeneous attention with SWA layers at `head_dim=256` and global layers at `head_dim=512` (same as PR #106 gemma-4-31B-IT).  The `SIGN_OFF_REQUIRED_HEAD_DIM` sentinel and `HeadDimSignOffRequired` exception are retired from `gemma4_no_fallback_mitigations.py`; the PR #172 flash-attn kernels are wired directly through `import_pr172_flash_attention(variant="d256_swa")` and `import_pr172_flash_attention(variant="large_d")`.
+
+The task-prompt "64 experts / top-6" numbers are inconsistent with the pinned HF `24548b62`, which is `num_experts=128, top_k=8, moe_intermediate_size=704` (per Codex `dual_input_tkg_moe_nki.py` + PR #172 §Architecture Details).  The Codex-verified values remain the source of truth for the fused-dispatch NEFF shape.
+
+### Historical context — the sign-off block (pre-PR-172)
 
 **Per task prompt:**
 > If head_dim discrepancy still not resolved (my prior report flagged head_dim=176 vs sourced 256 sliding / 512 global), block on operator sign-off — do NOT guess a value.
@@ -115,12 +122,14 @@ Codex's `harness-v2\staging\cycle465\compile_dual_input_tkg_moe_split.py` is alr
 
 ## 6. CPU-fallback trigger status (four triggers per scaffold §B.1)
 
+**Amended 2026-08-28:** AWS PR #172 (Gemma-4-26B-A4B NxDI contrib port) supersedes local mitigations for triggers #1 and #2.  The PR ships validated flash-attn kernels (`nki_flash_attn_d256_swa.py` for SWA head_dim=256, `nki_flash_attn_large_d.py` for global head_dim=512, both verbatim from PR #106 with Stage 5 canonical-chat validation matching HF CPU bf16 at 100% token agreement on 11/12 combos) and a subclassed `Gemma4KVCacheManager` for the hybrid per-layer geometry.  The head_dim sign-off block is retired — PR #172 pins the values at HF revision `24548b62`.  Triggers #3 and #4 remain campaign-owned because PR #172 validated at batch_size=1 only and does not touch the fused MoE dispatch NEFF this campaign compiles.
+
 | # | Trigger | Status | Fix | Ships in |
 |:---:|---|:---:|---|---|
-| 1 | `head_dim > _MAX_D_HEAD=128` | **BLOCKED_ON_SIGN_OFF** | Part B #1 head-dim tiling; sentinel raises `HeadDimSignOffRequired` | `gemma4_cpu_fallback_replacement.make_flash_attention_hybrid_sliding_global_kernel` |
-| 2 | Hybrid KV manager off | **SHIPPED** | `enable_hybrid_kv_cache_manager()` — 3.7× KV slot reduction | `gemma4_cpu_fallback_replacement.enable_hybrid_kv_cache_manager` |
-| 3 | vocab=262K > nc_find_index8 cap | **PARTIAL** | `should_disable_argmax_kernel()` mitigation; Part B #2 kernel not authored | `gemma4_cpu_fallback_replacement.should_disable_argmax_kernel` |
-| 4 | `(GLU, GELU_TANH_APPROX)` activation combo | **SHIPPED** | `MoEActivation.GELU_TANH_APPROX` branch + `verify_activation_branch_coverage()` guard | `moe_dispatch.MoEActivation` |
+| 1 | `head_dim > _MAX_D_HEAD=128` | **SHIPPED_UPSTREAM_PR172** | PR #172 `nki_flash_attn_d256_swa` (SWA) + `nki_flash_attn_large_d` (global); local adapter shim `import_pr172_flash_attention()` | `gemma4_no_fallback_mitigations.import_pr172_flash_attention` |
+| 2 | Hybrid KV manager off | **SHIPPED_UPSTREAM_PR172** | PR #172 `Gemma4KVCacheManager` subclass with per-layer heterogeneous shapes; local adapter shim `import_pr172_kv_cache_manager()` | `gemma4_no_fallback_mitigations.import_pr172_kv_cache_manager` |
+| 3 | vocab=262K > nc_find_index8 cap | **PARTIAL** | `should_disable_argmax_kernel()` mitigation; Part B #2 kernel not authored.  PR #172 validated at B=1 only. | `gemma4_no_fallback_mitigations.should_disable_argmax_kernel` |
+| 4 | `(GLU, GELU_TANH_APPROX)` activation combo | **SHIPPED_LOCAL_STOPGAP** | `MoEActivation.GELU_TANH_APPROX` branch + `verify_activation_branch_coverage()` guard.  PR #172 uses NxDI `moe_v2` directly and does not touch the fused-dispatch NEFF path. | `moe_dispatch.MoEActivation` |
 
 **Trigger #4 detail — closes §B5's silent-fallback hazard.**  The `enable_moe_fused_dispatch()` helper in `moe_dispatch.py` fires a `log.critical("MoE fused dispatch = enabled | ... | activation=%s", cfg.activation.name)` message when wired.  The Tier-1 CPU battery greps for `activation=GELU_TANH_APPROX` when compiling Gemma-4 and refuses to proceed if the label is missing.  This is the concrete instantiation of §C.1 "no silent fallback" discipline.
 

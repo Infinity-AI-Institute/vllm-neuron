@@ -16,7 +16,7 @@ Five NKI kernel implementations for Trainium2 with CPU reference implementations
 | `dma_coalescing_nki_v1.py` | NKI kernel for the K-way coalesced gather (Path A). Body at `_kernel_bodies/dma_coalescing_nki_v1_body.py`. | `test_dma_coalescing_nki_v1_smoke.py` | same as above, once fired |
 | `moe_dispatch.py` | Fused router + expert-combine dispatcher plus a fail-loud fallback ladder. Sets `use_shard_on_intermediate_dynamic_while=True` to work around the missing `_call_shard_hidden_kernel` in container `sha256:011d49c7`. | `test_moe_dispatch_correctness.py` | Qwen3-30B-A3B, GPT-OSS-20B, Gemma-4-26B-A4B |
 | `glm52_indexer_fp8_scale_fix.py` | Rescales `cache_quant_multiplier` by `240/448` so on-disk FP8 scale matches the Trn2 kernel's clamp, plus a load-time assertion. Analytical fix, no NKI. | `test_glm52_indexer_scale_audit.py` | GLM-5.2 |
-| `gemma4_cpu_fallback_replacement.py` | Python-side coverage for four triggers that push Gemma-4 26B-A4B to CPU under container `sha256:011d49c7`. Gemma-4 is deferred; kept so a future lane can re-open without re-deriving this. | (no test file yet) | Gemma-4-26B-A4B |
+| `gemma4_no_fallback_mitigations.py` | Python-side coverage for the two Gemma-4 26B-A4B CPU-fallback triggers PR #172 does not close: argmax kernel disable at high batch (trigger #3) and the `(GLU, GELU_TANH_APPROX)` activation branch guard (trigger #4). Triggers #1 and #2 are wired through the PR #172 adapter shim (`import_pr172_flash_attention`, `import_pr172_kv_cache_manager`); until PR #172 merges, they resolve against a local vendored snapshot. Renamed 2026-08-28 from `gemma4_cpu_fallback_replacement.py` — the name reflects intent (prevent fallback, never plan for it). | `test_no_cpu_fallback.py` (also universal — see below) | Gemma-4-26B-A4B |
 
 ## Slugs
 
@@ -37,10 +37,11 @@ cd vllm_neuron/kernels
 py -3 -m pytest -q
 ```
 
-Last run on Windows Python 3.12.10 (this repo layout): 307 tests, 300 passed, 7 skipped, 75.94 s wall. The 7 skips are environmental: 2 want `GLM_FP8_INDEX_PATH` set to a live GLM-5.2 FP8 checkpoint, 5 want `neuronxcc.nki` on the host. `pytest.ini` here sets `--import-mode=importlib` and pins `rootdir` at this directory so pytest does not walk up to `vllm_neuron/__init__.py`.
+Last run on Windows Python 3.12.10 (this repo layout): 317 tests, 306 passed, 11 skipped, 165 s wall. The 11 skips are environmental: 2 want `GLM_FP8_INDEX_PATH` set to a live GLM-5.2 FP8 checkpoint, 5 want `neuronxcc.nki` on the host, 4 in `test_no_cpu_fallback.py` want a `--compile-log`, `--artifact-dir`, or `--runtime-probe` flag pointed at a real target. `pytest.ini` here sets `--import-mode=importlib` and pins `rootdir` at this directory so pytest does not walk up to `vllm_neuron/__init__.py`.
 
 ## Rules the kernels enforce
 
+- **No CPU fallback.** Every compile lane on every model runs `tests/test_no_cpu_fallback.py` against its compile log and artifact dir. The test greps for canonical fallback markers (`falling back to cpu`, `torch_blockwise_matmul_inference`, `op fallback`, `emitting host code`, `partition cap exceeded`, and six more — see `CPU_FALLBACK_GREP_PATTERNS`) and fails loudly on any match. When Trn2 is reachable, `--runtime-probe` adds a live `neuron-top` sample check. This is a first-class campaign rule (Gemma-4-26B-A4B previously hit MFU 0.06% because a silent fallback slipped through). Invocation: `pytest kernels/tests/test_no_cpu_fallback.py --compile-log <path> --artifact-dir <dir>`.
 - **No speculative decoding.** KDA v2 dispatch paths raise on `softmax_impl` requests (`test_dispatch_rejects_softmax_impl`, `test_prefill_shim_rejects_softmax`), and a source scan (`test_source_omits_spec_decode_branch`) fails if a spec-decode branch is added to any kernel.
 - **LSE base is natural log.** Both DSA reference and NKI kernels expose `LSE_BASE_CONVENTION = "natural"`. Consumers that assume base-2 read wrong tokens. See `SGLANG-DSA-LSE-FIX-ANALYSIS-2026-08-28.md` for the SGLang cross-check.
 - **File-import, not `exec()`.** NKI kernel bodies live under `_kernel_bodies/` and are loaded through `importlib.util.spec_from_file_location`. `exec(src, ns)` leaves the function without a real `__file__`, and `KernelRewriter.reparse_function` then raises `OSError: could not get source code` at compile time. See `EXEC-TO-FILE-IMPORT-PATCH-2026-08-28.md`.
@@ -59,6 +60,7 @@ Details per kernel and the two adjacent analyses:
 - `EXEC-TO-FILE-IMPORT-PATCH-2026-08-28.md` — the file-import pattern
 - `SGLANG-DSA-LSE-FIX-ANALYSIS-2026-08-28.md` — natural-log LSE cross-check
 - `VLLM-KDA-KERNEL-FLAVOR-2026-08-28.md` — KDA reference-flavor gap analysis
+- `GEMMA4-NO-FALLBACK-REFACTOR-2026-08-28.md` — Gemma-4 fallback-mitigation rename + refactor rationale (PR #172 supersession for triggers #1 and #2)
 
 ## On-device order
 
@@ -74,4 +76,4 @@ MoE dispatch and the GLM-5.2 FP8 fix are Python-side and effective without a NKI
 
 Apache-2.0, inherited from `vllm-neuron`. Every file starts with `# SPDX-License-Identifier: Apache-2.0`. CPU references are original implementations validated against public references (FLA v0.5.2, SGLang for the LSE convention); no vendor code is copied.
 
-Author: `fleet-a-nki-kernels-agent`. Per-kernel callsigns: `dsa-nki-v1-agent`, `kda-nki-v2-agent`, `dma-nki-v1-agent`, `moe-dispatch-v0-agent`, `glm52-fp8-fix-agent`, `gemma4-cpu-fallback-agent`.
+Author: `fleet-a-nki-kernels-agent`. Per-kernel callsigns: `dsa-nki-v1-agent`, `kda-nki-v2-agent`, `dma-nki-v1-agent`, `moe-dispatch-v0-agent`, `glm52-fp8-fix-agent`, `gemma4-no-fallback-agent` (renamed 2026-08-28 from `gemma4-cpu-fallback-agent`).

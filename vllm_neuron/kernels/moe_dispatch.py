@@ -375,9 +375,9 @@ def make_gemma4_26b_a4b_tp4_kernel():
 
     IMPORTANT: For Gemma-4 whole-window fire, this MoE kernel is
     necessary but NOT sufficient — the attention half still hits
-    `_MAX_D_HEAD=128` and CPU-fallbacks until Part B #1 (or the
-    MAX_HEAD_DIM 128->256 gate flip, if head_dim<=256 confirmed) lands.
-    See `gemma4_cpu_fallback_replacement.py`.
+    `_MAX_D_HEAD=128` and CPU-fallbacks until AWS PR #172 (validated
+    `nki_flash_attn_d256_swa` + `nki_flash_attn_large_d`) is wired in.
+    See `gemma4_no_fallback_mitigations.import_pr172_flash_attention`.
     """
     return _make_moe_dispatch(GEMMA4_26B_A4B_TP4)
 
