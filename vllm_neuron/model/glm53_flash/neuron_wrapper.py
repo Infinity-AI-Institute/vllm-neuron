@@ -2162,6 +2162,32 @@ if _NXDI_AVAILABLE:
                 getattr(keep, "tag", keep),
             )
 
+        def _copy_past_key_values(self, outputs: Any) -> None:  # type: ignore[override]
+            """Thread state between graphs on the CPU-simulation path.
+
+            On device this never runs: ``input_output_aliases`` makes the
+            output buffer *be* the input buffer, and NxDI only calls this when
+            ``not generation_model.is_neuron()`` (model_base.py:3442). The base
+            implementation writes into
+            ``<model>.model.kv_mgr.past_key_values`` (model_base.py:3789-3795),
+            which is ``None`` here — GLM-5.3-Flash owns ``past_key_values``
+            directly. Overriding keeps CPU simulation usable instead of leaving
+            an ``AttributeError`` for whoever first tries to debug the model
+            without a device.
+            """
+            offset = self._get_captured_tensors_offset()
+            skip = 2 if (
+                self.neuron_config.output_logits
+                and self.neuron_config.on_device_sampling_config
+            ) else 1
+            new_state = outputs[skip + offset:]
+            for model in (self.token_generation_model, self.context_encoding_model):
+                target = getattr(getattr(model, "model", None), "past_key_values", None)
+                if target is None:
+                    continue
+                for i, value in enumerate(new_state):
+                    target[i].data = value
+
         def get_cpu_oracle(self) -> NeuronGlm53FlashForCausalLMImpl:
             """Materialize the CPU-reference impl for correctness gating.
 

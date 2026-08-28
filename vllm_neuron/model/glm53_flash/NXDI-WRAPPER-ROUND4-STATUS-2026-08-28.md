@@ -303,9 +303,56 @@ HBM, not FP8:
    dequantises the FP8 checkpoint at load. So the FP8 checkpoint buys disk and
    load bandwidth, not HBM residency or matmul throughput.
 
-Trainium2 carries 96 GB (≈89.4 GiB) HBM per device, so 36.51 GiB/chip of
-weights is ~41% of HBM and **fits comfortably at TP=16**. The Round-3 figure
-was wrong but not fatally so.
+### TP=16 does not fit, and the compiler says so in the same numbers
+
+The plan's TP=16 was fired and **neuronx-cc rejected it**:
+
+```
+[NCC_EVRF009] Size of total input and output tensors exceeds HBM limit of
+Trainium2. Needed 39,644,174,584 bytes (36 GB) vs. available
+25,769,803,776 bytes (24 GB).
+Top three largest input tensors are:
+  input200 of shape bf16[288,4096,256]
+  input228 of shape bf16[288,4096,256]
+  input256 of shape bf16[288,4096,256]
+```
+(`/mnt/compile/runroot/glm53-round4/logs/cc-real45-tkg-fire/`)
+
+Three things this confirms at once:
+
+* **The arithmetic above is right.** 39.644 GB measured vs 39.20 GB predicted
+  for the weights plus 0.28 GB of state cache — within 1%.
+* **The experts really are bf16 in HBM.** The three largest tensors are
+  `bf16[288, 4096, 256]`, i.e. the fused `gate_up_proj` slab at TP=16
+  (`intermediate*2/tp = 4096/16 = 256`). Had they stayed FP8 this would read
+  `f8e4m3[...]` and be half the size.
+* **The budget is 24 GB per LNC=2 logical core, not 96 GB per chip.**
+  trn2.48xlarge is 16 chips × 8 NeuronCore-v3, paired by LNC=2 into 64 logical
+  cores; 1.5 TB / 64 = 24 GB. A TP=16 job therefore addresses 16 of 64 logical
+  cores — a quarter of the box's HBM — not all of it. This is the single most
+  load-bearing number in the round and it is easy to get wrong by reasoning
+  per-chip.
+
+So the Round-3 figure was not a harmless bookkeeping error: at 18.64 GiB/chip
+the model would have fit at TP=16, and at the true 36.51 GiB/chip it does not.
+
+| TP | bf16 weights per logical core | fits under 24 GB? |
+|---|---|---|
+| 8 | 78.40 GB | no |
+| **16** | **39.20 GB** | **no — confirmed by neuronx-cc** |
+| 32 | 19.60 GB | yes, ~4 GB headroom |
+| 64 | 9.80 GB | yes |
+
+**The contract moves to TP=32** (or 64). All the divisibility gates still hold:
+`moe_intermediate 2048/32 = 64` clears the `%16` Tier-1 wall, `num_attention_heads
+64/32 = 2`, `KDA num_heads 64/32 = 2`, and the indexer's pooled head count is
+replicated regardless.
+
+This is now a **pre-fire gate** in the compile driver rather than a lesson: see
+`/mnt/compile/shared-images/glm53-flash-command.sh`, which computes
+`313.614 G × 2 B / TP` against a 90%-of-24 GB budget and refuses with the
+smallest TP that fits. It costs a second; finding out from neuronx-cc costs the
+whole trace.
 
 **Hybrid state cache at B=1, S=2048, bf16, per chip:**
 
@@ -354,9 +401,17 @@ generation for the 4-layer recipe (3 KDA layers):
 | 512 | 15.95 s |
 
 Linear at ~0.0104 s per KDA-layer-token, so the real 45-layer model at s=2048
-projects to ≈ 34 × 2048 × 0.0104 ≈ **12 min of HLO generation alone**, before
-`neuronx-cc` sees a graph with ~70,000 unrolled recurrence steps. TKG (L=1) is
-one step per layer and is unaffected — 0.46–0.54 s across every bucket measured.
+projects to ≈ 34 × 2048 × 0.0104 ≈ 12 min of HLO generation alone, before
+`neuronx-cc` sees a graph with ~70,000 unrolled recurrence steps.
+
+**Measured on the real 45-layer model at s=2048: 709.12 s (11.8 min) of CTE
+HLO generation**, peaking at ~87 GB RSS. The projection from the 4-layer curve
+was accurate to 2%, so the scan cost is genuinely linear in
+`num_kda_layers × seq_len` and can be planned against.
+
+TKG (L=1) is one step per layer and is unaffected — **5.01 s** for the full
+45-layer model, and 0.46–0.54 s for the 4-layer recipe across every bucket
+measured. The decode graph is not where this cost lives.
 
 ### 2. The DSA sparse gather is O(Q × topk)
 
@@ -382,6 +437,37 @@ measured shape and is the graph that determines tokenomics. The CTE contract at
 `max_model_len=2048` is where both limits bite. The two are fired and reported
 separately rather than as one number, and a CTE bucket is chosen from
 measurement rather than from the plan.
+
+## Compile driver
+
+`/mnt/compile/shared-images/glm53-flash-command.sh` is authored, contract-driven,
+and mirrors `llama33-70b-fp8-command.sh`'s structure. Three deliberate
+differences, each documented in its header rather than silently inherited:
+
+1. **Model class.** GLM-5.3-Flash has no in-tree NxDI modeling module; the
+   driver bind-mounts this campaign's wrapper (`/code`) and the qualified CPU
+   goldens (`/kernels`) read-only and drives them directly.
+2. **`MoENeuronConfig`, not `NeuronConfig`**, with an assertion that
+   `blockwise_matmul_config.use_shard_on_intermediate_dynamic_while` survived
+   construction, plus a hard refusal of `LNC != 2`.
+3. **FP8-KV keys are refused, not ignored.** A contract that sets
+   `kv_cache_quant` / `kv_quant_config` / `fp8_packed_kv` exits non-zero with an
+   explanation, because honouring them would change `neuron_config.json` and
+   not the tensors.
+
+It also carries the two gates this round paid for:
+
+* **HBM preflight** — `313.614 G × 2 B / TP` against 90% of 24 GB, refusing
+  with the smallest TP that fits. This is what would have caught the TP=16
+  fire in one second instead of one full trace.
+* **CPU-fallback scan** — the compile log is grepped for
+  `falling back to cpu`, `torch_blockwise_matmul_inference`,
+  `use_torch_block_wise=True` and friends, and a hit *fails* the fire rather
+  than warning. This is the failure mode that got Gemma-4 deferred.
+
+Receipts written: `effective-shape.json` (resolved config, including
+`models_compiled` so an emit-phase restriction is visible), `compile-result.json`
+(emitted NEFF paths + sizes + emitted dtype flags), `terminal.json`.
 
 ## Files
 
