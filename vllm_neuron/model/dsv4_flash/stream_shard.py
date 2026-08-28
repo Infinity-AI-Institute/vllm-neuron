@@ -8,6 +8,7 @@ TP-sliced, and released before the next layer.  This avoids materialising the
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -91,7 +92,7 @@ def _close_shards(handles: dict[str, Any]) -> None:
     for handle in handles.values():
         try:
             handle.__exit__(None, None, None)
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover  # noqa: BLE001,S110
             pass
 
 
@@ -125,9 +126,13 @@ def _target_shard(key: str, tensor: torch.Tensor, rank: int, tp_degree: int) -> 
     """Apply the frozen DSv4 first-fire TP layout to one converted tensor."""
     if key in {"embed_tokens.weight", "lm_head.weight"}:
         return _row_shard(tensor, rank, tp_degree, 0)
-    if key.endswith("router.weight") or key.endswith("tid2eid") or key.endswith("e_score_correction_bias"):
+    if key.endswith(
+        ("router.weight", "tid2eid", "e_score_correction_bias")
+    ):
         return tensor.contiguous()
-    if key.endswith("shared_expert.gate_proj.weight") or key.endswith("shared_expert.up_proj.weight"):
+    if key.endswith(
+        ("shared_expert.gate_proj.weight", "shared_expert.up_proj.weight")
+    ):
         return _row_shard(tensor, rank, tp_degree, 0)
     if key.endswith("shared_expert.down_proj.weight"):
         return _row_shard(tensor, rank, tp_degree, 1)
@@ -137,13 +142,41 @@ def _target_shard(key: str, tensor: torch.Tensor, rank: int, tp_degree: int) -> 
         return _row_shard(tensor, rank, tp_degree, 1)
     # MQA projections are TP-sharded; compressor/indexer leaves are replicated
     # for the first fire (their local head axes are deliberately not sliced).
-    if key.endswith("attn.wq_a.weight") or key.endswith("attn.wq_b.weight"):
+    if key.endswith(("attn.wq_a.weight", "attn.wq_b.weight")):
         return _row_shard(tensor, rank, tp_degree, 0)
     if key.endswith("attn.wo_a.weight"):
         return _row_shard(tensor, rank, tp_degree, 0)
     if key.endswith("attn.wo_b.weight"):
         return _row_shard(tensor, rank, tp_degree, 1)
     return tensor.contiguous()
+
+
+def _wrapper_key(key: str) -> str:
+    """Normalize converter MQA leaves to the Round-8 module tree.
+
+    The per-block converter intentionally retains the HF-like spelling
+    ``layers.i.attn.wq_a.weight`` for its standalone tests.  The NxDI wrapper
+    composes that block under ``attn.mqa``; emitted checkpoint keys therefore
+    need the one-level insertion below.  Compressor and indexer leaves are
+    already nested and must remain untouched.
+    """
+    mqa_names = {
+        "wq_a.weight",
+        "wq_b.weight",
+        "wkv.weight",
+        "wo_a.weight",
+        "wo_b.weight",
+        "q_norm.weight",
+        "kv_norm.weight",
+        "attn_sink",
+    }
+    marker = ".attn."
+    if marker not in key:
+        return key
+    prefix, leaf = key.split(marker, 1)
+    if leaf in mqa_names:
+        return f"{prefix}.attn.mqa.{leaf}"
+    return key
 
 
 def _convert_one_layer(state: Mapping[str, torch.Tensor], layer_idx: int, src: DeepseekV4FlashInferenceConfig) -> dict[str, torch.Tensor]:
@@ -170,7 +203,11 @@ def _convert_one_layer(state: Mapping[str, torch.Tensor], layer_idx: int, src: D
         _convert_routed_moe_layer(layer_state, converted, layer_idx, src)
     else:  # pragma: no cover
         raise ValueError(f"unsupported MLP layer type {mlp_type!r} at {layer_idx}")
-    return {key: value for key, value in converted.items() if not key.startswith("_")}
+    return {
+        _wrapper_key(key): value
+        for key, value in converted.items()
+        if not key.startswith("_")
+    }
 
 
 def stream_shard_dsv4_checkpoint(
@@ -263,6 +300,30 @@ def stream_shard_dsv4_checkpoint(
     report["end_unix"] = int(time.time())
     report["total_wall_s"] = report["end_unix"] - report["start_unix"]
     return report
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("hf_model_path")
+    parser.add_argument("compiled_model_path")
+    parser.add_argument("--tp-degree", type=int, default=32)
+    parser.add_argument("--ep-degree", type=int)
+    parser.add_argument("--ranks", type=int, nargs="+")
+    args = parser.parse_args()
+    config = DeepseekV4FlashInferenceConfig.from_pretrained(args.hf_model_path)
+    report = stream_shard_dsv4_checkpoint(
+        args.hf_model_path,
+        args.compiled_model_path,
+        config,
+        tp_degree=args.tp_degree,
+        ep_degree=args.ep_degree,
+        ranks=args.ranks,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised on compile host
+    _main()
 
 
 __all__ = ["stream_shard_dsv4_checkpoint"]

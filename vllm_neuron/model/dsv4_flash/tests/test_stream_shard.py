@@ -12,6 +12,7 @@ from vllm_neuron.model.dsv4_flash.stream_shard import (
     _load_hf_index,
     _row_shard,
     _shard_expert_gate_up,
+    _wrapper_key,
 )
 
 
@@ -28,6 +29,17 @@ def test_gate_up_shard_preserves_gate_then_up_order() -> None:
 def test_row_shard_rejects_ragged_axis() -> None:
     with pytest.raises(ValueError, match="cannot shard"):
         _row_shard(torch.zeros(5, 2), rank=0, tp_degree=2, dim=0)
+
+
+def test_wrapper_key_inserts_mqa_module_only_for_direct_mqa_leaves() -> None:
+    assert (
+        _wrapper_key("layers.0.attn.wq_a.weight")
+        == "layers.0.attn.mqa.wq_a.weight"
+    )
+    assert (
+        _wrapper_key("layers.2.attn.compressor.wkv.weight")
+        == "layers.2.attn.compressor.wkv.weight"
+    )
 
 
 def test_index_loader_requires_weight_map(tmp_path) -> None:
