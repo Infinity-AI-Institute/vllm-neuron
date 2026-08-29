@@ -111,10 +111,10 @@ class MoEActivation(Enum):
     fallback to `torch_blockwise_matmul_inference` (§B5 discipline).
     """
 
-    SILU = auto()               # Qwen3-30B-A3B, GPT-OSS-20B
-    GELU_TANH_APPROX = auto()   # Gemma-4-26B-A4B (§B5 hazard model)
-    GLU = auto()                # sigmoid * up
-    SILU_GLU = auto()           # silu * sigmoid — some DeepSeek variants
+    SILU = auto()  # Qwen3-30B-A3B, GPT-OSS-20B
+    GELU_TANH_APPROX = auto()  # Gemma-4-26B-A4B (§B5 hazard model)
+    GLU = auto()  # sigmoid * up
+    SILU_GLU = auto()  # silu * sigmoid — some DeepSeek variants
 
     def to_actfn(self):
         if not _NKI_AVAILABLE:
@@ -147,7 +147,7 @@ class MoEDispatchConfig:
     intermediate_global: int
     tp_degree: int
     activation: MoEActivation
-    renormalize_topk: bool       # §A.G-9 — GPT-OSS is False, others True
+    renormalize_topk: bool  # §A.G-9 — GPT-OSS is False, others True
     pmax: int = 128
     eps: float = 1e-6
     # Router weight axis convention: input `router_weights` is (hidden, experts)
@@ -177,9 +177,7 @@ class MoEDispatchConfig:
             )
         # 3) top_k must be power-of-2-or-8 for bitonic topk safety
         if self.top_k not in (1, 2, 4, 6, 8, 16):
-            raise ValueError(
-                f"{self.name}: top_k={self.top_k} outside tested set."
-            )
+            raise ValueError(f"{self.name}: top_k={self.top_k} outside tested set.")
 
 
 # Pinned shape families — every downstream compile picks one and never guesses.
@@ -197,10 +195,10 @@ QWEN3_30B_A3B_TP8 = MoEDispatchConfig(
 GEMMA4_26B_A4B_TP4 = MoEDispatchConfig(
     name="gemma4-26b-a4b-tp4",
     hidden=2816,
-    num_experts=128,           # per pinned HF revision 24548b62; task prompt
-    top_k=8,                   # cited 64/6 but that disagrees with the code +
-    intermediate_global=704,   # HF config — see status doc §4 for sign-off.
-    tp_degree=4,               # TP=4 so I_TP=176 (clears %16); TP=8 is I_TP=88 which fails.
+    num_experts=128,  # per pinned HF revision 24548b62; task prompt
+    top_k=8,  # cited 64/6 but that disagrees with the code +
+    intermediate_global=704,  # HF config — see status doc §4 for sign-off.
+    tp_degree=4,  # TP=4 so I_TP=176 (clears %16); TP=8 is I_TP=88 which fails.
     activation=MoEActivation.GELU_TANH_APPROX,
     renormalize_topk=True,
 )
@@ -213,7 +211,7 @@ GPT_OSS_20B_TP4 = MoEDispatchConfig(
     intermediate_global=2880,
     tp_degree=4,
     activation=MoEActivation.SILU,
-    renormalize_topk=False,   # §A.G-9 — GPT-OSS does NOT renormalize top-k weights
+    renormalize_topk=False,  # §A.G-9 — GPT-OSS does NOT renormalize top-k weights
 )
 
 
@@ -256,9 +254,9 @@ def _make_moe_dispatch(cfg: MoEDispatchConfig):
     # branch — legal AoT — not a router-output branch which §B6 forbids.
     @nki.jit
     def gemma_moe_router(
-        router_input,       # BF16 [B, S, HIDDEN]
-        router_gamma,       # BF16 [1, HIDDEN]  (Gemma: gamma * H**-0.5)
-        router_weights,     # BF16 [HIDDEN, EXPERTS]
+        router_input,  # BF16 [B, S, HIDDEN]
+        router_gamma,  # BF16 [1, HIDDEN]  (Gemma: gamma * H**-0.5)
+        router_weights,  # BF16 [HIDDEN, EXPERTS]
     ):
         """Router half: RMSNorm -> logits -> softmax -> top-K + affinities.
 
@@ -317,12 +315,12 @@ def _make_moe_dispatch(cfg: MoEDispatchConfig):
     # the combine barrier disappear — no extra graph after the expert loop.
     @nki.jit
     def gemma_moe_expert_combine(
-        expert_input,               # BF16 [T, HIDDEN]  (post-layernorm)
-        expert_gate_up_weights,     # BF16 [EXPERTS, HIDDEN, 2, I_TP]
-        expert_down_weights_scaled, # BF16 [EXPERTS, I_TP, HIDDEN]  (down * per_expert_scale)
-        expert_affinities,          # FP32 [T, EXPERTS]  from router
-        expert_index,               # U32  [T, TOP_K]    from router
-        rank_id,                    # I32  [1, 1]        EP rank (0 for EP1)
+        expert_input,  # BF16 [T, HIDDEN]  (post-layernorm)
+        expert_gate_up_weights,  # BF16 [EXPERTS, HIDDEN, 2, I_TP]
+        expert_down_weights_scaled,  # BF16 [EXPERTS, I_TP, HIDDEN]  (down * per_expert_scale)
+        expert_affinities,  # FP32 [T, EXPERTS]  from router
+        expert_index,  # U32  [T, TOP_K]    from router
+        rank_id,  # I32  [1, 1]        EP rank (0 for EP1)
     ):
         """Fused expert-MM + weighted in-place combine (Part A stages 3-5).
 
@@ -396,9 +394,9 @@ def make_gpt_oss_20b_tp4_kernel():
 
 
 class MoEFallbackRung(Enum):
-    FUSED_DISPATCH = 0                              # this kernel
-    BLOCKWISE_MM_SHARD_INTERMEDIATE_HYBRID = 1      # current Qwen3-30B-A3B production path
-    TORCH_BLOCKWISE_MATMUL_INFERENCE = 2            # §B5 CPU-fallback — FAIL LOUD
+    FUSED_DISPATCH = 0  # this kernel
+    BLOCKWISE_MM_SHARD_INTERMEDIATE_HYBRID = 1  # current Qwen3-30B-A3B production path
+    TORCH_BLOCKWISE_MATMUL_INFERENCE = 2  # §B5 CPU-fallback — FAIL LOUD
 
 
 def enable_moe_fused_dispatch(neuron_config, cfg: MoEDispatchConfig) -> None:

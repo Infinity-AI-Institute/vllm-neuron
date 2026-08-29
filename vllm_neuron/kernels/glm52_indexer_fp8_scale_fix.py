@@ -107,7 +107,7 @@ except ImportError:  # pragma: no cover - numpy is a hard runtime dep here
 # below fail loudly (see test_constants_mirror_upstream in the tests file).
 
 NEURON_LEGACY_E4M3_MAX = 240.0  # Trainium2 e4m3fn saturation magnitude.
-OCP_E4M3_MAX = 448.0            # OCP e4m3fn saturation magnitude.
+OCP_E4M3_MAX = 448.0  # OCP e4m3fn saturation magnitude.
 WEIGHT_DOWNSCALE = NEURON_LEGACY_E4M3_MAX / OCP_E4M3_MAX  # 0.53571...
 SCALE_COMPENSATION = OCP_E4M3_MAX / NEURON_LEGACY_E4M3_MAX  # 1.86666...
 
@@ -217,11 +217,7 @@ def _try_read_scales_from_safetensors(
     if not isinstance(weight_map, dict):
         return None
 
-    wanted = {
-        name
-        for name in weight_map
-        if name.endswith(".cache_quant_multiplier")
-    }
+    wanted = {name for name in weight_map if name.endswith(".cache_quant_multiplier")}
     if not wanted:
         return None
 
@@ -301,9 +297,7 @@ def _try_read_scales_from_companion_json(
         flat = {
             str(k): float(v)
             for k, v in payload.items()
-            if isinstance(v, (int, float))
-            and math.isfinite(float(v))
-            and float(v) > 0
+            if isinstance(v, (int, float)) and math.isfinite(float(v)) and float(v) > 0
         }
         if flat:
             return flat
@@ -361,9 +355,7 @@ def load_scale_manifest(source: Path | str) -> dict[str, float]:
         flat = {
             str(k): float(v)
             for k, v in payload.items()
-            if isinstance(v, (int, float))
-            and math.isfinite(float(v))
-            and float(v) > 0
+            if isinstance(v, (int, float)) and math.isfinite(float(v)) and float(v) > 0
         }
         if flat:
             return flat
@@ -427,9 +419,7 @@ def audit_indexer_scales(
     """
 
     if isinstance(source, Mapping):
-        scales: dict[str, float] = {
-            str(k): float(v) for k, v in source.items()
-        }
+        scales: dict[str, float] = {str(k): float(v) for k, v in source.items()}
         checkpoint_repr = "<in-memory mapping>"
     else:
         scales = load_scale_manifest(source)
@@ -438,9 +428,10 @@ def audit_indexer_scales(
     indexer, mla_k, mla_v = _group_by_layer(scales)
     report = AuditReport(checkpoint_path=checkpoint_repr)
     report.indexer_layers_seen = len(indexer)
-    report.total_layers = max(
-        (max(indexer, default=-1), max(mla_k, default=-1), max(mla_v, default=-1))
-    ) + 1
+    report.total_layers = (
+        max((max(indexer, default=-1), max(mla_k, default=-1), max(mla_v, default=-1)))
+        + 1
+    )
 
     for layer_idx in sorted(indexer):
         m = indexer[layer_idx]
@@ -531,8 +522,7 @@ def build_requantize_patch(
         if not (touched or include_clean_layers):
             continue
         name = (
-            f"model.layers.{audit.layer_idx}.self_attn."
-            "indexer.cache_quant_multiplier"
+            f"model.layers.{audit.layer_idx}.self_attn.indexer.cache_quant_multiplier"
         )
         patch[name] = audit.indexer_multiplier * downscale
     return {
@@ -620,8 +610,7 @@ def assert_indexer_multiplier_bounded(
         )
     if value <= 0:
         raise IndexerMultiplierOutOfRange(
-            f"indexer cache_quant_multiplier{layer_tag} must be positive; "
-            f"got {value!r}"
+            f"indexer cache_quant_multiplier{layer_tag} must be positive; got {value!r}"
         )
     if value > cap:
         raise IndexerMultiplierOutOfRange(
@@ -667,9 +656,7 @@ def _format_report_text(report: AuditReport) -> str:
         f"median indexer mult  : {report.median_indexer_multiplier:.4f}",
     ]
     if report.missing_mla_pairs:
-        lines.append(
-            f"layers missing MLA-k sibling : {report.missing_mla_pairs}"
-        )
+        lines.append(f"layers missing MLA-k sibling : {report.missing_mla_pairs}")
     return "\n".join(lines)
 
 

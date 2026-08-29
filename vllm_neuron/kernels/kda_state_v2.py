@@ -67,9 +67,7 @@ import numpy as np
 # Kernel identity
 # ---------------------------------------------------------------------------
 
-KDA_STATE_V2_KERNEL_SLUG: str = (
-    "kda_state.decode.kda_gate.rank1_delta.bf16_state.v1"
-)
+KDA_STATE_V2_KERNEL_SLUG: str = "kda_state.decode.kda_gate.rank1_delta.bf16_state.v1"
 
 # GLM-5.3-Flash + Kimi K3 defaults (see FLA v0.5.2 constexpr set summarized in
 # VLLM-KDA-KERNEL-FLAVOR-2026-08-28.md §2):
@@ -85,6 +83,7 @@ KDA_DEFAULT_HEAD_DIM: int = 128
 # ---------------------------------------------------------------------------
 # bf16 simulation
 # ---------------------------------------------------------------------------
+
 
 def bf16_cast(x: np.ndarray) -> np.ndarray:
     """Simulate fp32 -> bf16 -> fp32 round-trip via bit-twiddling.
@@ -119,12 +118,13 @@ def bf16_cast(x: np.ndarray) -> np.ndarray:
 # Per-step delta-rule kernel bodies
 # ---------------------------------------------------------------------------
 
+
 def _kda_delta_rule_step_gatefree(
     S_prev: np.ndarray,  # [H, D_v, D_qk] float32
-    q: np.ndarray,       # [H, D_qk] float32
-    k: np.ndarray,       # [H, D_qk] float32
-    v: np.ndarray,       # [H, D_v]  float32
-    beta: np.ndarray,    # [H]       float32
+    q: np.ndarray,  # [H, D_qk] float32
+    k: np.ndarray,  # [H, D_qk] float32
+    v: np.ndarray,  # [H, D_v]  float32
+    beta: np.ndarray,  # [H]       float32
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Yang et al. 2024 gated-delta-rule step WITHOUT the KDA per-channel gate.
 
@@ -132,7 +132,7 @@ def _kda_delta_rule_step_gatefree(
     contribution of the KDA gate to output drift. NEVER call this as the served
     reference for KDA -- it is DeltaNet, not KDA (see v1 file gap discussion).
     """
-    Sk = np.einsum("hij,hj->hi", S_prev, k)          # [H, D_v]
+    Sk = np.einsum("hij,hj->hi", S_prev, k)  # [H, D_v]
     delta = v - Sk
     outer = np.einsum("h,hi,hj->hij", beta, delta, k)
     S_t = S_prev + outer
@@ -141,14 +141,14 @@ def _kda_delta_rule_step_gatefree(
 
 
 def _kda_delta_rule_step(
-    S_prev: np.ndarray,       # [H, D_v, D_qk] float32
-    q_raw: np.ndarray,        # [H, D_qk] float32 (post-conv, pre-L2norm)
-    k_raw: np.ndarray,        # [H, D_qk] float32 (post-conv, pre-L2norm)
-    v: np.ndarray,            # [H, D_v]  float32 (post-conv)
-    g_raw: np.ndarray,        # [H, D_qk] float32 (raw per-channel gate logits)
-    beta_raw: np.ndarray,     # [H]       float32 (raw per-head beta logit)
-    a_log: np.ndarray,        # [H]       float32 (learned per-head)
-    g_bias: np.ndarray,       # [H, D_qk] float32 (learned per-head-per-channel)
+    S_prev: np.ndarray,  # [H, D_v, D_qk] float32
+    q_raw: np.ndarray,  # [H, D_qk] float32 (post-conv, pre-L2norm)
+    k_raw: np.ndarray,  # [H, D_qk] float32 (post-conv, pre-L2norm)
+    v: np.ndarray,  # [H, D_v]  float32 (post-conv)
+    g_raw: np.ndarray,  # [H, D_qk] float32 (raw per-channel gate logits)
+    beta_raw: np.ndarray,  # [H]       float32 (raw per-head beta logit)
+    a_log: np.ndarray,  # [H]       float32 (learned per-head)
+    g_bias: np.ndarray,  # [H, D_qk] float32 (learned per-head-per-channel)
     lower_bound: float = KDA_LOWER_BOUND,
     l2norm_eps: float = KDA_L2NORM_EPS,
     scale: Optional[float] = None,
@@ -198,21 +198,21 @@ def _kda_delta_rule_step(
     q = q * scale
 
     # (3) KDA per-channel gate.
-    a_amp = np.exp(a_log.astype(np.float32))                 # [H]
-    g = g_raw.astype(np.float32) + g_bias.astype(np.float32) # [H, D_qk]
+    a_amp = np.exp(a_log.astype(np.float32))  # [H]
+    g = g_raw.astype(np.float32) + g_bias.astype(np.float32)  # [H, D_qk]
     alpha = lower_bound / (1.0 + np.exp(-(a_amp[:, None] * g)))  # [H, D_qk]
-    decay = np.exp(alpha)                                     # [H, D_qk]
+    decay = np.exp(alpha)  # [H, D_qk]
 
     # (4) State decay -- broadcast over the D_v axis. The Triton kernel indexes
     # b_h as [BV, BK]; the decay `b_gk[None, :]` broadcasts on the D_v axis.
-    S = S * decay[:, None, :]                                 # [H, D_v, D_qk]
+    S = S * decay[:, None, :]  # [H, D_v, D_qk]
 
     # (5) delta = v - S @ k
-    Sk = np.einsum("hij,hj->hi", S, k)                        # [H, D_v]
-    delta = v - Sk                                            # [H, D_v]
+    Sk = np.einsum("hij,hj->hi", S, k)  # [H, D_v]
+    delta = v - Sk  # [H, D_v]
 
     # (6) beta = sigmoid(beta_raw)
-    beta = 1.0 / (1.0 + np.exp(-beta_raw.astype(np.float32))) # [H]
+    beta = 1.0 / (1.0 + np.exp(-beta_raw.astype(np.float32)))  # [H]
 
     # (7) delta *= beta (per-head scalar broadcast on D_v axis)
     delta = delta * beta[:, None]
@@ -230,6 +230,7 @@ def _kda_delta_rule_step(
 # Learned-parameter container
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class KdaLayerParams:
     """Per-layer learned parameters for the KDA gate.
@@ -239,6 +240,7 @@ class KdaLayerParams:
         g_bias : [H, D_qk]  -- per-head per-channel vector (called `dt_bias` in the
                                vLLM module), sharded on projection axis across TP
     """
+
     a_log: np.ndarray
     g_bias: np.ndarray
     lower_bound: float = KDA_LOWER_BOUND
@@ -254,6 +256,7 @@ class KdaLayerParams:
 # Public decode-step inputs / outputs (bf16 state)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class KdaDecodeInputsV2:
     """Batched decode-step inputs, bf16-state variant.
@@ -267,6 +270,7 @@ class KdaDecodeInputsV2:
                                                        vLLM's [num_slots, HV, V, K])
         params           : KdaLayerParams
     """
+
     query: np.ndarray
     key: np.ndarray
     value: np.ndarray
@@ -284,6 +288,7 @@ class KdaDecodeOutputsV2:
         y          : [B, 1, H, D_v] float32 (bf16-quantized -- matches Triton store)
         state_bf16 : [B, H, D_v, D_qk] float32 (bf16-quantized final state)
     """
+
     y: np.ndarray
     state_bf16: np.ndarray
 
@@ -292,7 +297,10 @@ class KdaDecodeOutputsV2:
 # Reference forward -- bit-exact CPU golden
 # ---------------------------------------------------------------------------
 
-def kda_state_decode_forward_reference_v2(inputs: KdaDecodeInputsV2) -> KdaDecodeOutputsV2:
+
+def kda_state_decode_forward_reference_v2(
+    inputs: KdaDecodeInputsV2,
+) -> KdaDecodeOutputsV2:
     """CPU numpy golden -- bit-exact reference for the NKI kernel.
 
     Per-batch loop of `_kda_delta_rule_step`. Q length is 1 per batch element for
@@ -328,9 +336,16 @@ def kda_state_decode_forward_reference_v2(inputs: KdaDecodeInputsV2) -> KdaDecod
         g = g4[b, 0].astype(np.float32)
         beta_r = beta3[b, 0].astype(np.float32)
         y_b, S_b = _kda_delta_rule_step(
-            S_prev, q, k, v, g, beta_r,
-            a_log=params.a_log, g_bias=params.g_bias,
-            lower_bound=params.lower_bound, l2norm_eps=params.l2norm_eps,
+            S_prev,
+            q,
+            k,
+            v,
+            g,
+            beta_r,
+            a_log=params.a_log,
+            g_bias=params.g_bias,
+            lower_bound=params.lower_bound,
+            l2norm_eps=params.l2norm_eps,
             scale=params.scale,
         )
         # Store state and output in bf16 (matches Triton's cast-to-dtype at store).
@@ -341,8 +356,8 @@ def kda_state_decode_forward_reference_v2(inputs: KdaDecodeInputsV2) -> KdaDecod
 
 
 def kda_state_reset_v2(
-    state_bf16: np.ndarray,     # [B, H, D_v, D_qk]
-    reset_mask: np.ndarray,     # [B] bool
+    state_bf16: np.ndarray,  # [B, H, D_v, D_qk]
+    reset_mask: np.ndarray,  # [B] bool
 ) -> np.ndarray:
     """Zero the state slabs for batch elements whose reset_mask is True.
 
@@ -363,13 +378,14 @@ def kda_state_reset_v2(
 # Prefill (temporarily by-token; chunked-parallel deferred)
 # ---------------------------------------------------------------------------
 
+
 def kda_state_prefill_forward_reference_v2(
-    query: np.ndarray,        # [B, L, H, D_qk]
-    key: np.ndarray,          # [B, L, H, D_qk]
-    value: np.ndarray,        # [B, L, H, D_v]
-    g_raw: np.ndarray,        # [B, L, H, D_qk]
-    beta_raw: np.ndarray,     # [B, L, H]
-    state_bf16: np.ndarray,   # [B, H, D_v, D_qk]
+    query: np.ndarray,  # [B, L, H, D_qk]
+    key: np.ndarray,  # [B, L, H, D_qk]
+    value: np.ndarray,  # [B, L, H, D_v]
+    g_raw: np.ndarray,  # [B, L, H, D_qk]
+    beta_raw: np.ndarray,  # [B, L, H]
+    state_bf16: np.ndarray,  # [B, H, D_v, D_qk]
     params: KdaLayerParams,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Prefill by unrolled decode calls -- correct but O(L) sequential.
@@ -385,16 +401,16 @@ def kda_state_prefill_forward_reference_v2(
     S = state_bf16
     for t in range(L):
         step = KdaDecodeInputsV2(
-            query=query[:, t:t + 1],
-            key=key[:, t:t + 1],
-            value=value[:, t:t + 1],
-            g_raw=g_raw[:, t:t + 1],
-            beta_raw=beta_raw[:, t:t + 1],
+            query=query[:, t : t + 1],
+            key=key[:, t : t + 1],
+            value=value[:, t : t + 1],
+            g_raw=g_raw[:, t : t + 1],
+            beta_raw=beta_raw[:, t : t + 1],
             state_bf16=S,
             params=params,
         )
         out = kda_state_decode_forward_reference_v2(step)
-        y_all[:, t:t + 1] = out.y
+        y_all[:, t : t + 1] = out.y
         S = out.state_bf16
     return y_all, S
 
@@ -403,10 +419,12 @@ def kda_state_prefill_forward_reference_v2(
 # NKI backend (compilable-in-principle Python DSL source string). Loaded lazily.
 # ---------------------------------------------------------------------------
 
+
 def _try_import_nki() -> Optional[object]:
     """Best-effort NKI import. CPU-only environments return None."""
     try:
         import neuronxcc.nki as nki  # type: ignore
+
         return nki
     except Exception:
         return None
@@ -571,17 +589,19 @@ def kda_state_decode_forward_v2(
 # Kernel-tier sizing helpers (bf16 state -- 2x the v1 int8 sizes)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class KdaShapeV2:
     """Shape preset for the bf16-state KDA kernel.
 
     Fields mirror v1.KdaShape but the dtype is bf16 (2 bytes) rather than int8.
     """
-    B: int         # batch (= num_slots for continuous batching)
-    H: int         # heads (HV per FLA convention; H_kv folded in)
-    D_v: int       # value head-dim
-    D_qk: int      # QK head-dim
-    layers: int    # KDA layers colocated on one NC
+
+    B: int  # batch (= num_slots for continuous batching)
+    H: int  # heads (HV per FLA convention; H_kv folded in)
+    D_v: int  # value head-dim
+    D_qk: int  # QK head-dim
+    layers: int  # KDA layers colocated on one NC
 
 
 def sbuf_resident_state_bytes_v2(shape: KdaShapeV2) -> int:
@@ -618,7 +638,7 @@ EFFICIENT_DMA_DESCRIPTOR_BYTES_V2 = 4 * 1024
 TRAINIUM2_SBUF_BUDGET_BYTES_V2 = 24 * 1024 * 1024
 
 # Trn2 per-NeuronCore HBM budget (24 GiB).
-TRAINIUM2_HBM_BUDGET_BYTES_V2 = 24 * (1024 ** 3)
+TRAINIUM2_HBM_BUDGET_BYTES_V2 = 24 * (1024**3)
 
 
 # ---------------------------------------------------------------------------

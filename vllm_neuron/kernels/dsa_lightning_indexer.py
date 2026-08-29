@@ -58,6 +58,7 @@ DSA Lightning Indexer + sparse gather + sparse attention chain used by:
       which the CPU behavior is ported. Cross-check semantics before
       shipping any NKI kernel against this file.
 """
+
 from __future__ import annotations
 
 import math
@@ -100,7 +101,7 @@ KERNEL_SLUG_V1_NKI = "nki_v1_lightning_indexer"
 #
 # Any future NKI v1 device kernel that emits LSE MUST match this base
 # convention or file a defect against `test_dsa_lse_accumulator`.
-LSE_BASE_CONVENTION = "natural"   # "natural" or "base2"
+LSE_BASE_CONVENTION = "natural"  # "natural" or "base2"
 
 
 @dataclass(frozen=True)
@@ -156,21 +157,21 @@ def _causal_mask_scores(
     B, Q, L = scores.shape
     device = scores.device
 
-    key_idx = torch.arange(L, device=device).view(1, 1, L)     # [1,1,L]
-    q_pos = position_ids.view(B, Q, 1).to(torch.int64)          # [B,Q,1]
-    causal_ok = key_idx <= q_pos                                # [B,Q,L] bool
+    key_idx = torch.arange(L, device=device).view(1, 1, L)  # [1,1,L]
+    q_pos = position_ids.view(B, Q, 1).to(torch.int64)  # [B,Q,1]
+    causal_ok = key_idx <= q_pos  # [B,Q,L] bool
 
-    valid_len = key_lengths.view(B, 1, 1).to(torch.int64)       # [B,1,1]
-    len_ok = key_idx < valid_len                                 # [B,1,L] bool
+    valid_len = key_lengths.view(B, 1, 1).to(torch.int64)  # [B,1,1]
+    len_ok = key_idx < valid_len  # [B,1,L] bool
 
-    ok = causal_ok & len_ok                                     # [B,Q,L] bool
+    ok = causal_ok & len_ok  # [B,Q,L] bool
     return scores.masked_fill(~ok, float("-inf"))
 
 
 def lightning_indexer_scores(
-    query: torch.Tensor,          # [B, Q, H, D]  — the main-attention query
-    indexer_q_proj: torch.Tensor, # [H_idx, H*D, D_idx]  or projection weights
-    indexer_k_cache: torch.Tensor,# [B, L, H_idx, D_idx]
+    query: torch.Tensor,  # [B, Q, H, D]  — the main-attention query
+    indexer_q_proj: torch.Tensor,  # [H_idx, H*D, D_idx]  or projection weights
+    indexer_k_cache: torch.Tensor,  # [B, L, H_idx, D_idx]
     *,
     index_pool: int = 1,
     pool_weights: Optional[torch.Tensor] = None,  # [index_pool] fp32
@@ -205,7 +206,9 @@ def lightning_indexer_scores(
     if index_pool > 1:
         if pool_weights is None:
             pool_weights = torch.full(
-                (index_pool,), 1.0 / index_pool, dtype=torch.float32,
+                (index_pool,),
+                1.0 / index_pool,
+                dtype=torch.float32,
                 device=indexer_k_cache.device,
             )
         k_pooled = _apply_index_pool(indexer_k_cache, index_pool, pool_weights)
@@ -223,7 +226,7 @@ def lightning_indexer_scores(
 def _apply_index_pool(
     indexer_k_cache: torch.Tensor,  # [B, L, H_idx*index_pool, D_idx]
     index_pool: int,
-    pool_weights: torch.Tensor,     # [index_pool] fp32
+    pool_weights: torch.Tensor,  # [index_pool] fp32
 ) -> torch.Tensor:
     """Weighted-sum collapse of the pool axis. See scaffold §3.3."""
     B, L, HP, D_idx = indexer_k_cache.shape
@@ -231,13 +234,13 @@ def _apply_index_pool(
     H_idx = HP // index_pool
     reshaped = indexer_k_cache.reshape(B, L, H_idx, index_pool, D_idx).to(torch.float32)
     weights = pool_weights.to(torch.float32).view(1, 1, 1, index_pool, 1)
-    pooled = (reshaped * weights).sum(dim=3)   # [B, L, H_idx, D_idx]
+    pooled = (reshaped * weights).sum(dim=3)  # [B, L, H_idx, D_idx]
     return pooled
 
 
 def dsa_index_pool_projection(
-    index_keys: torch.Tensor,   # [B, L, index_pool * H_idx, D_idx]
-    pool_weights: torch.Tensor, # [index_pool]
+    index_keys: torch.Tensor,  # [B, L, index_pool * H_idx, D_idx]
+    pool_weights: torch.Tensor,  # [index_pool]
     *,
     index_pool: int,
 ) -> torch.Tensor:
@@ -246,11 +249,11 @@ def dsa_index_pool_projection(
 
 
 def lightning_indexer_topk(
-    query: torch.Tensor,           # [B, Q, H, D]
+    query: torch.Tensor,  # [B, Q, H, D]
     indexer_q_proj: torch.Tensor,  # [H_idx, H*D, D_idx]
-    indexer_k_cache: torch.Tensor, # [B, L, H_idx*index_pool, D_idx]
-    position_ids: torch.Tensor,    # [B, Q] int64
-    key_lengths: torch.Tensor,     # [B]    int64
+    indexer_k_cache: torch.Tensor,  # [B, L, H_idx*index_pool, D_idx]
+    position_ids: torch.Tensor,  # [B, Q] int64
+    key_lengths: torch.Tensor,  # [B]    int64
     *,
     topk: int,
     causal: bool = True,
@@ -289,8 +292,8 @@ def lightning_indexer_topk(
 
 
 def sparse_gather_kv(
-    kv_cache: torch.Tensor,        # [B, L, H, D]
-    topk_indices: torch.Tensor,    # [B, Q, topk] int32
+    kv_cache: torch.Tensor,  # [B, L, H, D]
+    topk_indices: torch.Tensor,  # [B, Q, topk] int32
 ) -> torch.Tensor:
     """Gather K or V rows at `topk_indices`.
 
@@ -302,14 +305,14 @@ def sparse_gather_kv(
     """
     B, L, H, D = kv_cache.shape
     _, Q, K = topk_indices.shape
-    idx = topk_indices.to(torch.int64).clamp_(0, L - 1)         # [B, Q, K]
+    idx = topk_indices.to(torch.int64).clamp_(0, L - 1)  # [B, Q, K]
     # Expand for gather over dim=1 (the L axis).
-    idx_exp = idx.view(B, Q, K, 1, 1).expand(B, Q, K, H, D)      # [B,Q,K,H,D]
+    idx_exp = idx.view(B, Q, K, 1, 1).expand(B, Q, K, H, D)  # [B,Q,K,H,D]
     kv_exp = kv_cache.view(B, L, 1, H, D).expand(B, L, Q, H, D)
     # gather along dim=1 of kv_exp gives [B, K_selected, Q, H, D] — but we
     # want per-query independent gathers; do it with advanced indexing.
     batch_idx = torch.arange(B, device=kv_cache.device).view(B, 1, 1).expand(B, Q, K)
-    selected = kv_cache[batch_idx, idx]                          # [B, Q, K, H, D]
+    selected = kv_cache[batch_idx, idx]  # [B, Q, K, H, D]
     return selected
 
 
@@ -319,12 +322,12 @@ def sparse_gather_kv(
 
 
 def dsa_sparse_attention_forward(
-    query: torch.Tensor,          # [B, Q, H, D]
-    kv_cache_k: torch.Tensor,     # [B, L, H, D]
-    kv_cache_v: torch.Tensor,     # [B, L, H, D]
-    topk_indices: torch.Tensor,   # [B, Q, topk] int32
-    position_ids: torch.Tensor,   # [B, Q] int64
-    key_lengths: torch.Tensor,    # [B]    int64
+    query: torch.Tensor,  # [B, Q, H, D]
+    kv_cache_k: torch.Tensor,  # [B, L, H, D]
+    kv_cache_v: torch.Tensor,  # [B, L, H, D]
+    topk_indices: torch.Tensor,  # [B, Q, topk] int32
+    position_ids: torch.Tensor,  # [B, Q] int64
+    key_lengths: torch.Tensor,  # [B]    int64
     *,
     topk: int,
     scaling: Optional[float] = None,
@@ -359,22 +362,22 @@ def dsa_sparse_attention_forward(
         scaling = 1.0 / math.sqrt(D)
 
     # Gather K and V per selected index.
-    k_sel = sparse_gather_kv(kv_cache_k, topk_indices)   # [B, Q, K, H, D]
-    v_sel = sparse_gather_kv(kv_cache_v, topk_indices)   # [B, Q, K, H, D]
+    k_sel = sparse_gather_kv(kv_cache_k, topk_indices)  # [B, Q, K, H, D]
+    v_sel = sparse_gather_kv(kv_cache_v, topk_indices)  # [B, Q, K, H, D]
 
-    q = query.unsqueeze(2).to(torch.float32)              # [B, Q, 1, H, D]
-    k = k_sel.to(torch.float32)                           # [B, Q, K, H, D]
+    q = query.unsqueeze(2).to(torch.float32)  # [B, Q, 1, H, D]
+    k = k_sel.to(torch.float32)  # [B, Q, K, H, D]
     v = v_sel.to(torch.float32)
 
     # Scores: [B, Q, K, H] = sum_D q * k
-    scores = (q * k).sum(dim=-1) * scaling               # [B, Q, K, H]
+    scores = (q * k).sum(dim=-1) * scaling  # [B, Q, K, H]
 
     # Build the mask over the K axis. Same rule as the indexer.
     device = query.device
-    q_pos = position_ids.view(B, Q, 1).to(torch.int64)   # [B,Q,1]
-    idx_int = topk_indices.to(torch.int64)                # [B,Q,K]
+    q_pos = position_ids.view(B, Q, 1).to(torch.int64)  # [B,Q,1]
+    idx_int = topk_indices.to(torch.int64)  # [B,Q,K]
 
-    valid_len = key_lengths.view(B, 1, 1).to(torch.int64) # [B,1,1]
+    valid_len = key_lengths.view(B, 1, 1).to(torch.int64)  # [B,1,1]
     len_ok = idx_int < valid_len
     if causal:
         causal_ok = idx_int <= q_pos
@@ -389,7 +392,7 @@ def dsa_sparse_attention_forward(
     # topk=1 IF the indexer's single choice was masked out — a real
     # correctness escape hatch. Detect and replace with zero output
     # (attention contributes nothing) rather than NaN-propagate.
-    all_neg_inf = (~ok).all(dim=-1)                       # [B, Q]
+    all_neg_inf = (~ok).all(dim=-1)  # [B, Q]
     if all_neg_inf.any():
         # Replace those rows' scores with a single sentinel 0.0 in slot 0
         # so softmax returns a one-hot on the (masked) row 0; the
@@ -408,10 +411,10 @@ def dsa_sparse_attention_forward(
     denom = exp.sum(dim=2, keepdim=True)
     # Guard against all-masked queries -> denom=0 -> nan.
     denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-    attn = exp / denom                                    # [B, Q, K, H]
+    attn = exp / denom  # [B, Q, K, H]
 
     # Weighted sum of V:  out = sum_K attn * v
-    out = (attn.unsqueeze(-1) * v).sum(dim=2)             # [B, Q, H, D]
+    out = (attn.unsqueeze(-1) * v).sum(dim=2)  # [B, Q, H, D]
 
     # Force all-masked rows to zero output, not the softmax fallback.
     if all_neg_inf.any():
@@ -426,7 +429,7 @@ def dsa_sparse_attention_forward(
         # scores_max=0, which would yield lse=0. Override with -inf so a
         # cross-shard combine treats this row as zero-mass (matches
         # SGLang `fixup_zero_kv_rows` at PR #31821).
-        lse = (scores_max + torch.log(denom)).squeeze(2)   # [B, Q, H]
+        lse = (scores_max + torch.log(denom)).squeeze(2)  # [B, Q, H]
         if all_neg_inf.any():
             lse = lse.masked_fill(
                 all_neg_inf.unsqueeze(-1),
@@ -442,13 +445,13 @@ def dsa_sparse_attention_forward(
 
 
 def dsa_lightning_indexer_forward(
-    query: torch.Tensor,             # [B, Q, H, D]
-    indexer_q_proj: torch.Tensor,    # [H_idx, H*D, D_idx]
-    indexer_k_cache: torch.Tensor,   # [B, L, H_idx*index_pool, D_idx]
-    kv_cache_k: torch.Tensor,        # [B, L, H, D]
-    kv_cache_v: torch.Tensor,        # [B, L, H, D]
-    position_ids: torch.Tensor,      # [B, Q]  int64
-    key_lengths: torch.Tensor,       # [B]     int64
+    query: torch.Tensor,  # [B, Q, H, D]
+    indexer_q_proj: torch.Tensor,  # [H_idx, H*D, D_idx]
+    indexer_k_cache: torch.Tensor,  # [B, L, H_idx*index_pool, D_idx]
+    kv_cache_k: torch.Tensor,  # [B, L, H, D]
+    kv_cache_v: torch.Tensor,  # [B, L, H, D]
+    position_ids: torch.Tensor,  # [B, Q]  int64
+    key_lengths: torch.Tensor,  # [B]     int64
     *,
     topk: int,
     index_pool: int = 1,
@@ -510,11 +513,11 @@ def dsa_lightning_indexer_forward(
 
 
 def full_attention_reference(
-    query: torch.Tensor,          # [B, Q, H, D]
-    kv_cache_k: torch.Tensor,     # [B, L, H, D]
-    kv_cache_v: torch.Tensor,     # [B, L, H, D]
-    position_ids: torch.Tensor,   # [B, Q] int64
-    key_lengths: torch.Tensor,    # [B]    int64
+    query: torch.Tensor,  # [B, Q, H, D]
+    kv_cache_k: torch.Tensor,  # [B, L, H, D]
+    kv_cache_v: torch.Tensor,  # [B, L, H, D]
+    position_ids: torch.Tensor,  # [B, Q] int64
+    key_lengths: torch.Tensor,  # [B]    int64
     *,
     scaling: Optional[float] = None,
     causal: bool = True,
@@ -555,7 +558,7 @@ def full_attention_reference(
     exp = torch.where(torch.isfinite(scores), exp, torch.zeros_like(exp))
     denom = exp.sum(dim=2, keepdim=True)
     denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-    attn = exp / denom                                # [B, Q, L, H]
+    attn = exp / denom  # [B, Q, L, H]
 
     out = torch.einsum("bqlh,blhd->bqhd", attn, v)
     return out.to(query.dtype)
@@ -567,12 +570,12 @@ def full_attention_reference(
 
 
 def full_attention_at_indices_reference(
-    query: torch.Tensor,          # [B, Q, H, D]
-    kv_cache_k: torch.Tensor,     # [B, L, H, D]
-    kv_cache_v: torch.Tensor,     # [B, L, H, D]
-    topk_indices: torch.Tensor,   # [B, Q, topk] int32
-    position_ids: torch.Tensor,   # [B, Q]       int64
-    key_lengths: torch.Tensor,    # [B]          int64
+    query: torch.Tensor,  # [B, Q, H, D]
+    kv_cache_k: torch.Tensor,  # [B, L, H, D]
+    kv_cache_v: torch.Tensor,  # [B, L, H, D]
+    topk_indices: torch.Tensor,  # [B, Q, topk] int32
+    position_ids: torch.Tensor,  # [B, Q]       int64
+    key_lengths: torch.Tensor,  # [B]          int64
     *,
     scaling: Optional[float] = None,
     causal: bool = True,
@@ -593,8 +596,8 @@ def full_attention_at_indices_reference(
     # Materialise selected K, V per query.
     idx = topk_indices.to(torch.int64)
     batch_idx = torch.arange(B, device=query.device).view(B, 1, 1).expand_as(idx)
-    k_sel = kv_cache_k[batch_idx, idx]      # [B, Q, K, H, D]
-    v_sel = kv_cache_v[batch_idx, idx]      # [B, Q, K, H, D]
+    k_sel = kv_cache_k[batch_idx, idx]  # [B, Q, K, H, D]
+    v_sel = kv_cache_v[batch_idx, idx]  # [B, Q, K, H, D]
 
     q = query.unsqueeze(2).to(torch.float32)
     k = k_sel.to(torch.float32)
@@ -619,7 +622,7 @@ def full_attention_at_indices_reference(
     exp = torch.where(torch.isfinite(scores), exp, torch.zeros_like(exp))
     denom = exp.sum(dim=2, keepdim=True)
     denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-    attn = exp / denom                       # [B, Q, K, H]
+    attn = exp / denom  # [B, Q, K, H]
     out = (attn.unsqueeze(-1) * v).sum(dim=2)  # [B, Q, H, D]
     return out.to(query.dtype)
 
@@ -645,19 +648,19 @@ class KernelResourceBounds:
     sbuf_bytes_gather_workspace: int
     sbuf_bytes_attention_workspace: int
     sbuf_bytes_total: int
-    sbuf_bytes_ceiling: int          # Trn2 per-NC SBUF ~24 MiB after weights
-    sbuf_fits: bool                  # sbuf_bytes_total <= sbuf_bytes_ceiling
+    sbuf_bytes_ceiling: int  # Trn2 per-NC SBUF ~24 MiB after weights
+    sbuf_fits: bool  # sbuf_bytes_total <= sbuf_bytes_ceiling
     sbuf_headroom_bytes: int
 
     # DMA descriptors
-    descriptors_per_query_naive: int    # 1 per topk position
-    descriptors_per_query_coalesced: int # 1 per (topk // block_size)
-    descriptor_reduction_factor: float   # naive / coalesced
+    descriptors_per_query_naive: int  # 1 per topk position
+    descriptors_per_query_coalesced: int  # 1 per (topk // block_size)
+    descriptor_reduction_factor: float  # naive / coalesced
     descriptor_cache_slots_used: int
     descriptor_cache_slots_ceiling: int  # ~4096
 
     # Compute floor
-    flops_indexer: int    # 2*L*H_idx*D_idx + L*log(L)   (top-K sort)
+    flops_indexer: int  # 2*L*H_idx*D_idx + L*log(L)   (top-K sort)
     flops_sparse_attn: int  # 4*topk*H*D
     cycles_floor_per_token: int  # very optimistic — TensorE peak
     cycles_ceiling_per_token: int  # pessimistic — full serial
@@ -675,7 +678,7 @@ def analytical_bounds(
     topk: int,
     block_size: int,
     index_pool: int = 1,
-    dtype_bytes: int = 2,   # bf16 default
+    dtype_bytes: int = 2,  # bf16 default
 ) -> KernelResourceBounds:
     """Compute the analytical SBUF/DMA/cycles envelope for one kernel call.
 
@@ -686,30 +689,30 @@ def analytical_bounds(
     # Indexer KV resident window: keep `sbuf_indexer_window_blocks` blocks
     # of the indexer cache SBUF-resident during the top-K pass. This is
     # the smallest tile allowed by the descriptor-coalescing scaffold.
-    sbuf_indexer_window_blocks = 96   # scaffold §4.1
+    sbuf_indexer_window_blocks = 96  # scaffold §4.1
     sbuf_indexer_bytes = (
         sbuf_indexer_window_blocks * block_size * H_idx * D_idx * dtype_bytes
     )
     # Top-K workspace: `L` fp32 scores per (b, q) held during selection.
     # We stream in `min(L, 16384)` slots at a time to stay under the
     # `nc_find_index8` cap. Workspace is the STREAM tile, not the full L.
-    topk_stream_width = min(L, 16384)   # nc_find_index8 partition cap
-    sbuf_topk_bytes = topk_stream_width * 4   # fp32
+    topk_stream_width = min(L, 16384)  # nc_find_index8 partition cap
+    sbuf_topk_bytes = topk_stream_width * 4  # fp32
     # Gather workspace: one block of K + V held per Q-tile.
-    q_tile = min(Q, 16)   # scaffold §4.3
+    q_tile = min(Q, 16)  # scaffold §4.3
     sbuf_gather_bytes = 2 * q_tile * block_size * H * D * dtype_bytes
     # Attention workspace: one Q-tile of the K-fold accumulator.
-    sbuf_attn_bytes = q_tile * topk * H * dtype_bytes    # scores at fp16
+    sbuf_attn_bytes = q_tile * topk * H * dtype_bytes  # scores at fp16
     sbuf_total = (
         sbuf_indexer_bytes + sbuf_topk_bytes + sbuf_gather_bytes + sbuf_attn_bytes
     )
-    sbuf_ceiling = 24 * 1024 * 1024    # ~24 MiB per NC after weights
+    sbuf_ceiling = 24 * 1024 * 1024  # ~24 MiB per NC after weights
     sbuf_fits = sbuf_total <= sbuf_ceiling
     sbuf_headroom = sbuf_ceiling - sbuf_total
 
     # ----- DMA descriptors --------------------------------------------
-    desc_naive = topk                                     # 1 per position
-    desc_coalesced = max(1, topk // block_size)           # 1 per block
+    desc_naive = topk  # 1 per position
+    desc_coalesced = max(1, topk // block_size)  # 1 per block
     desc_reduction = desc_naive / max(desc_coalesced, 1)
     # Total across a q_tile of 16 queries: 16 * desc_coalesced. Compare
     # to descriptor cache (~4096 slots per scaffold §4.3).
@@ -724,7 +727,7 @@ def analytical_bounds(
     # Cycles floor: TensorE @ 8k FLOPs/cycle (Trn2 peak), one NC.
     tensor_e_flops_per_cycle = 8192
     cycles_floor = max(1, (flops_index + flops_sparse_attn) // tensor_e_flops_per_cycle)
-    cycles_ceiling = cycles_floor * 4    # pessimistic serial factor
+    cycles_ceiling = cycles_floor * 4  # pessimistic serial factor
 
     return KernelResourceBounds(
         sbuf_bytes_indexer_kv_resident=sbuf_indexer_bytes,
