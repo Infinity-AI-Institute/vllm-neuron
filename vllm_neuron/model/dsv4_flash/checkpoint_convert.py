@@ -604,6 +604,7 @@ def _convert_routed_moe_layer(
     wrapper_prefix: str = "",
     dtype: torch.dtype | None = None,
     expert_indices: range | list[int] | None = None,
+    include_static: bool = True,
 ) -> dict[str, Any]:
     """Convert one DSv4-Flash routed-MoE layer HF -> wrapper module tree.
 
@@ -638,6 +639,10 @@ def _convert_routed_moe_layer(
     NxDI's ExpertMLPs weight layout is ``[E, hidden, 2*I]`` for
     ``gate_up_proj`` and ``[E, I, hidden]`` for ``down_proj`` — same as
     GLM-5.3-Flash Round 5.
+
+    ``include_static=False`` is reserved for later streaming expert chunks;
+    those calls emit only the selected routed-expert tensors and skip the
+    layer-static router, correction bias, shared expert, and report.
     """
     dtype = dtype if dtype is not None else src.torch_dtype
     if src.mlp_layer_types[layer_idx] != "moe":
@@ -655,38 +660,40 @@ def _convert_routed_moe_layer(
     hf_base = f"{hf_prefix}layers.{layer_idx}."
     target = f"{wrapper_prefix}layers.{layer_idx}.mlp."
 
-    # ---- router + correction bias ----
-    router_key = f"{hf_base}{ROUTER_KEY}"
-    router = state_dict.get(router_key)
-    if router is None:
-        raise KeyError(f"missing router weight {router_key!r}")
-    if tuple(router.shape) != (n_experts, hidden):
-        raise ValueError(
-            f"router weight {router_key!r} shape {tuple(router.shape)} "
-            f"disagrees with expected ({n_experts}, {hidden})"
-        )
-    # Router lives in fp32 in the wrapper — cast at conversion so no cast
-    # is inserted at forward time.
-    converted[f"{target}router.weight"] = router.to(torch.float32)
-
-    corr_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
-    corr = state_dict.get(corr_key)
-    if corr is None:
-        # A missing correction bias degrades gracefully to top-k on the raw
-        # scores; the wrapper declares the parameter with a zero default so
-        # this is a documented soft fallback.  Record it in the report.
-        e_bias_present = False
-    else:
-        if tuple(corr.shape) != (n_experts,):
+    e_bias_present: bool | None = None
+    if include_static:
+        # ---- router + correction bias ----
+        router_key = f"{hf_base}{ROUTER_KEY}"
+        router = state_dict.get(router_key)
+        if router is None:
+            raise KeyError(f"missing router weight {router_key!r}")
+        if tuple(router.shape) != (n_experts, hidden):
             raise ValueError(
-                f"correction bias {corr_key!r} shape {tuple(corr.shape)} "
-                f"disagrees with expected ({n_experts},)"
+                f"router weight {router_key!r} shape {tuple(router.shape)} "
+                f"disagrees with expected ({n_experts}, {hidden})"
             )
-        converted[f"{target}e_score_correction_bias"] = corr.to(torch.float32)
-        e_bias_present = True
+        # Router lives in fp32 in the wrapper — cast at conversion so no cast
+        # is inserted at forward time.
+        converted[f"{target}router.weight"] = router.to(torch.float32)
 
-    # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
-    _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
+        corr_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
+        corr = state_dict.get(corr_key)
+        if corr is None:
+            # A missing correction bias degrades gracefully to top-k on the raw
+            # scores; the wrapper declares the parameter with a zero default so
+            # this is a documented soft fallback.  Record it in the report.
+            e_bias_present = False
+        else:
+            if tuple(corr.shape) != (n_experts,):
+                raise ValueError(
+                    f"correction bias {corr_key!r} shape {tuple(corr.shape)} "
+                    f"disagrees with expected ({n_experts},)"
+                )
+            converted[f"{target}e_score_correction_bias"] = corr.to(torch.float32)
+            e_bias_present = True
+
+        # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
+        _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
 
     # ---- routed experts (FP4-UE8M0, block (1, 32)) ----
     #
@@ -756,7 +763,8 @@ def _convert_routed_moe_layer(
         "block_size_fp4": DSV4_FP4_BLOCK_SIZE,
         "block_size_fp8_shared": block_fp8,
     }
-    converted.setdefault("_routed_moe_reports", {})[layer_idx] = report
+    if include_static:
+        converted.setdefault("_routed_moe_reports", {})[layer_idx] = report
     return report
 
 
@@ -833,6 +841,7 @@ def _convert_hash_moe_block(
     wrapper_prefix: str = "",
     dtype: torch.dtype | None = None,
     expert_indices: range | list[int] | None = None,
+    include_static: bool = True,
 ) -> dict[str, Any]:
     """Convert one DSv4-Flash hash-MoE bootstrap layer HF -> wrapper module tree.
 
@@ -876,6 +885,10 @@ def _convert_hash_moe_block(
     ``_hash_moe_reports[layer_idx]`` on the ``converted`` dict for
     debugging + smoke-test consumption.  The report includes the
     ``tid2eid`` shape/dtype and per-expert stacked shapes.
+
+    ``include_static=False`` is reserved for later streaming expert chunks;
+    those calls emit only the selected routed-expert tensors and skip the
+    layer-static router, tid2eid, shared expert, and report.
     """
     dtype = dtype if dtype is not None else src.torch_dtype
     if src.mlp_layer_types[layer_idx] != "hash_moe":
@@ -896,48 +909,51 @@ def _convert_hash_moe_block(
     hf_base = f"{hf_prefix}layers.{layer_idx}."
     target = f"{wrapper_prefix}layers.{layer_idx}.mlp."
 
-    # ---- router ----
-    router_key = f"{hf_base}{ROUTER_KEY}"
-    router = state_dict.get(router_key)
-    if router is None:
-        raise KeyError(f"missing router weight {router_key!r}")
-    if tuple(router.shape) != (n_experts, hidden):
-        raise ValueError(
-            f"router weight {router_key!r} shape {tuple(router.shape)} "
-            f"disagrees with expected ({n_experts}, {hidden})"
-        )
-    # Router lives in fp32 in the wrapper — cast at conversion so no cast
-    # is inserted at forward time.
-    converted[f"{target}router.weight"] = router.to(torch.float32)
+    normalized_tid2eid: torch.Tensor | None = None
+    tid2eid_report: dict[str, Any] | None = None
+    if include_static:
+        # ---- router ----
+        router_key = f"{hf_base}{ROUTER_KEY}"
+        router = state_dict.get(router_key)
+        if router is None:
+            raise KeyError(f"missing router weight {router_key!r}")
+        if tuple(router.shape) != (n_experts, hidden):
+            raise ValueError(
+                f"router weight {router_key!r} shape {tuple(router.shape)} "
+                f"disagrees with expected ({n_experts}, {hidden})"
+            )
+        # Router lives in fp32 in the wrapper — cast at conversion so no cast
+        # is inserted at forward time.
+        converted[f"{target}router.weight"] = router.to(torch.float32)
 
-    # ---- tid2eid lookup ----
-    tid_key = f"{hf_base}{HASH_TID2EID_KEY}"
-    tid2eid = state_dict.get(tid_key)
-    if tid2eid is None:
-        raise KeyError(
-            f"missing tid2eid lookup {tid_key!r} — hash-MoE layer requires "
-            "the frozen [vocab_size, num_experts_per_tok] integer lookup"
+        # ---- tid2eid lookup ----
+        tid_key = f"{hf_base}{HASH_TID2EID_KEY}"
+        tid2eid = state_dict.get(tid_key)
+        if tid2eid is None:
+            raise KeyError(
+                f"missing tid2eid lookup {tid_key!r} — hash-MoE layer requires "
+                "the frozen [vocab_size, num_experts_per_tok] integer lookup"
+            )
+        normalized_tid2eid, tid2eid_report = _convert_hash_tid2eid(
+            tid2eid,
+            key=tid_key,
+            vocab_size=vocab_size,
+            top_k=top_k,
+            n_experts=n_experts,
         )
-    normalized_tid2eid, tid2eid_report = _convert_hash_tid2eid(
-        tid2eid,
-        key=tid_key,
-        vocab_size=vocab_size,
-        top_k=top_k,
-        n_experts=n_experts,
-    )
-    converted[f"{target}tid2eid"] = normalized_tid2eid
+        converted[f"{target}tid2eid"] = normalized_tid2eid
 
-    # ---- correction bias MUST be absent (hash mode) ----
-    bias_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
-    if state_dict.get(bias_key) is not None:
-        raise ValueError(
-            f"hash-MoE layer {layer_idx} carries {bias_key!r} but HF sets "
-            "Gate.bias=None in hash mode (model.py:565) — layer schedule "
-            "drift between config and checkpoint"
-        )
+        # ---- correction bias MUST be absent (hash mode) ----
+        bias_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
+        if state_dict.get(bias_key) is not None:
+            raise ValueError(
+                f"hash-MoE layer {layer_idx} carries {bias_key!r} but HF sets "
+                "Gate.bias=None in hash mode (model.py:565) — layer schedule "
+                "drift between config and checkpoint"
+            )
 
-    # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
-    _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
+        # ---- shared expert (FP8-UE8M0, block (128, 128)) ----
+        _convert_shared_expert(state_dict, converted, hf_base, target, dtype, block_fp8)
 
     # ---- routed experts (FP4-UE8M0, block (1, 32)) ----
     # Same layout as the routed-MoE per-layer helper — the two paths
@@ -981,7 +997,7 @@ def _convert_hash_moe_block(
     converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_stacked
     converted[f"{target}expert_mlps.mlp_op.down_proj.weight"] = down_stacked
 
-    report = {
+    report: dict[str, Any] = {
         "layer_idx": layer_idx,
         "layer_type": "hash_moe",
         "n_routed_experts": n_experts,
@@ -991,14 +1007,21 @@ def _convert_hash_moe_block(
         "moe_intermediate": inter,
         "gate_up_shape": tuple(gate_up_stacked.shape),
         "down_shape": tuple(down_stacked.shape),
-        "tid2eid_shape": tuple(normalized_tid2eid.shape),
-        "tid2eid_dtype": str(normalized_tid2eid.dtype),
-        "tid2eid_conversion": tid2eid_report,
         "dtype": str(dtype),
         "block_size_fp4": DSV4_FP4_BLOCK_SIZE,
         "block_size_fp8_shared": block_fp8,
     }
-    converted.setdefault("_hash_moe_reports", {})[layer_idx] = report
+    if include_static:
+        assert normalized_tid2eid is not None
+        assert tid2eid_report is not None
+        report.update(
+            {
+                "tid2eid_shape": tuple(normalized_tid2eid.shape),
+                "tid2eid_dtype": str(normalized_tid2eid.dtype),
+                "tid2eid_conversion": tid2eid_report,
+            }
+        )
+        converted.setdefault("_hash_moe_reports", {})[layer_idx] = report
     return report
 
 

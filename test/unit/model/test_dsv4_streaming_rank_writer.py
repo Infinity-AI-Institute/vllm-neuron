@@ -47,7 +47,7 @@ _load_module(
     "vllm_neuron.model.dsv4_flash.config",
     MODEL_ROOT / "dsv4_flash" / "config.py",
 )
-_load_module(
+CONVERTER = _load_module(
     "vllm_neuron.model.dsv4_flash.checkpoint_convert",
     MODEL_ROOT / "dsv4_flash" / "checkpoint_convert.py",
 )
@@ -174,3 +174,124 @@ def test_unpinned_source_bypass_is_reduced_fixture_only(tmp_path: Path) -> None:
             ranks=[0],
             _test_only_allow_unpinned_source=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("mlp_type", "converter_name"),
+    [
+        ("hash_moe", "_convert_hash_moe_block"),
+        ("moe", "_convert_routed_moe_layer"),
+    ],
+)
+def test_chunked_experts_emit_static_layer_state_once(
+    monkeypatch: pytest.MonkeyPatch, mlp_type: str, converter_name: str
+) -> None:
+    calls: list[bool] = []
+    expert_key = "layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+    down_key = "layers.0.mlp.expert_mlps.mlp_op.down_proj.weight"
+
+    def convert(state, converted, layer_idx, src, *, expert_indices, include_static):
+        del state, layer_idx, src
+        calls.append(include_static)
+        count = len(expert_indices)
+        converted[expert_key] = torch.ones(count, 2, 2)
+        converted[down_key] = torch.ones(count, 2, 2)
+        if include_static:
+            converted["layers.0.mlp.router.weight"] = torch.ones(2, 2)
+            converted["_conversion_report"] = {"first_chunk": True}
+
+    monkeypatch.setattr(SHARDER, converter_name, convert)
+    monkeypatch.setattr(SHARDER, "_convert_csa_block", lambda *args: {})
+    monkeypatch.setattr(SHARDER, "_convert_mhc_layer", lambda *args: {})
+    source = SimpleNamespace(
+        layer_types=["compressed_sparse_attention"],
+        mlp_layer_types=[mlp_type],
+        n_routed_experts=4,
+        torch_dtype=torch.float32,
+    )
+    converted = SHARDER._convert_one_layer(
+        {"layers.0.ffn_norm.weight": torch.ones(2)},
+        0,
+        source,
+        expert_chunk_size=2,
+    )
+    assert calls == [True, False]
+    assert converted[expert_key].shape == (4, 2, 2)
+    assert converted[down_key].shape == (4, 2, 2)
+    assert torch.equal(converted["layers.0.mlp.router.weight"], torch.ones(2, 2))
+    assert all(not key.startswith("_") for key in converted)
+
+
+def test_chunked_experts_still_reject_unexpected_later_chunk_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expert_key = "layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+    down_key = "layers.0.mlp.expert_mlps.mlp_op.down_proj.weight"
+
+    def buggy_convert(
+        state, converted, layer_idx, src, *, expert_indices, include_static
+    ):
+        del state, layer_idx, src, include_static
+        count = len(expert_indices)
+        converted[expert_key] = torch.ones(count, 2, 2)
+        converted[down_key] = torch.ones(count, 2, 2)
+        converted["layers.0.mlp.router.weight"] = torch.ones(2, 2)
+
+    monkeypatch.setattr(SHARDER, "_convert_hash_moe_block", buggy_convert)
+    monkeypatch.setattr(SHARDER, "_convert_csa_block", lambda *args: {})
+    monkeypatch.setattr(SHARDER, "_convert_mhc_layer", lambda *args: {})
+    source = SimpleNamespace(
+        layer_types=["compressed_sparse_attention"],
+        mlp_layer_types=["hash_moe"],
+        n_routed_experts=4,
+        torch_dtype=torch.float32,
+    )
+    with pytest.raises(RuntimeError, match="unexpected duplicate keys"):
+        SHARDER._convert_one_layer(
+            {"layers.0.ffn_norm.weight": torch.ones(2)},
+            0,
+            source,
+            expert_chunk_size=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mlp_type", "converter_name"),
+    [
+        ("hash_moe", "_convert_hash_moe_block"),
+        ("moe", "_convert_routed_moe_layer"),
+    ],
+)
+def test_later_chunk_converter_skips_all_static_outputs(
+    monkeypatch: pytest.MonkeyPatch, mlp_type: str, converter_name: str
+) -> None:
+    def dequant(state, key, dtype):
+        del state
+        if ".w2." in key:
+            return torch.ones(2, 1, dtype=dtype)
+        return torch.ones(1, 2, dtype=dtype)
+
+    monkeypatch.setattr(CONVERTER, "_dequant_expert_fp4_weight", dequant)
+    source = SimpleNamespace(
+        mlp_layer_types=[mlp_type],
+        torch_dtype=torch.float32,
+        hidden_size=2,
+        moe_intermediate_size=1,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        vocab_size=4,
+        quantization_config=SimpleNamespace(weight_block_size=(1, 1)),
+    )
+    converted = {}
+    getattr(CONVERTER, converter_name)(
+        {},
+        converted,
+        0,
+        source,
+        expert_indices=[0],
+        include_static=False,
+    )
+    assert set(converted) == {
+        "layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight",
+        "layers.0.mlp.expert_mlps.mlp_op.down_proj.weight",
+    }
