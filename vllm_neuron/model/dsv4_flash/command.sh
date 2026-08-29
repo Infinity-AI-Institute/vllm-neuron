@@ -9,6 +9,16 @@ set -euo pipefail
 
 : "${COMPILE_CONTRACT:?set COMPILE_CONTRACT to the lane contract JSON}"
 : "${COMPILE_RUN_ROOT:?set COMPILE_RUN_ROOT to the lane run root}"
+: "${MODEL_DIR:?set MODEL_DIR to the reviewed DeepSeek-V4 snapshot}"
+: "${SRC_DIR:?set SRC_DIR to the exact validator-merged source checkout}"
+: "${AUTH_EVIDENCE_ROOT:?set AUTH_EVIDENCE_ROOT to the reviewed host-only evidence directory}"
+
+COMPILE_CONTRACT="$(realpath "$COMPILE_CONTRACT")"
+COMPILE_RUN_ROOT="$(realpath "$COMPILE_RUN_ROOT")"
+MODEL_DIR="$(realpath "$MODEL_DIR")"
+SRC_DIR="$(realpath "$SRC_DIR")"
+AUTH_EVIDENCE_ROOT="$(realpath "$AUTH_EVIDENCE_ROOT")"
+RANK_SOURCE_DIR="$(realpath "$COMPILE_RUN_ROOT/weights")"
 
 IMAGE="$(jq -er '.stack.container_digest' "$COMPILE_CONTRACT")"
 TP="$(jq -er '.compile.tp' "$COMPILE_CONTRACT")"
@@ -19,10 +29,8 @@ DISABLE_ARGMAX="$(jq -er '.compile.disable_argmax_kernel' "$COMPILE_CONTRACT")"
 DRY_RUN="$(jq -er '.compile.dry_run' "$COMPILE_CONTRACT")"
 CONTRACT_SLUG="$(jq -er '.contract_slug' "$COMPILE_CONTRACT")"
 
-MODEL_DIR="${MODEL_DIR:-/mnt/compile/hf-cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
-SRC_DIR="${SRC_DIR:-/mnt/compile/src/vllm-neuron-bravo}"
-: "${AUTH_EVIDENCE_ROOT:?set AUTH_EVIDENCE_ROOT to the reviewed host-only evidence directory}"
 AUTH_PACKET="${AUTH_PACKET:-$SRC_DIR/vllm_neuron/model/dsv4_flash/tp32_compile_authorization.json}"
+AUTH_PACKET="$(realpath "$AUTH_PACKET")"
 OUT_DIR="$COMPILE_RUN_ROOT/artifacts/model"
 test -s "$MODEL_DIR/config.json"
 test -f "$SRC_DIR/vllm_neuron/model/dsv4_flash/neuron_wrapper.py"
@@ -31,7 +39,10 @@ python "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py"
   --packet "$AUTH_PACKET" \
   --compile-contract "$COMPILE_CONTRACT" \
   --evidence-root "$AUTH_EVIDENCE_ROOT" \
-  --repository "$SRC_DIR" \
+  --model-dir "$MODEL_DIR" \
+  --compile-run-root "$COMPILE_RUN_ROOT" \
+  --rank-source "$RANK_SOURCE_DIR" \
+  --source-dir "$SRC_DIR" \
   --require-compile-permitted
 mkdir -p "$COMPILE_RUN_ROOT"/{cache,work/tmp,work/nxd,artifacts/model,logs}
 

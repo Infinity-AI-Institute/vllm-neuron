@@ -84,6 +84,20 @@ def _safe_artifact(root: Path, relative: Any, label: str) -> Path:
     return path
 
 
+def _git_output(repository: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    _require(
+        result.returncode == 0,
+        f"Git command failed in {repository}: {' '.join(arguments)}",
+    )
+    return result.stdout.strip()
+
+
 def validate_packet(packet: Mapping[str, Any]) -> None:
     _require(packet.get("schema_version") == 1, "schema drift")
     _require(
@@ -196,12 +210,35 @@ def _validate_source(
 ) -> None:
     for key in ("source_commit", "validator_merge_sha"):
         _require_git_oid(source.get(key), key)
+    _require_git_oid(source.get("validator_merge_tree_sha"), "validator merge tree")
     _require(
         source.get("validator_merged_to_agent_main") is True,
         "source is not validator-merged",
     )
     for key in ("revision", "config_sha256", "index_sha256"):
         _require(source.get(key) == packet[key], f"source {key} drift")
+    model_files = source.get("model_files")
+    expected_model_hashes = {
+        "config.json": packet["config_sha256"],
+        "model.safetensors.index.json": packet["index_sha256"],
+        "tokenizer.json": packet["tokenizer_sha256"],
+    }
+    _require(
+        isinstance(model_files, Mapping)
+        and set(model_files) == set(expected_model_hashes),
+        "source model-file inventory drift",
+    )
+    for name, expected_hash in expected_model_hashes.items():
+        identity = model_files[name]
+        _require(
+            isinstance(identity, Mapping) and set(identity) == {"sha256", "bytes"},
+            f"source {name} identity fields drift",
+        )
+        _require(identity["sha256"] == expected_hash, f"source {name} hash drift")
+        _require(
+            isinstance(identity["bytes"], int) and identity["bytes"] > 0,
+            f"source {name} byte count invalid",
+        )
     command = ["git", "-C", str(repository), "merge-base", "--is-ancestor"]
     for ancestor, descendant in (
         (source["source_commit"], source["validator_merge_sha"]),
@@ -214,6 +251,14 @@ def _validate_source(
             result.returncode == 0,
             f"source ancestry failed: {ancestor} -> {descendant}",
         )
+
+    _require(
+        _git_output(
+            repository, "rev-parse", f"{source['validator_merge_sha']}^{{tree}}"
+        )
+        == source["validator_merge_tree_sha"],
+        "validator merge tree evidence drift",
+    )
 
     shards = source.get("shards")
     _require(
@@ -385,6 +430,97 @@ def _validate_ranks(
     )
 
 
+def _validate_launch_model(
+    packet: Mapping[str, Any], source: Mapping[str, Any], model_dir: Path
+) -> None:
+    model_dir = model_dir.resolve()
+    _require(model_dir.is_dir(), f"launch model directory missing: {model_dir}")
+    model_files = source["model_files"]
+    for name in ("config.json", "model.safetensors.index.json", "tokenizer.json"):
+        path = model_dir / name
+        _require(path.is_file(), f"launch model file missing: {name}")
+        identity = model_files[name]
+        _require(path.stat().st_size == identity["bytes"], f"launch {name} byte drift")
+        _require(_sha256_file(path) == identity["sha256"], f"launch {name} hash drift")
+
+    reviewed_shards = source["shards"]
+    expected_names = [item["name"] for item in reviewed_shards]
+    actual_names = sorted(
+        path.name for path in model_dir.glob("model-*-of-00048.safetensors")
+    )
+    _require(actual_names == expected_names, "launch model shard set/order drift")
+    for item in reviewed_shards:
+        path = model_dir / item["name"]
+        _require(
+            path.stat().st_size == item["size"], f"launch {item['name']} byte drift"
+        )
+        _require(
+            _sha256_file(path) == item["lfs_sha256"],
+            f"launch {item['name']} payload hash drift",
+        )
+    _require(
+        len(actual_names) == packet["source_shard_count"], "launch shard count drift"
+    )
+
+
+def _validate_launch_ranks(inventory: Mapping[str, Any], rank_source: Path) -> None:
+    rank_source = rank_source.resolve()
+    _require(rank_source.is_dir(), f"launch rank directory missing: {rank_source}")
+    ranks = inventory["ranks"]
+    expected_names = [f"tp{rank}_sharded_checkpoint.safetensors" for rank in range(32)]
+    actual_names = sorted(
+        (path.name for path in rank_source.glob("tp*_sharded_checkpoint.safetensors")),
+        key=lambda name: int(name.removeprefix("tp").split("_", 1)[0]),
+    )
+    _require(actual_names == expected_names, "launch rank file set/order drift")
+    for item in ranks:
+        path = rank_source / f"tp{item['rank']}_sharded_checkpoint.safetensors"
+        checkpoint = item["checkpoint"]
+        _require(
+            path.stat().st_size == checkpoint["bytes"],
+            f"launch rank {item['rank']} byte drift",
+        )
+        _require(
+            _sha256_file(path) == checkpoint["sha256"],
+            f"launch rank {item['rank']} hash drift",
+        )
+
+
+def _validate_launch_source(source: Mapping[str, Any], source_dir: Path) -> None:
+    source_dir = source_dir.resolve()
+    _require(source_dir.is_dir(), f"launch source directory missing: {source_dir}")
+    _require(
+        _git_output(source_dir, "status", "--porcelain=v1", "--untracked-files=all")
+        == "",
+        "launch source checkout is dirty",
+    )
+    head = _git_output(source_dir, "rev-parse", "HEAD")
+    _require(head == source["validator_merge_sha"], "launch source HEAD drift")
+    tree = _git_output(source_dir, "rev-parse", "HEAD^{tree}")
+    _require(tree == source["validator_merge_tree_sha"], "launch source tree drift")
+
+
+def validate_launch_bindings(
+    packet: Mapping[str, Any],
+    root: Path,
+    model_dir: Path,
+    compile_run_root: Path,
+    rank_source: Path,
+    source_dir: Path,
+) -> None:
+    """Bind the reviewed evidence to every path consumed by command.sh."""
+    compile_run_root = compile_run_root.resolve()
+    _require(
+        rank_source.resolve() == compile_run_root / "weights",
+        "launch rank source is not COMPILE_RUN_ROOT/weights",
+    )
+    source = _load(root / "source-provenance.json")
+    inventory = _load(root / "rank-inventory.json")
+    _validate_launch_model(packet, source, model_dir)
+    _validate_launch_ranks(inventory, rank_source)
+    _validate_launch_source(source, source_dir)
+
+
 def _validate_compiler(packet: Mapping[str, Any], compiler: Mapping[str, Any]) -> None:
     _require(
         compiler.get("image_digest") == packet["compiler_image"], "compiler image drift"
@@ -500,7 +636,10 @@ def main() -> int:
     parser.add_argument("--packet", type=Path, default=PACKET)
     parser.add_argument("--compile-contract", type=Path)
     parser.add_argument("--evidence-root", type=Path)
-    parser.add_argument("--repository", type=Path)
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--compile-run-root", type=Path)
+    parser.add_argument("--rank-source", type=Path)
+    parser.add_argument("--source-dir", type=Path)
     parser.add_argument("--require-compile-permitted", action="store_true")
     args = parser.parse_args()
     packet = _load(args.packet)
@@ -509,12 +648,29 @@ def main() -> int:
         validate_compile_contract(packet, _load(args.compile_contract))
     holds = [item["id"] for item in packet["blockers"]]
     if args.evidence_root is not None:
-        _require(args.repository is not None, "--repository is required with evidence")
+        _require(args.source_dir is not None, "--source-dir is required with evidence")
+        _require(args.model_dir is not None, "--model-dir is required with evidence")
+        _require(
+            args.compile_run_root is not None,
+            "--compile-run-root is required with evidence",
+        )
+        _require(
+            args.rank_source is not None, "--rank-source is required with evidence"
+        )
         _require(
             args.compile_contract is not None,
             "--compile-contract is required with evidence",
         )
-        holds = validate_evidence(packet, args.evidence_root, args.repository)
+        holds = validate_evidence(packet, args.evidence_root, args.source_dir)
+        if not holds:
+            validate_launch_bindings(
+                packet,
+                args.evidence_root,
+                args.model_dir,
+                args.compile_run_root,
+                args.rank_source,
+                args.source_dir,
+            )
     permitted = not holds
     print(json.dumps({"compile_permitted": permitted, "holds": holds}, sort_keys=True))
     return 2 if args.require_compile_permitted and not permitted else 0

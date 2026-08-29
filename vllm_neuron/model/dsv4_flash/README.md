@@ -43,7 +43,11 @@ of these machine-verifiable receipts are present:
 6. an exact emitted-contract receipt.
 
 `command.sh` invokes that validator with `--require-compile-permitted` before
-creating run directories or invoking Docker. There is no TP16 fallback.
+creating run directories, copying rank files, or invoking Docker. The same
+preflight hashes the resolved launch snapshot (config, index, tokenizer, and
+all 48 shards), all 32 resolved launch rank files, and requires the executing
+source checkout to be at the exact clean validator-merged HEAD/tree recorded in
+the reviewed evidence. There is no TP16 fallback.
 
 ## Host-only checks
 
