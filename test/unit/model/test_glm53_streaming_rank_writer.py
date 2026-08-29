@@ -58,6 +58,7 @@ TensorChunk = WRITER.TensorChunk
 TensorSpec = WRITER.TensorSpec
 stream_rank_checkpoint = WRITER.stream_rank_checkpoint
 Glm53RankPlan = RANK_PLAN.Glm53RankPlan
+PlannedSourceSpec = RANK_PLAN.PlannedSourceSpec
 TargetTensorPlan = RANK_PLAN.TargetTensorPlan
 build_glm53_rank_plan = RANK_PLAN.build_glm53_rank_plan
 
@@ -348,6 +349,18 @@ def test_bounded_fp8_slice_uses_intersecting_reciprocal_tiles(
     torch.testing.assert_close(actual, expected)
     assert reader.max_source_group_bytes < source.nbytes // 10
 
+    wrong_parent = tmp_path / "wrong-scale"
+    wrong_parent.mkdir()
+    wrong_root = _small_checkpoint(
+        wrong_parent,
+        {key: source, scale_key: torch.ones((2, 3), dtype=torch.float32)},
+    )
+    wrong_reader = IndexedTensorReader(wrong_root)
+    with pytest.raises(Glm53StreamingError, match="reciprocal scale shape drift"):
+        wrong_reader.read_converted_slice(
+            key, (slice(120, 140), slice(120, 140)), out_dtype=torch.float32
+        )
+
 
 def test_rank_plan_is_deterministic_and_streams_shard_without_rank_buffer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -395,6 +408,7 @@ def test_rank_plan_rejects_source_shape_drift_before_yielding(
         inventory=RankInventory(rank=0, tp_degree=2, tensors=(operation.target,)),
         operations=(operation,),
         max_chunk_bytes=16,
+        source_specs=(PlannedSourceSpec(key, (2, 4), "weight"),),
     )
     with pytest.raises(Glm53StreamingError, match="shape drift"):
         list(plan.iter_chunks(reader))
@@ -499,12 +513,15 @@ def test_actual_pinned_metadata_produces_stable_complete_rank_contract(
     last_rank = build_glm53_rank_plan(root, rank=31)
     assert len(plan.operations) == 1_262
     assert len({op.target.name for op in plan.operations}) == 1_262
+    assert len(plan.source_specs) == 74_001
+    assert sum(spec.role == "weight" for spec in plan.source_specs) == 37_534
+    assert sum(spec.role == "reciprocal_scale" for spec in plan.source_specs) == 36_467
     assert plan.inventory.total_tensor_bytes == 19_859_704_056
     assert plan.inventory.contract_sha256 == (
         "0d7380ce03aeadb73d2b9dcb9a015c789a24a1a6220696717736c42cbe5d096a"
     )
     assert plan.contract_sha256 == (
-        "b39c8e2e829048c06f80c8a5b223e4e670a83309da3cefe47aa5912854e274ea"
+        "9c6e5c5a76d1cc11f2732a3b472ee9da92cbaa5944fd84ae0a7d7a3eb651511f"
     )
     assert repeat.contract_sha256 == plan.contract_sha256
     assert last_rank.contract_sha256 != plan.contract_sha256

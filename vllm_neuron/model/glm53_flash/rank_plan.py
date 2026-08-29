@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -60,10 +61,21 @@ class TargetTensorPlan:
 
 
 @dataclass(frozen=True)
+class PlannedSourceSpec:
+    key: str
+    shape: tuple[int, ...]
+    role: Literal["weight", "reciprocal_scale"]
+
+    def canonical(self) -> dict[str, Any]:
+        return {"key": self.key, "shape": list(self.shape), "role": self.role}
+
+
+@dataclass(frozen=True)
 class Glm53RankPlan:
     inventory: RankInventory
     operations: tuple[TargetTensorPlan, ...]
     max_chunk_bytes: int
+    source_specs: tuple[PlannedSourceSpec, ...] = ()
 
     @property
     def contract_sha256(self) -> str:
@@ -76,6 +88,7 @@ class Glm53RankPlan:
             },
             "rank_inventory_sha256": self.inventory.contract_sha256,
             "max_chunk_bytes": self.max_chunk_bytes,
+            "source_shape_contract": [spec.canonical() for spec in self.source_specs],
             "operations": [operation.canonical() for operation in self.operations],
         }
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
@@ -95,6 +108,19 @@ class Glm53RankPlan:
             if spec.shape != expected_shape:
                 raise Glm53StreamingError(
                     f"source shape drift for {key}: expected {expected_shape}, got {spec.shape}"
+                )
+
+    def _validate_source_contract(self, reader: IndexedTensorReader) -> None:
+        for planned in self.source_specs:
+            actual = reader.source_specs.get(planned.key)
+            if actual is None:
+                raise Glm53StreamingError(
+                    f"planned {planned.role} is absent after audit: {planned.key}"
+                )
+            if actual.shape != planned.shape:
+                raise Glm53StreamingError(
+                    f"{planned.role} shape drift for {planned.key}: "
+                    f"expected {planned.shape}, got {actual.shape}"
                 )
 
     def _split_target(self, name: str, start: int, tensor: torch.Tensor):
@@ -161,6 +187,7 @@ class Glm53RankPlan:
     def iter_chunks(self, reader: IndexedTensorReader):
         if self.max_chunk_bytes <= 0:
             raise Glm53StreamingError("max_chunk_bytes must be positive")
+        self._validate_source_contract(reader)
         for operation in self.operations:
             self._validate_source(reader, operation)
             if operation.kind in ("copy", "shard0", "shard1"):
@@ -630,6 +657,26 @@ def build_glm53_rank_plan(
             f"target plan does not bijectively cover production text weights: "
             f"unmapped={missing[:8]} invalid={extra[:8]}"
         )
+    expected_weight_shapes = {
+        key: shape
+        for operation in operations
+        for key, shape in zip(
+            operation.source_keys, operation.source_shapes, strict=True
+        )
+    }
+    planned_sources: list[PlannedSourceSpec] = []
+    for key in sorted(expected_weight_shapes):
+        shape = expected_weight_shapes[key]
+        planned_sources.append(PlannedSourceSpec(key, shape, "weight"))
+        scale_key = f"{key}_scale_inv"
+        if scale_key in weight_map:
+            scale_shape = shape[:-2] + (
+                math.ceil(shape[-2] / 128),
+                math.ceil(shape[-1] / 128),
+            )
+            planned_sources.append(
+                PlannedSourceSpec(scale_key, scale_shape, "reciprocal_scale")
+            )
     inventory = RankInventory(
         rank=rank, tp_degree=tp_degree, tensors=tuple(op.target for op in operations)
     )
@@ -637,6 +684,7 @@ def build_glm53_rank_plan(
         inventory=inventory,
         operations=tuple(operations),
         max_chunk_bytes=max_chunk_bytes,
+        source_specs=tuple(planned_sources),
     )
 
 
@@ -670,6 +718,7 @@ def stream_glm53_rank_checkpoint(
 
 __all__ = [
     "Glm53RankPlan",
+    "PlannedSourceSpec",
     "TargetTensorPlan",
     "build_glm53_rank_plan",
     "stream_glm53_rank_checkpoint",

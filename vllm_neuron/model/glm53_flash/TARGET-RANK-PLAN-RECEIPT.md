@@ -28,7 +28,7 @@ For rank 0 with a 64 MiB output-chunk ceiling:
 - rank inventory SHA-256:
   `0d7380ce03aeadb73d2b9dcb9a015c789a24a1a6220696717736c42cbe5d096a`
 - full source-to-target plan SHA-256:
-  `b39c8e2e829048c06f80c8a5b223e4e670a83309da3cefe47aa5912854e274ea`
+  `9c6e5c5a76d1cc11f2732a3b472ee9da92cbaa5944fd84ae0a7d7a3eb651511f`
 
 The plan includes embedding/head shards, replicated norms and mHC state,
 KDA projections and per-head-interleaved short convolution, DSA/MLA and
@@ -62,9 +62,10 @@ dictionary is constructed.
 
 A range-only audit of all 62 production SafeTensors headers also passed. It
 read 10,684,096 header bytes and zero tensor payload bytes, proved exact
-header/index agreement for all 76,108 indexed tensors, and matched all 37,797
-planned source-weight/reciprocal-scale shapes. Audit receipt SHA-256:
-`e77999e09fd0303abefe6870754ac8ae3bac395b1a31a103b3d1ccdb5c5cfc0e`.
+header/index agreement for all 76,108 indexed tensors, and matched all 74,001
+planned source shapes: 37,534 weights plus all 36,467 reciprocal scales. Audit
+receipt SHA-256:
+`3121e936c2bbb1012ecf3f805e2d2c2986c22d56a86d34d85ca87ba65e775d76`.
 
 No r7i compilation slot, Trn2 device, model weights, excluded model, `main`
 branch, or runtime/tokenomics path was touched.

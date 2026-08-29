@@ -368,6 +368,15 @@ class IndexedTensorReader:
                     f"missing audited reciprocal scale: {scale_key}"
                 )
             block_out, block_in = (128, 128)
+            expected_scale_shape = spec.shape[:-2] + (
+                math.ceil(spec.shape[-2] / block_out),
+                math.ceil(spec.shape[-1] / block_in),
+            )
+            if scale_spec.shape != expected_scale_shape:
+                raise Glm53StreamingError(
+                    f"reciprocal scale shape drift for {scale_key}: expected "
+                    f"{expected_scale_shape}, got {scale_spec.shape}"
+                )
             scale_slices = list(slices[:-2])
             row_start, row_stop = bounds[-2]
             col_start, col_stop = bounds[-1]
