@@ -15,6 +15,12 @@ from .rank_plan import (
     build_glm53_rank_plan,
     stream_glm53_rank_checkpoint,
 )
+from .runtime_config import (
+    GLM53_ARCHITECTURE,
+    GLM53_RUNTIME_CONFIG_SCHEMA,
+    Glm53RuntimeConfig,
+    Glm53RuntimeConfigError,
+)
 from .streaming_rank_writer import (
     Glm53StreamingError,
     IndexedTensorReader,
@@ -26,9 +32,13 @@ from .streaming_rank_writer import (
 )
 
 __all__ = [
+    "GLM53_ARCHITECTURE",
     "GLM53_CHECKPOINT_REVISION",
+    "GLM53_RUNTIME_CONFIG_SCHEMA",
     "Glm53CheckpointReport",
     "Glm53RankPlan",
+    "Glm53RuntimeConfig",
+    "Glm53RuntimeConfigError",
     "Glm53StreamingError",
     "IndexedTensorReader",
     "PlannedSourceSpec",
