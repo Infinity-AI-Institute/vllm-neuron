@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Transactional, resource-bounded GLM-5.3 per-rank checkpoint writer.
+"""Transactional, resource-bounded per-rank checkpoint writer.
 
 The writer emits a valid SafeTensors file from bounded tensor chunks.  It
 predeclares the complete rank inventory in the SafeTensors header, writes each
@@ -449,8 +449,10 @@ class StreamingRankWriter:
         output_path: str | Path,
         inventory: RankInventory,
         *,
-        source_report: Glm53CheckpointReport,
+        source_report: Glm53CheckpointReport | Any,
         max_chunk_bytes: int,
+        source_metadata: Mapping[str, str] | None = None,
+        manifest_schema: str = "glm53-streaming-rank-v1",
         plan_contract_sha256: str | None = None,
     ) -> None:
         if max_chunk_bytes <= 0:
@@ -459,6 +461,26 @@ class StreamingRankWriter:
         self.inventory = inventory
         self.source_report = source_report
         self.max_chunk_bytes = max_chunk_bytes
+        self.source_metadata = dict(
+            source_metadata
+            or {
+                "model": "GLM-5.3-Flash",
+                "revision": GLM53_CHECKPOINT_REVISION,
+                "config_sha256": GLM53_CONFIG_SHA256,
+                "index_sha256": GLM53_INDEX_SHA256,
+            }
+        )
+        required_metadata = {"model", "revision", "config_sha256", "index_sha256"}
+        if set(self.source_metadata) != required_metadata or not all(
+            isinstance(value, str) and value for value in self.source_metadata.values()
+        ):
+            raise ValueError(
+                "source_metadata must contain exactly model, revision, "
+                "config_sha256, and index_sha256"
+            )
+        if not manifest_schema:
+            raise ValueError("manifest_schema must be non-empty")
+        self.manifest_schema = manifest_schema
         if plan_contract_sha256 is not None and (
             len(plan_contract_sha256) != 64
             or any(char not in "0123456789abcdef" for char in plan_contract_sha256)
@@ -499,10 +521,7 @@ class StreamingRankWriter:
         header: dict[str, Any] = {
             "__metadata__": {
                 "format": "pt",
-                "model": "GLM-5.3-Flash",
-                "revision": GLM53_CHECKPOINT_REVISION,
-                "config_sha256": GLM53_CONFIG_SHA256,
-                "index_sha256": GLM53_INDEX_SHA256,
+                **self.source_metadata,
                 "rank": str(self.inventory.rank),
                 "tp_degree": str(self.inventory.tp_degree),
                 "plan_contract_sha256": self.plan_contract_sha256 or "unbound",
@@ -605,11 +624,9 @@ class StreamingRankWriter:
         os.replace(self.partial_path, self.output_path)
         self._published = True
         manifest = {
-            "schema": "glm53-streaming-rank-v1",
+            "schema": self.manifest_schema,
             "source": {
-                "revision": GLM53_CHECKPOINT_REVISION,
-                "config_sha256": GLM53_CONFIG_SHA256,
-                "index_sha256": GLM53_INDEX_SHA256,
+                **self.source_metadata,
                 "preflight": self.source_report.to_dict(),
             },
             "rank": self.inventory.rank,

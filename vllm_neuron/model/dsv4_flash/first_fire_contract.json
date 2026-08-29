@@ -1,0 +1,35 @@
+{
+  "contract_slug": "tp32-lnc2-b1c1-s4096-bf16-shard_intermediate-skip_dma-cont_batch",
+  "model": {
+    "repo_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+  },
+  "stack": {
+    "container_digest": "public.ecr.aws/neuron/pytorch-inference-neuronx@sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1"
+  },
+  "compile": {
+    "tp": 32,
+    "logical_nc_config": 2,
+    "ctx_batch_size": 1,
+    "tkg_batch_size": 1,
+    "sequence_buckets": [4096],
+    "disable_argmax_kernel": false,
+    "dry_run": false,
+    "blockwise_matmul_config": {
+      "use_shard_on_intermediate_dynamic_while": true
+    }
+  },
+  "emitted_contract": {
+    "rank_count": 32,
+    "rank_checkpoint_dtype": "bfloat16",
+    "compute_dtype": "bfloat16",
+    "cache_dtype": "bfloat16",
+    "fp8_kv": false,
+    "runtime_weight_quantized": false,
+    "sampler": "greedy_argmax",
+    "speculative_decode": false,
+    "mtp": false,
+    "dspark": false,
+    "max_writer_chunk_bytes": 67108864
+  }
+}

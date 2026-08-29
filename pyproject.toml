@@ -105,6 +105,8 @@ extend-select = ["G004"]
 # E721/E722: Type comparisons and bare except (legacy patterns)
 "vllm_neuron/*" = ["E741", "F841", "E402", "E701", "E711", "E712", "E721", "E722", "G004"]
 "test/vllm_neuron/*" = ["E741", "F841", "E402", "E701"]
+"vllm_neuron/model/dsv4_flash/tests/*" = ["BLE001", "S110", "RUF059", "SIM117"]
+"vllm_neuron/model/dsv4_flash/neuron_wrapper.py" = ["BLE001"]
 "examples/vllm_neuron/*" = ["F841"]
 
 [tool.mypy]
