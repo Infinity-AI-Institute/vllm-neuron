@@ -167,6 +167,9 @@ def build_targets() -> list[TargetSpec]:
     add("embed_tokens.weight", "BF16", (vocab // TP, hidden), "tp_shard_dim0")
     add("final_norm_weight", "BF16", (hidden,), "replicated")
     add("lm_head.weight", "BF16", (vocab // TP, hidden), "tp_shard_dim0")
+    add("hc_head_fn", "F32", (4, 4 * hidden), "replicated_mhc_fp32")
+    add("hc_head_base", "F32", (4,), "replicated_mhc_fp32")
+    add("hc_head_scale", "F32", (1,), "replicated_mhc_fp32")
     mqa = {
         "wq_a.weight": (q_lora // TP, hidden, "tp_shard_dim0"),
         "wq_b.weight": (heads * head_dim // TP, q_lora, "tp_shard_dim0"),
@@ -230,6 +233,25 @@ def build_targets() -> list[TargetSpec]:
             }.items():
                 add(f"{prefix}attn.compressor.{name}", "BF16", shape, "replicated")
         add(f"{prefix}ffn_norm.weight", "BF16", (hidden,), "replicated")
+        for stem in ("hc_attn", "hc_ffn"):
+            add(
+                f"{prefix}{stem}_fn",
+                "F32",
+                (24, 4 * hidden),
+                "replicated_mhc_fp32",
+            )
+            add(
+                f"{prefix}{stem}_base",
+                "F32",
+                (24,),
+                "replicated_mhc_fp32",
+            )
+            add(
+                f"{prefix}{stem}_scale",
+                "F32",
+                (3,),
+                "replicated_mhc_fp32",
+            )
         add(f"{prefix}mlp.router.weight", "F32", (experts, hidden), "replicated_router")
         if layer < 3:
             add(f"{prefix}mlp.tid2eid", "I32", (vocab, top_k), "replicated_hash_route")
@@ -270,7 +292,7 @@ def build_targets() -> list[TargetSpec]:
             (experts, inter // TP, hidden),
             "expert_axis_replicated_intermediate_tp_sharded",
         )
-    require(len(targets) == 1024, "target tensor count drift")
+    require(len(targets) == 1285, "target tensor count drift")
     require(len({item.name for item in targets}) == len(targets), "duplicate targets")
     return targets
 
@@ -280,7 +302,8 @@ def classify_sources(headers: dict[str, HeaderSpec]) -> dict[str, list[str]]:
         "routable": [],
         "support_scale": [],
         "dropped_mtp_or_speculation": [],
-        "unmapped_mhc": [],
+        "replicated_mhc": [],
+        "converted_hash_route_i64_to_i32": [],
         "incompatible_hash_route_dtype": [],
         "orphan": [],
     }
@@ -289,9 +312,14 @@ def classify_sources(headers: dict[str, HeaderSpec]) -> dict[str, list[str]]:
         if key.startswith(("mtp.", "layers.43.")) or "dspark" in key:
             categories["dropped_mtp_or_speculation"].append(key)
         elif "hc_" in key:
-            categories["unmapped_mhc"].append(key)
-        elif key.endswith("ffn.gate.tid2eid") and spec.dtype != "I32":
-            categories["incompatible_hash_route_dtype"].append(key)
+            categories["replicated_mhc"].append(key)
+        elif key.endswith("ffn.gate.tid2eid"):
+            if spec.dtype == "I64":
+                categories["converted_hash_route_i64_to_i32"].append(key)
+            elif spec.dtype == "I32":
+                categories["routable"].append(key)
+            else:
+                categories["incompatible_hash_route_dtype"].append(key)
         elif key.endswith(".scale"):
             weight = f"{key[: -len('.scale')]}.weight"
             if weight in headers:
@@ -312,7 +340,7 @@ def audit(root: Path, tool_sha256: str) -> dict[str, Any]:
     blockers = {
         key: values
         for key, values in categories.items()
-        if key in {"unmapped_mhc", "incompatible_hash_route_dtype", "orphan"} and values
+        if key in {"incompatible_hash_route_dtype", "orphan"} and values
     }
     target_rows = [item.canonical() for item in targets]
     inventory_bytes = sum(item.nbytes for item in targets)

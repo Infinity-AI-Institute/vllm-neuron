@@ -54,8 +54,12 @@ def _write_fixture(root: Path, rows: dict[str, tuple[str, list[int]]]) -> None:
 
 def test_target_plan_is_exact_tp32_and_rank_bound() -> None:
     targets = MODULE.build_targets()
-    assert len(targets) == 1024
-    assert len({row.name for row in targets}) == 1024
+    assert len(targets) == 1285
+    assert len({row.name for row in targets}) == 1285
+    mhc = [row for row in targets if "hc_" in row.name]
+    assert len(mhc) == 261
+    assert {row.dtype for row in mhc} == {"F32"}
+    assert {row.ownership for row in mhc} == {"replicated_mhc_fp32"}
     gate = next(
         row
         for row in targets
@@ -75,7 +79,7 @@ def test_target_plan_is_exact_tp32_and_rank_bound() -> None:
     ) != MODULE.canonical_sha256({"rank": 31, "tp_degree": 32, "tensors": rows})
 
 
-def test_source_classifier_rejects_mhc_and_i64_hash_routes() -> None:
+def test_source_classifier_routes_mhc_and_reviewed_i64_hash_conversion() -> None:
     headers = {
         "embed.weight": MODULE.HeaderSpec("BF16", (129280, 4096), "s"),
         "layers.0.hc_attn_base": MODULE.HeaderSpec("F32", (24,), "s"),
@@ -85,8 +89,9 @@ def test_source_classifier_rejects_mhc_and_i64_hash_routes() -> None:
         "mtp.0.attn_norm.weight": MODULE.HeaderSpec("BF16", (4096,), "s"),
     }
     result = MODULE.classify_sources(headers)
-    assert result["unmapped_mhc"] == ["layers.0.hc_attn_base"]
-    assert result["incompatible_hash_route_dtype"] == ["layers.0.ffn.gate.tid2eid"]
+    assert result["replicated_mhc"] == ["layers.0.hc_attn_base"]
+    assert result["converted_hash_route_i64_to_i32"] == ["layers.0.ffn.gate.tid2eid"]
+    assert result["incompatible_hash_route_dtype"] == []
     assert result["support_scale"] == ["layers.0.attn.wq_a.scale"]
     assert result["dropped_mtp_or_speculation"] == ["mtp.0.attn_norm.weight"]
 
@@ -141,10 +146,10 @@ def test_duplicate_header_json_key_fails_closed(
         MODULE.read_headers(root, test_only_allow_unpinned=True)
 
 
-def test_exact_host_only_hold_receipt_passes() -> None:
+def test_exact_host_only_routed_receipt_passes_without_compile_claim() -> None:
     receipt = json.loads(RECEIPT.read_text(encoding="utf-8"))
     VALIDATOR.validate_receipt(receipt)
-    assert receipt["complete"] is False
+    assert receipt["complete"] is True
     assert receipt["compile_permitted"] is False
     assert not any(receipt["claims"].values())
 
@@ -154,12 +159,13 @@ def test_exact_host_only_hold_receipt_passes() -> None:
     [
         (("source", "revision"), "0" * 40),
         (("source", "tensor_payload_bytes_read"), 1),
-        (("routing", "target_tensor_count_per_rank"), 1023),
+        (("routing", "target_tensor_count_per_rank"), 1284),
         (("routing", "target_bytes_per_rank"), 1),
         (("routing", "ownership_counts", "replicated"), 548),
         (("routing", "moe_ownership", "expert_axis_partitioned_by_ep"), True),
-        (("blockers", "unmapped_mhc", "count"), 0),
-        (("blockers", "incompatible_hash_route_dtype", "count"), 0),
+        (("routing", "source_category_counts", "replicated_mhc"), 260),
+        (("routing", "source_category_counts", "converted_hash_route_i64_to_i32"), 2),
+        (("blockers", "unexpected"), {"count": 1}),
         (("claims", "rank_files_materialized"), True),
         (("compile_permitted",), True),
     ],

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -112,6 +113,62 @@ HC_PARAM_SUFFIXES = (
     "hc_ffn_fn",
     "hc_ffn_scale",
 )
+
+
+def _require_exact_mhc_tensor(
+    state_dict: Mapping[str, Any], key: str, shape: tuple[int, ...]
+) -> torch.Tensor:
+    """Return one mHC tensor without rename, cast, clone, or mutation."""
+    value = state_dict.get(key)
+    if value is None:
+        raise KeyError(f"missing exact mHC tensor {key!r}")
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"mHC tensor {key!r} is not a torch.Tensor")
+    if value.dtype != torch.float32:
+        raise TypeError(f"mHC tensor {key!r} must remain FP32; got {value.dtype}")
+    if tuple(value.shape) != shape:
+        raise ValueError(f"mHC tensor {key!r} shape {tuple(value.shape)} != {shape}")
+    return value
+
+
+def _convert_mhc_head(
+    state_dict: Mapping[str, Any], src: DeepseekV4FlashInferenceConfig
+) -> dict[str, torch.Tensor]:
+    """Route the three official top-level mHC leaves losslessly."""
+    width = int(src.hc_mult) * int(src.hidden_size)
+    return {
+        "hc_head_fn": _require_exact_mhc_tensor(
+            state_dict, "hc_head_fn", (int(src.hc_mult), width)
+        ),
+        "hc_head_base": _require_exact_mhc_tensor(
+            state_dict, "hc_head_base", (int(src.hc_mult),)
+        ),
+        "hc_head_scale": _require_exact_mhc_tensor(state_dict, "hc_head_scale", (1,)),
+    }
+
+
+def _convert_mhc_layer(
+    state_dict: Mapping[str, Any],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+) -> dict[str, torch.Tensor]:
+    """Route one layer's attention/FFN mHC leaves losslessly."""
+    hc = int(src.hc_mult)
+    mix = (2 + hc) * hc
+    width = hc * int(src.hidden_size)
+    converted: dict[str, torch.Tensor] = {}
+    for stem in ("hc_attn", "hc_ffn"):
+        prefix = f"layers.{layer_idx}.{stem}"
+        converted[f"{prefix}_fn"] = _require_exact_mhc_tensor(
+            state_dict, f"{prefix}_fn", (mix, width)
+        )
+        converted[f"{prefix}_base"] = _require_exact_mhc_tensor(
+            state_dict, f"{prefix}_base", (mix,)
+        )
+        converted[f"{prefix}_scale"] = _require_exact_mhc_tensor(
+            state_dict, f"{prefix}_scale", (3,)
+        )
+    return converted
 
 
 def is_mtp_key(key: str, *, mtp_start_layer: int = 43) -> bool:
@@ -1574,6 +1631,7 @@ def _convert_dsv4_checkpoint(
     if FINAL_NORM_KEY not in state_dict:
         raise ValueError(f"missing {FINAL_NORM_KEY!r} in state_dict")
     converted["final_norm_weight"] = state_dict[FINAL_NORM_KEY].to(dtype)
+    converted.update(_convert_mhc_head(state_dict, src))
     if LM_HEAD_KEY in state_dict:
         converted["lm_head.weight"] = state_dict[LM_HEAD_KEY].to(dtype)
     elif getattr(src, "tie_word_embeddings", False):
@@ -1627,6 +1685,7 @@ def _convert_dsv4_checkpoint(
                 f"{ffn_norm_hf!r} shape {tuple(ffn_norm_raw.shape)} != ({hidden},)"
             )
         converted[f"layers.{layer_idx}.ffn_norm.weight"] = ffn_norm_raw.to(dtype)
+        converted.update(_convert_mhc_layer(state_dict, layer_idx, src))
 
         # MLP subtree — hash-MoE for the bootstrap layers, routed-MoE
         # for the rest.  Both helpers emit 7 wrapper-tree keys.
@@ -1651,9 +1710,8 @@ def _convert_dsv4_checkpoint(
             "attn_key_count": attn_key_count,
             "mlp_key_count": mlp_key_count,
             # attn_key_count already includes the 8/12/18 attention keys;
-            # +1 for the sibling attn_norm from the attention converter,
-            # +1 for ffn_norm added here, +7 for the MLP subtree.
-            "total_layer_key_count": attn_key_count + 1 + 1 + mlp_key_count,
+            # +1 for each norm, +6 exact mHC leaves, +7 for the MLP subtree.
+            "total_layer_key_count": attn_key_count + 1 + 1 + 6 + mlp_key_count,
         }
 
     # ---- dropped-tensor bookkeeping ----
@@ -1663,12 +1721,12 @@ def _convert_dsv4_checkpoint(
         elif is_dspark_key(key):
             dropped_dspark.append(key)
 
-    # Sanity: converted keys should be exactly 1024 for the full-shape
-    # frozen schedule (3 top-level + 1021 per-layer).  A caller running
+    # Sanity: converted keys should be exactly 1285 for the full-shape
+    # frozen schedule (6 top-level + 1279 per-layer).  A caller running
     # on `allow_reduced_shapes=True` fixtures skips this check.
     non_report_keys = [k for k in converted if not k.startswith("_")]
     if not getattr(src, "allow_reduced_shapes", False):
-        expected_total = 3 + sum(
+        expected_total = 6 + sum(
             r["total_layer_key_count"] for r in per_layer_report.values()
         )
         if len(non_report_keys) != expected_total:

@@ -131,7 +131,7 @@ effective = {
     "dry_run": dry_run,
     "num_hidden_layers": source.num_hidden_layers,
     "state_cache_expected": 84,
-    "wrapper_tree_keys_expected": 1024,
+    "wrapper_tree_keys_expected": 1285,
 }
 with open("/runroot/logs/effective-shape.json", "w", encoding="utf-8") as fh:
     json.dump(effective, fh, indent=2, sort_keys=True)

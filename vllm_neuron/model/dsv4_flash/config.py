@@ -373,6 +373,8 @@ class DeepseekV4FlashInferenceConfig:
             raise ValueError(
                 "DeepSeek-V4-Flash requires mHC hc_mult=4 with 20 Sinkhorn iters"
             )
+        if self.hc_eps != 1e-6:
+            raise ValueError("DeepSeek-V4-Flash requires mHC hc_eps=1e-6")
         if self.scoring_func != "sqrtsoftplus":
             raise ValueError("DeepSeek-V4-Flash router uses sqrt(softplus(x)) scoring")
         if self.topk_method != "noaux_tc":

@@ -36,17 +36,18 @@ Structural facts exercised:
        * ``_RoutedMoEBlock.PARAM_KEYS``:        7
 
   3. **Full wrapper-tree count**.  Aggregating over 43 layers +
-     ``attn_norm.weight`` + ``ffn_norm.weight`` per layer + 3 top-level
-     (embed_tokens, final_norm, lm_head) yields 1024 wrapper-tree
+     ``attn_norm.weight`` + ``ffn_norm.weight`` per layer + 6 top-level
+     (embed_tokens, final_norm, lm_head, hc_head_{fn,base,scale}) yields
+     1285 wrapper-tree
      parameter names for the full-shape DSv4-Flash compile.  Also
      validates the per-family sub-counts:
 
-       * 2 × (8 + 7 + 2) = 34    sliding + hash_moe
-       * 1 × (18 + 7 + 2) = 27   CSA + hash_moe
-       * 20 × (18 + 7 + 2) = 540 CSA + routed_moe
-       * 20 × (12 + 7 + 2) = 420 HCA + routed_moe
-       Sum per-layer =    1021
-       + 3 top-level =    1024
+       * 2 × (8 + 7 + 8) = 46    sliding + hash_moe
+       * 1 × (18 + 7 + 8) = 33   CSA + hash_moe
+       * 20 × (18 + 7 + 8) = 660 CSA + routed_moe
+       * 20 × (12 + 7 + 8) = 540 HCA + routed_moe
+       Sum per-layer =    1279
+       + 6 top-level =    1285
 
   4. **CSA state-cache aggregation**.  Each CSA layer contributes 4
      aliased pairs (``compressor_overlap_kv/gate`` at head_dim=512 +
@@ -148,13 +149,14 @@ EXPECTED_CSA_KEY_COUNT = 18
 EXPECTED_HASH_MOE_KEY_COUNT = 7
 EXPECTED_ROUTED_MOE_KEY_COUNT = 7
 
-# 3 top-level: embed_tokens.weight, final_norm_weight, lm_head.weight.
-EXPECTED_TOP_LEVEL_KEY_COUNT = 3
+# 6 top-level: embedding, final norm, LM head, and three mHC-head leaves.
+EXPECTED_TOP_LEVEL_KEY_COUNT = 6
 
 # Per-layer decoder-level RMSNorm gains: attn_norm.weight + ffn_norm.weight.
 EXPECTED_LAYER_NORM_KEY_COUNT = 2
+EXPECTED_LAYER_MHC_KEY_COUNT = 6
 
-EXPECTED_TOTAL_WRAPPER_TREE_KEYS = 1024
+EXPECTED_TOTAL_WRAPPER_TREE_KEYS = 1285
 
 # Aliased state: 4 pairs per CSA layer, none elsewhere.
 EXPECTED_STATE_CACHE_PAIRS_PER_CSA_LAYER = 4
@@ -277,9 +279,9 @@ def _mlp_keys_for_layer(nw, mlp_type: str) -> tuple[str, ...]:
     raise AssertionError(f"unsupported mlp_type {mlp_type!r}")
 
 
-def test_full_wrapper_tree_key_count_reaches_1024() -> None:
+def test_full_wrapper_tree_key_count_reaches_1285() -> None:
     """Aggregate every layer's block-class PARAM_KEYS + per-layer norm
-    gains + top-level and confirm the full-shape total is 1024."""
+    and mHC gains + top-level and confirm the full-shape total is 1285."""
     cfg, nw = _import_library()
     src = cfg.DeepseekV4FlashInferenceConfig()
 
@@ -288,7 +290,12 @@ def test_full_wrapper_tree_key_count_reaches_1024() -> None:
     for layer_idx in range(EXPECTED_TOTAL_LAYERS):
         attn_keys = _attn_keys_for_layer(nw, src.layer_types[layer_idx])
         mlp_keys = _mlp_keys_for_layer(nw, src.mlp_layer_types[layer_idx])
-        layer_key_count = len(attn_keys) + len(mlp_keys) + EXPECTED_LAYER_NORM_KEY_COUNT
+        layer_key_count = (
+            len(attn_keys)
+            + len(mlp_keys)
+            + EXPECTED_LAYER_NORM_KEY_COUNT
+            + EXPECTED_LAYER_MHC_KEY_COUNT
+        )
         per_layer_counts[layer_idx] = layer_key_count
         total_keys += layer_key_count
 
@@ -315,10 +322,10 @@ def test_full_wrapper_tree_key_count_reaches_1024() -> None:
         for i, v in per_layer_counts.items()
         if i in EXPECTED_HCA_INDICES and i in EXPECTED_ROUTED_MOE_INDICES
     )
-    assert sliding_hash_total == 34, sliding_hash_total
-    assert csa_hash_total == 27, csa_hash_total
-    assert csa_routed_total == 540, csa_routed_total
-    assert hca_routed_total == 420, hca_routed_total
+    assert sliding_hash_total == 46, sliding_hash_total
+    assert csa_hash_total == 33, csa_hash_total
+    assert csa_routed_total == 660, csa_routed_total
+    assert hca_routed_total == 540, hca_routed_total
     assert (
         sliding_hash_total
         + csa_hash_total
@@ -402,7 +409,7 @@ if __name__ == "__main__":
         test_every_block_class_declares_param_keys,
         test_block_class_param_key_counts,
         test_routed_moe_block_class_param_keys_if_available,
-        test_full_wrapper_tree_key_count_reaches_1024,
+        test_full_wrapper_tree_key_count_reaches_1285,
         test_state_cache_specs_aggregate_to_84_across_csa_layers,
         test_hash_moe_layer_indices_within_num_hash_layers,
         test_reject_degenerate_output_no_empty_or_duplicated_keys,

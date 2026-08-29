@@ -11,20 +11,19 @@ FP32 split/Sinkhorn, pre, post, and head equations. Focused tests compare it to
 an independent transcription and reject key, shape, dtype, multiplier,
 iteration-count, epsilon, or mutation drift.
 
-The integration boundary composes with the exact existing authorization packet
-from source parent `2dc3d6a2a125cad006426d77a2998c5dd4b7bd13` (canonical Git-blob SHA-256
-`b9cdcfdaabccfcd807a6fd5cf9cc19f03730368796f5b0d9dde86bb7c5986822`). It
+The integration boundary preserves the authorization lineage from source parent
+`2dc3d6a2a125cad006426d77a2998c5dd4b7bd13`; the routed packet's canonical
+Git-blob SHA-256 is
+`1f8da802a22799cfce4d8a26e0b3676e27cd140045e51715a5e67630174f69b4`. It
 freezes the digest-pinned Neuron image, TP32/LNC2/B1/S4096 topology, BF16
 checkpoint/compute/cache state, and no-spec/no-MTP state. It also rejects any
 future compile path that omits `/mnt/compile/OWNERSHIP.md`, cap-2,
 `systemd-run --unit ... --nice=15`, network-none, or atomic `.partial` output
 publication. Every execution and result claim remains false.
 
-This does **not** mark the tensors routable yet. The current NxDI wrapper uses a
-single hidden stream and ordinary residual adds; correct DeepSeek-V4-Flash uses
-four hidden streams, mHC pre/post around both branches in every layer, and an
-mHC collapse before the final norm/head. Compile and runtime remain forbidden
-until a separately reviewed integration consumes this primitive across the
-full model tree, the TP32 header audit is rerun after the I64 route conversion
-lands, and every existing compile-authorization receipt passes. No correctness,
-performance, or tokenomics claim is made.
+The dependent integration routes all 261 tensors losslessly, expands embeddings
+to four hidden streams, applies mHC pre/post around attention and MoE in all 43
+layers, and collapses the streams before final norm/head. The symbolic TP32 plan
+is complete, but rank files are not materialized and the compile-authorization
+packet remains fail-closed. No compile, runtime, correctness, performance, or
+tokenomics claim is made.

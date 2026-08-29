@@ -153,10 +153,9 @@ def test_pre_post_and_head_match_independent_formulas() -> None:
 
     branch = torch.randn_like(reduced)
     post_out = MHC.mhc_post(branch, residual, post, comb)
-    post_ref_out = (
-        post.unsqueeze(-1) * branch.float().unsqueeze(-2)
-        + torch.sum(comb.unsqueeze(-1) * residual.float().unsqueeze(-2), dim=2)
-    ).to(branch.dtype)
+    post_ref_out = post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(
+        -2
+    ) + torch.matmul(comb.to(branch.dtype).transpose(-1, -2), residual)
     torch.testing.assert_close(post_out, post_ref_out, rtol=0, atol=0)
 
     head_fn = torch.randn(4, 32, dtype=torch.float32)
