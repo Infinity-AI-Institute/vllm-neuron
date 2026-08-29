@@ -22,6 +22,14 @@ EXPECTED_BLOCKERS = {
     "cpu_reference_bank",
     "emitted_contract_receipt",
 }
+EXPECTED_SATISFIED = {
+    "source_validator_merged": True,
+    "checkpoint_headers_and_payload_identity": True,
+    "tp32_rank_inventory": False,
+    "compiler_inventory": False,
+    "cpu_reference_bank": False,
+    "emitted_contract_receipt": False,
+}
 PROMPTS = [
     ("prompt00", "Hi, what can you help me with?"),
     ("prompt01", "What is 84 * 3 / 2?"),
@@ -30,6 +38,7 @@ PROMPTS = [
 ]
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^[0-9a-f]{40}$")
+PAYLOAD_LINE_RE = re.compile(r"^([0-9a-f]{64})  \./([^/]+)$")
 
 
 class AuthorizationError(ValueError):
@@ -165,13 +174,42 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
     _require(
         {item.get("id") for item in blockers} == EXPECTED_BLOCKERS, "blocker drift"
     )
+    blocker_state = {item["id"]: item.get("satisfied") for item in blockers}
+    _require(blocker_state == EXPECTED_SATISFIED, "production receipt state drift")
     _require(
-        all(
-            item.get("satisfied") is False and item.get("machine_check")
-            for item in blockers
-        ),
-        "static blockers must remain falsifiable HOLDs",
+        all(item.get("machine_check") for item in blockers),
+        "every blocker requires a machine check",
     )
+    production = packet.get("production_evidence")
+    expected_production = {
+        "source_provenance": (
+            "evidence/source-provenance.json",
+            "6d8adb42de7664cbc2f76fb481aaab12ca1ba8deded4d9fb8daabb40f788a965",
+        ),
+        "routing_manifest": (
+            "evidence/routing-manifest.json",
+            "93c516df53d1fc5e88e77acb043f68c9d37b7eb12a75f70d8469ab284a663547",
+        ),
+        "checkpoint_payload_manifest": (
+            "evidence/checkpoint-all-files.sha256",
+            "ac05cbd738cb8866595257aec855bdb231b677280bbdcb6bd65950c356f68a8d",
+        ),
+        "audit_tool": (
+            "audit_source_provenance.py",
+            "d7c6acf9ae3340ff01ef8aeac3b1ea2f93d53de456c310aab6b83c78ced6ab3a",
+        ),
+    }
+    _require(
+        isinstance(production, Mapping) and set(production) == set(expected_production),
+        "production evidence inventory drift",
+    )
+    for name, (path, digest) in expected_production.items():
+        identity = production[name]
+        _require(
+            isinstance(identity, Mapping)
+            and identity == {"path": path, "sha256": digest},
+            f"production evidence binding drift: {name}",
+        )
     claims = packet.get("claims", {})
     _require(
         isinstance(claims, Mapping) and not any(claims.values()),
@@ -345,6 +383,112 @@ def _validate_source(
             "shards": shards,
         },
         "routing manifest body drift",
+    )
+
+
+def validate_production_source_evidence(
+    packet: Mapping[str, Any], package_root: Path, repository: Path
+) -> None:
+    """Validate the two committed production receipts independently of later gates."""
+    production = packet["production_evidence"]
+    resolved: dict[str, Path] = {}
+    for name, identity in production.items():
+        path = (package_root / identity["path"]).resolve()
+        _require(path.is_relative_to(package_root.resolve()), f"{name} escapes package")
+        _require(path.is_file(), f"production evidence missing: {name}")
+        _require(
+            _sha256_file(path) == identity["sha256"],
+            f"production evidence hash drift: {name}",
+        )
+        resolved[name] = path
+
+    source_path = resolved["source_provenance"]
+    source_root = source_path.parent
+    source = _load(source_path)
+    _require(
+        source.get("source_commit") == "266af97d16cb8621514d6ae77741ce17ece40d9c",
+        "reviewed source head drift",
+    )
+    _require(
+        source.get("validator_merge_sha") == "2543fe18c70f7d92a5bf498e4adaccacde425728",
+        "validator merge SHA drift",
+    )
+    _require(
+        source.get("validator_merge_tree_sha")
+        == "e51e1e648726a054b8906b6b2338b7fb75b795ea",
+        "validator merge tree drift",
+    )
+    _validate_source(packet, source, source_root, repository)
+    _require(
+        (source_root / source["routing_manifest"]["path"]).resolve()
+        == resolved["routing_manifest"],
+        "routing path binding drift",
+    )
+
+    payload = source.get("payload_manifest")
+    _require(
+        isinstance(payload, Mapping)
+        and payload
+        == {
+            "path": "checkpoint-all-files.sha256",
+            "sha256": production["checkpoint_payload_manifest"]["sha256"],
+            "entry_count": 56,
+            "shard_entries": 48,
+            "shard_bytes": packet["source_total_bytes"],
+            "prior_hash_verification": "48/48_PASS",
+        },
+        "payload manifest receipt drift",
+    )
+    _require(
+        (source_root / payload["path"]).resolve()
+        == resolved["checkpoint_payload_manifest"],
+        "payload manifest path binding drift",
+    )
+    entries: dict[str, str] = {}
+    for line in (
+        resolved["checkpoint_payload_manifest"].read_text(encoding="utf-8").splitlines()
+    ):
+        match = PAYLOAD_LINE_RE.fullmatch(line)
+        _require(match is not None, "malformed checkpoint payload manifest")
+        digest, name = match.groups()
+        _require(name not in entries, f"duplicate payload manifest entry: {name}")
+        entries[name] = digest
+    _require(len(entries) == 56, "payload manifest entry census drift")
+    for shard in source["shards"]:
+        _require(
+            entries.get(shard["name"]) == shard["lfs_sha256"],
+            f"payload identity mismatch: {shard['name']}",
+        )
+    for name, identity in source["model_files"].items():
+        _require(
+            entries.get(name) == identity["sha256"],
+            f"model-file manifest identity mismatch: {name}",
+        )
+
+    _require(
+        source.get("complete_marker")
+        == {
+            "name": ".complete",
+            "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        },
+        "checkpoint completion marker drift",
+    )
+    _require(
+        source.get("audit")
+        == {
+            "tool_path": "audit_source_provenance.py",
+            "tool_sha256": production["audit_tool"]["sha256"],
+            "method": "safetensors_8_byte_prefix_plus_json_header_only",
+            "tensor_payload_bytes_read": 0,
+            "rank_conversion_performed": False,
+            "large_outputs_created": False,
+        },
+        "host-only audit boundary drift",
+    )
+    _require(
+        resolved["audit_tool"] == package_root / source["audit"]["tool_path"],
+        "audit tool path binding drift",
     )
 
 
@@ -644,9 +788,11 @@ def main() -> int:
     args = parser.parse_args()
     packet = _load(args.packet)
     validate_packet(packet)
+    repository = args.source_dir or HERE.parents[2]
+    validate_production_source_evidence(packet, HERE, repository)
     if args.compile_contract is not None:
         validate_compile_contract(packet, _load(args.compile_contract))
-    holds = [item["id"] for item in packet["blockers"]]
+    holds = [item["id"] for item in packet["blockers"] if not item["satisfied"]]
     if args.evidence_root is not None:
         _require(args.source_dir is not None, "--source-dir is required with evidence")
         _require(args.model_dir is not None, "--model-dir is required with evidence")

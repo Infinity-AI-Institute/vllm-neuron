@@ -35,7 +35,7 @@ optional-dependencies = {test = {file = ["requirements/test.txt"]}}
 include-package-data = true
 
 [tool.setuptools.package-data]
-vllm_neuron = ["py.typed", "**/*.json", "model/llama3/LICENSE"]
+vllm_neuron = ["py.typed", "**/*.json", "**/*.sha256", "model/llama3/LICENSE"]
 
 # Keep only the plugin package out of all the top-level dirs (test/, ci/, tools/,
 # examples/, ...). The dotted form pins it to vllm_neuron and its subpackages, so
