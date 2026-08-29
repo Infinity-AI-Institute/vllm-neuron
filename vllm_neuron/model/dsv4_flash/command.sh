@@ -21,6 +21,8 @@ CONTRACT_SLUG="$(jq -r '.contract_slug // empty' "$COMPILE_CONTRACT")"
 
 MODEL_DIR="${MODEL_DIR:-/mnt/compile/hf-cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
 SRC_DIR="${SRC_DIR:-/mnt/compile/src/vllm-neuron-bravo}"
+: "${AUTH_EVIDENCE_ROOT:?set AUTH_EVIDENCE_ROOT to the reviewed host-only evidence directory}"
+AUTH_PACKET="${AUTH_PACKET:-$SRC_DIR/vllm_neuron/model/dsv4_flash/tp32_compile_authorization.json}"
 OUT_DIR="$COMPILE_RUN_ROOT/artifacts/model"
 if [[ -z "$CONTRACT_SLUG" ]]; then
   CONTRACT_SLUG="tp${TP}-lnc2-b1c1-s${SEQ}-bf16-shard_intermediate-skip_dma-cont_batch"
@@ -28,6 +30,11 @@ fi
 
 test -s "$MODEL_DIR/config.json"
 test -f "$SRC_DIR/vllm_neuron/model/dsv4_flash/neuron_wrapper.py"
+test "$TP" -eq 32
+python "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py" \
+  --packet "$AUTH_PACKET" \
+  --evidence-root "$AUTH_EVIDENCE_ROOT" \
+  --require-compile-permitted
 mkdir -p "$COMPILE_RUN_ROOT"/{cache,work/tmp,work/nxd,artifacts/model,logs}
 
 # The stream sharder writes the rank files before this driver is queued.  Do

@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+
+ROOT = Path(__file__).parents[3]
+MODEL_ROOT = ROOT / "vllm_neuron" / "model"
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+for package_name, package_path in (
+    ("vllm_neuron", ROOT / "vllm_neuron"),
+    ("vllm_neuron.model", MODEL_ROOT),
+    ("vllm_neuron.model.glm53_flash", MODEL_ROOT / "glm53_flash"),
+    ("vllm_neuron.model.dsv4_flash", MODEL_ROOT / "dsv4_flash"),
+):
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(package_path)]
+    sys.modules.setdefault(package_name, package)
+
+_load_module(
+    "vllm_neuron.model.glm53_flash.checkpoint_converter",
+    MODEL_ROOT / "glm53_flash" / "checkpoint_converter.py",
+)
+_load_module(
+    "vllm_neuron.model.glm53_flash.streaming_rank_writer",
+    MODEL_ROOT / "glm53_flash" / "streaming_rank_writer.py",
+)
+_load_module(
+    "vllm_neuron.model.dsv4_flash.config",
+    MODEL_ROOT / "dsv4_flash" / "config.py",
+)
+_load_module(
+    "vllm_neuron.model.dsv4_flash.checkpoint_convert",
+    MODEL_ROOT / "dsv4_flash" / "checkpoint_convert.py",
+)
+SHARDER = _load_module(
+    "vllm_neuron.model.dsv4_flash.stream_shard",
+    MODEL_ROOT / "dsv4_flash" / "stream_shard.py",
+)
+
+
+def _fixture(tmp_path: Path, *, orphan: bool = False) -> Path:
+    root = tmp_path / "hf"
+    root.mkdir()
+    shard = root / "model-00001-of-00001.safetensors"
+    tensors = {
+        "embed.weight": torch.arange(16).reshape(4, 4),
+        "norm.weight": torch.arange(4),
+        "layers.0.attn.wq_a.weight": torch.arange(16).reshape(4, 4),
+    }
+    if orphan:
+        tensors["orphan.weight"] = torch.ones(1)
+    save_file(tensors, shard)
+    weight_map = {
+        key: shard.name for key in tensors if not (orphan and key == "orphan.weight")
+    }
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    return root
+
+
+def _source() -> SimpleNamespace:
+    return SimpleNamespace(
+        allow_reduced_shapes=True,
+        num_hidden_layers=1,
+        tie_word_embeddings=True,
+        torch_dtype=torch.int64,
+    )
+
+
+def test_two_pass_rank_inventory_and_transactional_bounded_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path)
+
+    def convert(state, layer_idx, src, **kwargs):
+        del layer_idx, src, kwargs
+        return {"layers.0.attn.mqa.wq_a.weight": state["layers.0.attn.wq_a.weight"]}
+
+    monkeypatch.setattr(SHARDER, "_convert_one_layer", convert)
+    out = tmp_path / "compiled"
+    report = SHARDER.stream_shard_dsv4_checkpoint(
+        str(root),
+        str(out),
+        _source(),
+        tp_degree=2,
+        ranks=[0, 1],
+        max_chunk_bytes=16,
+        _test_only_allow_unpinned_source=True,
+    )
+    assert report["ranks_written"] == [0, 1]
+    assert report["source_audit"] == {
+        "shard_count": 1,
+        "tensor_count": 3,
+        "payload_bytes_loaded_during_audit": 0,
+    }
+    assert set(report["rank_inventory_sha256"]) == {"0", "1"}
+    assert all(
+        item["observed_max_chunk_bytes"] <= 16
+        for item in report["rank_manifest"].values()
+    )
+    rank0_path = out / "weights" / "tp0_sharded_checkpoint.safetensors"
+    rank0 = load_file(rank0_path)
+    assert torch.equal(rank0["embed_tokens.weight"], torch.arange(16).reshape(4, 4)[:2])
+    with safe_open(rank0_path, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata()
+    assert metadata["model"] == "DeepSeek-V4-Flash-0731"
+    assert metadata["revision"] == SHARDER.DSV4_CHECKPOINT_REVISION
+    manifest = json.loads(
+        rank0_path.with_suffix(".safetensors.manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema"] == "dsv4-streaming-rank-v1"
+    assert manifest["rank_inventory_sha256"] == report["rank_inventory_sha256"]["0"]
+    assert not list((out / "weights").glob("*.partial-*"))
+
+
+def test_header_audit_rejects_orphan_before_publication(tmp_path: Path) -> None:
+    root = _fixture(tmp_path, orphan=True)
+    out = tmp_path / "compiled"
+    with pytest.raises(ValueError, match="orphan"):
+        SHARDER.stream_shard_dsv4_checkpoint(
+            str(root),
+            str(out),
+            _source(),
+            tp_degree=2,
+            ranks=[0],
+            _test_only_allow_unpinned_source=True,
+        )
+    assert not list(out.rglob("*.safetensors"))
+
+
+def test_unpinned_source_bypass_is_reduced_fixture_only(tmp_path: Path) -> None:
+    root = tmp_path / "hf"
+    root.mkdir()
+    source = _source()
+    source.allow_reduced_shapes = False
+    source.num_hidden_layers = 43
+    with pytest.raises(ValueError, match="reduced test fixtures"):
+        SHARDER.stream_shard_dsv4_checkpoint(
+            str(root),
+            str(tmp_path / "out"),
+            source,
+            tp_degree=32,
+            ranks=[0],
+            _test_only_allow_unpinned_source=True,
+        )

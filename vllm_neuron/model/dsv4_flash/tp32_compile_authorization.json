@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "config_sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
+  "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+  "source_tensor_count": 72317,
+  "source_shard_count": 48,
+  "topology": {
+    "hardware": "trn2.48xlarge",
+    "tp_degree": 32,
+    "logical_neuroncore_config": 2,
+    "ctx_batch_size": 1,
+    "tkg_batch_size": 1,
+    "sequence_buckets": [4096],
+    "continuous_batching": true
+  },
+  "emitted_contract": {
+    "rank_count": 32,
+    "rank_checkpoint_dtype": "bfloat16",
+    "compute_dtype": "bfloat16",
+    "cache_dtype": "bfloat16",
+    "fp8_kv": false,
+    "runtime_weight_quantized": false,
+    "sampler": "greedy_argmax",
+    "speculative_decode": false,
+    "mtp": false,
+    "dspark": false,
+    "max_writer_chunk_bytes": 67108864
+  },
+  "authorization_rule": "compile is permitted only when every machine check reports satisfied=true",
+  "blockers": [
+    {
+      "id": "source_validator_merged",
+      "satisfied": false,
+      "machine_check": "git merge-base --is-ancestor <source_commit> origin/agent-main and bind the merge SHA in source-provenance.json"
+    },
+    {
+      "id": "checkpoint_headers_and_payload_identity",
+      "satisfied": false,
+      "machine_check": "source-provenance.json must bind the pinned revision/config/index, 48 exact routed shard headers, 72317 tensors, zero orphan/missing/misrouted keys, and every LFS object SHA-256"
+    },
+    {
+      "id": "tp32_rank_inventory",
+      "satisfied": false,
+      "machine_check": "rank-inventory.json plus 32 dsv4-streaming-rank-v1 manifests must cover ranks 0..31, bind unique inventory and checkpoint SHA-256 values, TP=32, BF16 outputs, and <=67108864 observed writer chunks"
+    },
+    {
+      "id": "compiler_inventory",
+      "satisfied": false,
+      "machine_check": "compiler-provenance.json must bind image/config digests and exact neuronx-cc, torch-neuronx, NxDI, NxD, NKI, torch and runtime package/source identities"
+    },
+    {
+      "id": "cpu_reference_bank",
+      "satisfied": false,
+      "machine_check": "cpu-reference-manifest.json must bind campaign-canonical-v1 prompt hash 99f702c72d2fafcc, four prompts x ten token IDs, 40 full-vocabulary FP32 logit artifacts, exact checkpoint/tokenizer identity and canonical manifest SHA-256"
+    },
+    {
+      "id": "emitted_contract_receipt",
+      "satisfied": false,
+      "machine_check": "emitted-contract.json must exactly equal topology and emitted_contract above and reject missing/extra/drifted fields before compile"
+    }
+  ],
+  "claims": {
+    "compile_permitted": false,
+    "compiled": false,
+    "trn2_used": false,
+    "runtime_correctness": false,
+    "performance": false,
+    "tokenomics": false
+  }
+}

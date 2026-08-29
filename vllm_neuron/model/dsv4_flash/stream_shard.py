@@ -10,15 +10,24 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
+
+from vllm_neuron.model.glm53_flash.streaming_rank_writer import (
+    RankInventory,
+    StreamingRankWriter,
+    TensorChunk,
+    TensorSpec,
+)
 
 from .checkpoint_convert import (
     _convert_csa_block,
@@ -28,6 +37,34 @@ from .checkpoint_convert import (
     _convert_sliding_only_block,
 )
 from .config import DeepseekV4FlashInferenceConfig
+
+DSV4_CHECKPOINT_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+DSV4_CONFIG_SHA256 = "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023"
+DSV4_INDEX_SHA256 = "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b"
+DSV4_SHARD_COUNT = 48
+DEFAULT_MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Dsv4SourceReport:
+    shard_count: int
+    tensor_count: int
+    payload_bytes_loaded_during_audit: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "shard_count": self.shard_count,
+            "tensor_count": self.tensor_count,
+            "payload_bytes_loaded_during_audit": self.payload_bytes_loaded_during_audit,
+        }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class _MmapState(Mapping[str, torch.Tensor]):
@@ -98,6 +135,81 @@ def _close_shards(handles: dict[str, Any]) -> None:
             handle.__exit__(None, None, None)
         except Exception:  # pragma: no cover  # noqa: BLE001,S110
             pass
+
+
+def _preflight_and_audit_source(
+    model_path: str,
+    weight_map: Mapping[str, str],
+    handles: Mapping[str, Any],
+    *,
+    test_only_allow_unpinned_source: bool,
+) -> Dsv4SourceReport:
+    """Bind provenance and compare every index route with actual shard headers."""
+    root = Path(model_path).resolve(strict=True)
+    if test_only_allow_unpinned_source:
+        if root.name == DSV4_CHECKPOINT_REVISION:
+            raise ValueError(
+                "test-only provenance bypass is forbidden for the pinned snapshot"
+            )
+    else:
+        if root.name != DSV4_CHECKPOINT_REVISION:
+            raise ValueError(
+                "checkpoint directory must be the exact pinned revision "
+                f"{DSV4_CHECKPOINT_REVISION}; got {root.name!r}"
+            )
+        for filename, expected in (
+            ("config.json", DSV4_CONFIG_SHA256),
+            ("model.safetensors.index.json", DSV4_INDEX_SHA256),
+        ):
+            actual = _sha256_file(root / filename)
+            if actual != expected:
+                raise ValueError(
+                    f"immutable {filename} SHA-256 mismatch: expected {expected}, got {actual}"
+                )
+
+    expected_by_shard: dict[str, set[str]] = {}
+    for key, shard_name in weight_map.items():
+        shard_path = Path(shard_name)
+        if shard_path.is_absolute() or shard_path.name != shard_name:
+            raise ValueError(f"unsafe shard path in index: {shard_name!r}")
+        expected_by_shard.setdefault(shard_name, set()).add(key)
+    actual_files = {path.name for path in root.glob("*.safetensors")}
+    referenced = set(expected_by_shard)
+    if actual_files != referenced:
+        raise ValueError(
+            "source shard inventory mismatch: "
+            f"missing={sorted(referenced - actual_files)[:4]} "
+            f"extra={sorted(actual_files - referenced)[:4]}"
+        )
+    if not test_only_allow_unpinned_source and len(referenced) != DSV4_SHARD_COUNT:
+        raise ValueError(
+            f"pinned DSv4 snapshot requires {DSV4_SHARD_COUNT} shards; got {len(referenced)}"
+        )
+
+    seen: set[str] = set()
+    for shard_name in sorted(referenced):
+        actual_keys = set(handles[shard_name].keys())
+        expected_keys = expected_by_shard[shard_name]
+        if actual_keys != expected_keys:
+            raise ValueError(
+                f"tensor routing mismatch in {shard_name}: "
+                f"missing={sorted(expected_keys - actual_keys)[:4]} "
+                f"orphan={sorted(actual_keys - expected_keys)[:4]}"
+            )
+        duplicate = seen & actual_keys
+        if duplicate:
+            raise ValueError(
+                f"tensor appears in multiple shards: {sorted(duplicate)[:4]}"
+            )
+        seen.update(actual_keys)
+    if seen != set(weight_map):
+        raise ValueError(
+            "audited shard headers do not exactly equal the immutable index"
+        )
+    return Dsv4SourceReport(
+        shard_count=len(referenced),
+        tensor_count=len(seen),
+    )
 
 
 def _row_shard(
@@ -281,6 +393,91 @@ def _convert_one_layer(
     }
 
 
+def _iter_rank_tensors(
+    weight_map: dict[str, str],
+    handles: dict[str, Any],
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    rank: int,
+    tp_degree: int,
+):
+    top_state = _MmapState(
+        weight_map,
+        handles,
+        {key for key in weight_map if not key.startswith("layers.")},
+    )
+    embed = top_state.get("embed.weight")
+    final_norm = top_state.get("norm.weight")
+    lm_head = top_state.get("head.weight")
+    if embed is None or final_norm is None:
+        raise KeyError("embed.weight and norm.weight are required")
+    if lm_head is None:
+        if not src.tie_word_embeddings:
+            raise KeyError("head.weight is required when tie_word_embeddings=False")
+        lm_head = embed
+    yield (
+        "embed_tokens.weight",
+        _row_shard(embed.to(src.torch_dtype), rank, tp_degree, 0),
+    )
+    yield "final_norm_weight", final_norm.to(src.torch_dtype).contiguous()
+    yield "lm_head.weight", _row_shard(lm_head.to(src.torch_dtype), rank, tp_degree, 0)
+
+    for layer_idx in range(src.num_hidden_layers):
+        layer_keys = {
+            key for key in weight_map if key.startswith(f"layers.{layer_idx}.")
+        }
+        state = _MmapState(weight_map, handles, layer_keys)
+        converted = _convert_one_layer(
+            state,
+            layer_idx,
+            src,
+            rank=rank,
+            tp_degree=tp_degree,
+        )
+        for key, value in converted.items():
+            if not key.endswith(
+                (
+                    "expert_mlps.mlp_op.gate_up_proj.weight",
+                    "expert_mlps.mlp_op.down_proj.weight",
+                )
+            ):
+                value = _target_shard(key, value, rank, tp_degree)
+            yield key, value
+        del converted, state
+        gc.collect()
+
+
+def _rank_inventory(
+    weight_map: dict[str, str],
+    handles: dict[str, Any],
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    rank: int,
+    tp_degree: int,
+) -> RankInventory:
+    specs: list[TensorSpec] = []
+    for key, tensor in _iter_rank_tensors(
+        weight_map, handles, src, rank=rank, tp_degree=tp_degree
+    ):
+        specs.append(TensorSpec(key, tensor.dtype, tuple(tensor.shape)))
+        del tensor
+        gc.collect()
+    return RankInventory(rank=rank, tp_degree=tp_degree, tensors=tuple(specs))
+
+
+def _write_bounded_tensor(
+    writer: StreamingRankWriter,
+    key: str,
+    tensor: torch.Tensor,
+) -> None:
+    flat = tensor.contiguous().view(-1)
+    elements_per_chunk = max(1, writer.max_chunk_bytes // flat.element_size())
+    for start in range(0, flat.numel(), elements_per_chunk):
+        writer.write_chunk(
+            TensorChunk(key, start, flat[start : start + elements_per_chunk])
+        )
+
+
 def stream_shard_dsv4_checkpoint(
     hf_model_path: str,
     compiled_model_path: str,
@@ -289,8 +486,10 @@ def stream_shard_dsv4_checkpoint(
     tp_degree: int,
     ep_degree: int | None = None,
     ranks: list[int] | None = None,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    _test_only_allow_unpinned_source: bool = False,
 ) -> dict[str, Any]:
-    """Stream-write per-rank safetensors from a DSv4-Flash HF snapshot."""
+    """Transactionally stream complete per-rank SafeTensors checkpoints."""
     if tp_degree <= 0:
         raise ValueError(f"tp_degree must be positive; got {tp_degree}")
     if ep_degree is None:
@@ -306,6 +505,12 @@ def stream_shard_dsv4_checkpoint(
         raise ValueError(f"ranks must be a non-empty subset of [0, {tp_degree})")
     if len(set(ranks_iter)) != len(ranks_iter):
         raise ValueError("ranks contains duplicates")
+    if max_chunk_bytes <= 0:
+        raise ValueError("max_chunk_bytes must be positive")
+    if _test_only_allow_unpinned_source and not src.allow_reduced_shapes:
+        raise ValueError(
+            "unpinned-source bypass is restricted to reduced test fixtures"
+        )
 
     os.makedirs(compiled_model_path, exist_ok=True)
     weights_dir = os.path.join(compiled_model_path, "weights")
@@ -321,6 +526,12 @@ def stream_shard_dsv4_checkpoint(
         raise KeyError(f"HF index is missing required top-level keys: {missing}")
 
     handles = _open_shards(hf_model_path, set(weight_map.values()))
+    source_report = _preflight_and_audit_source(
+        hf_model_path,
+        weight_map,
+        handles,
+        test_only_allow_unpinned_source=_test_only_allow_unpinned_source,
+    )
     report: dict[str, Any] = {
         "model_path": hf_model_path,
         "compiled_model_path": compiled_model_path,
@@ -332,73 +543,54 @@ def stream_shard_dsv4_checkpoint(
         "rank_wall_s": {},
         "layers": src.num_hidden_layers,
         "peak_layer_key_count": 0,
+        "source_audit": source_report.to_dict(),
+        "rank_inventory_sha256": {},
+        "rank_manifest": {},
+        "max_chunk_bytes": max_chunk_bytes,
         "start_unix": int(time.time()),
     }
     try:
-        top_state = _MmapState(
-            weight_map,
-            handles,
-            {key for key in weight_map if not key.startswith("layers.")},
-        )
-        embed = top_state.get("embed.weight")
-        final_norm = top_state.get("norm.weight")
-        lm_head = top_state.get("head.weight")
-        if embed is None or final_norm is None:
-            raise KeyError("embed.weight and norm.weight are required")
-        if lm_head is None:
-            if not src.tie_word_embeddings:
-                raise KeyError("head.weight is required when tie_word_embeddings=False")
-            lm_head = embed
-
         for rank in ranks_iter:
             started = time.time()
-            rank_dict: dict[str, torch.Tensor] = {
-                "embed_tokens.weight": _row_shard(
-                    embed.to(src.torch_dtype), rank, tp_degree, 0
-                ),
-                "final_norm_weight": final_norm.to(src.torch_dtype).contiguous(),
-                "lm_head.weight": _row_shard(
-                    lm_head.to(src.torch_dtype), rank, tp_degree, 0
-                ),
-            }
-            for layer_idx in range(src.num_hidden_layers):
-                layer_keys = {
-                    key for key in weight_map if key.startswith(f"layers.{layer_idx}.")
-                }
-                state = _MmapState(weight_map, handles, layer_keys)
-                converted = _convert_one_layer(
-                    state,
-                    layer_idx,
-                    src,
-                    rank=rank,
-                    tp_degree=tp_degree,
-                )
-                report["peak_layer_key_count"] = max(
-                    report["peak_layer_key_count"], len(converted)
-                )
-                rank_dict.update(
-                    {
-                        key: value
-                        if key.endswith(
-                            (
-                                "expert_mlps.mlp_op.gate_up_proj.weight",
-                                "expert_mlps.mlp_op.down_proj.weight",
-                            )
-                        )
-                        else _target_shard(key, value, rank, tp_degree)
-                        for key, value in converted.items()
-                    }
-                )
-                del converted, state
-                gc.collect()
+            inventory = _rank_inventory(
+                weight_map, handles, src, rank=rank, tp_degree=tp_degree
+            )
             output_path = os.path.join(
                 weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"
             )
-            save_file(rank_dict, output_path)
+            with StreamingRankWriter(
+                output_path,
+                inventory,
+                source_report=source_report,
+                max_chunk_bytes=max_chunk_bytes,
+                source_metadata={
+                    "model": "DeepSeek-V4-Flash-0731",
+                    "revision": DSV4_CHECKPOINT_REVISION,
+                    "config_sha256": DSV4_CONFIG_SHA256,
+                    "index_sha256": DSV4_INDEX_SHA256,
+                },
+                manifest_schema="dsv4-streaming-rank-v1",
+            ) as writer:
+                for key, tensor in _iter_rank_tensors(
+                    weight_map, handles, src, rank=rank, tp_degree=tp_degree
+                ):
+                    _write_bounded_tensor(writer, key, tensor)
+                    del tensor
+                    gc.collect()
+                manifest = writer.finalize()
             report["ranks_written"].append(rank)
             report["rank_bytes"][str(rank)] = os.path.getsize(output_path)
             report["rank_wall_s"][str(rank)] = round(time.time() - started, 2)
-            del rank_dict
+            report["rank_inventory_sha256"][str(rank)] = inventory.contract_sha256
+            report["rank_manifest"][str(rank)] = {
+                "path": os.path.basename(writer.manifest_path),
+                "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+                "chunks_written": manifest["resource_bound"]["chunks_written"],
+                "observed_max_chunk_bytes": manifest["resource_bound"][
+                    "observed_max_chunk_bytes"
+                ],
+            }
+            del inventory, manifest
             gc.collect()
     finally:
         _close_shards(handles)
@@ -414,6 +606,7 @@ def _main() -> None:
     parser.add_argument("--tp-degree", type=int, default=32)
     parser.add_argument("--ep-degree", type=int)
     parser.add_argument("--ranks", type=int, nargs="+")
+    parser.add_argument("--max-chunk-bytes", type=int, default=DEFAULT_MAX_CHUNK_BYTES)
     args = parser.parse_args()
     config = DeepseekV4FlashInferenceConfig.from_pretrained(args.hf_model_path)
     report = stream_shard_dsv4_checkpoint(
@@ -423,6 +616,7 @@ def _main() -> None:
         tp_degree=args.tp_degree,
         ep_degree=args.ep_degree,
         ranks=args.ranks,
+        max_chunk_bytes=args.max_chunk_bytes,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
@@ -431,4 +625,10 @@ if __name__ == "__main__":  # pragma: no cover - exercised on compile host
     _main()
 
 
-__all__ = ["stream_shard_dsv4_checkpoint"]
+__all__ = [
+    "DEFAULT_MAX_CHUNK_BYTES",
+    "DSV4_CHECKPOINT_REVISION",
+    "DSV4_CONFIG_SHA256",
+    "DSV4_INDEX_SHA256",
+    "stream_shard_dsv4_checkpoint",
+]
