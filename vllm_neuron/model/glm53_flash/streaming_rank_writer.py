@@ -163,6 +163,12 @@ class SourceAuditReport:
     payload_bytes_loaded_during_audit: int
 
 
+@dataclass(frozen=True)
+class SourceTensorSpec:
+    safe_dtype: str
+    shape: tuple[int, ...]
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -194,6 +200,7 @@ class IndexedTensorReader:
         if not isinstance(weight_map, Mapping):
             raise Glm53StreamingError("immutable index has no weight_map")
         self.weight_map = {str(key): str(value) for key, value in weight_map.items()}
+        self.source_specs: dict[str, SourceTensorSpec] = {}
         self.max_source_group_bytes = 0
         self.source_groups_loaded = 0
         self.audit_report = self._audit_shards()
@@ -245,6 +252,9 @@ class IndexedTensorReader:
                 )
             seen.update(actual_keys)
             for key, (safe_dtype, shape) in header_specs.items():
+                self.source_specs[key] = SourceTensorSpec(
+                    safe_dtype=safe_dtype, shape=tuple(shape)
+                )
                 dtype_bytes = _SAFE_DTYPE_BYTES.get(safe_dtype)
                 if dtype_bytes is None:
                     raise Glm53StreamingError(
@@ -295,6 +305,102 @@ class IndexedTensorReader:
                 )
             return handle.get_tensor(key)
 
+    def _load_slice(self, key: str, slices: tuple[slice, ...]) -> torch.Tensor:
+        shard_name = self.weight_map.get(key)
+        spec = self.source_specs.get(key)
+        if shard_name is None or spec is None:
+            raise Glm53StreamingError(
+                f"tensor is not in audited immutable index: {key}"
+            )
+        if len(slices) != len(spec.shape):
+            raise Glm53StreamingError(
+                f"slice rank for {key} is {len(slices)}; expected {len(spec.shape)}"
+            )
+        safe_open = _safe_open()
+        with safe_open(self.root / shard_name, framework="pt", device="cpu") as handle:
+            return handle.get_slice(key)[slices]
+
+    @staticmethod
+    def _normalize_slice(value: slice, size: int, key: str) -> tuple[int, int]:
+        start, stop, step = value.indices(size)
+        if step != 1 or stop <= start:
+            raise Glm53StreamingError(
+                f"{key} requires a non-empty unit-stride slice; got {value!r}"
+            )
+        return start, stop
+
+    def read_converted_slice(
+        self,
+        key: str,
+        slices: tuple[slice, ...],
+        *,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """Read and convert one bounded source slice.
+
+        Block-FP8 slices may start inside a 128x128 tile. Only the intersecting
+        reciprocal-scale cells are loaded, expanded, and cropped to the exact
+        requested window; no full source tensor is materialized.
+        """
+        policy = classify_tensor(key, self.weight_map)
+        if policy in ("drop_mtp", "drop_vision", "block_fp8_scale"):
+            raise Glm53StreamingError(
+                f"tensor policy {policy} cannot be emitted directly: {key}"
+            )
+        spec = self.source_specs.get(key)
+        if spec is None:
+            raise Glm53StreamingError(
+                f"tensor is not in audited immutable index: {key}"
+            )
+        bounds = [
+            self._normalize_slice(value, size, key)
+            for value, size in zip(slices, spec.shape, strict=True)
+        ]
+        weight = self._load_slice(key, slices)
+        loaded_bytes = weight.numel() * weight.element_size()
+        if policy == "block_fp8_weight":
+            if len(spec.shape) < 2:
+                raise Glm53StreamingError(f"block-FP8 tensor is not rank >=2: {key}")
+            scale_key = f"{key}_scale_inv"
+            scale_spec = self.source_specs.get(scale_key)
+            if scale_spec is None:
+                raise Glm53StreamingError(
+                    f"missing audited reciprocal scale: {scale_key}"
+                )
+            block_out, block_in = (128, 128)
+            scale_slices = list(slices[:-2])
+            row_start, row_stop = bounds[-2]
+            col_start, col_stop = bounds[-1]
+            scale_slices.extend(
+                (
+                    slice(row_start // block_out, math.ceil(row_stop / block_out)),
+                    slice(col_start // block_in, math.ceil(col_stop / block_in)),
+                )
+            )
+            scale = self._load_slice(scale_key, tuple(scale_slices))
+            loaded_bytes += scale.numel() * scale.element_size()
+            expanded = scale.to(torch.float32)
+            expanded = expanded.repeat_interleave(block_out, -2).repeat_interleave(
+                block_in, -1
+            )
+            row_offset = row_start % block_out
+            col_offset = col_start % block_in
+            expanded = expanded[
+                ...,
+                row_offset : row_offset + (row_stop - row_start),
+                col_offset : col_offset + (col_stop - col_start),
+            ]
+            result = (weight.to(torch.float32) * expanded).to(out_dtype)
+        else:
+            if spec.safe_dtype.startswith("F8_"):
+                raise Glm53StreamingError(
+                    f"unscaled FP8 tensor is not a valid holdout: {key}"
+                )
+            result = weight.to(out_dtype)
+        self.max_source_group_bytes = max(self.max_source_group_bytes, loaded_bytes)
+        self.source_groups_loaded += 1
+        return result
+
     def read_converted(
         self, key: str, *, out_dtype: torch.dtype = torch.bfloat16
     ) -> torch.Tensor:
@@ -336,6 +442,7 @@ class StreamingRankWriter:
         *,
         source_report: Glm53CheckpointReport,
         max_chunk_bytes: int,
+        plan_contract_sha256: str | None = None,
     ) -> None:
         if max_chunk_bytes <= 0:
             raise ValueError("max_chunk_bytes must be positive")
@@ -343,6 +450,12 @@ class StreamingRankWriter:
         self.inventory = inventory
         self.source_report = source_report
         self.max_chunk_bytes = max_chunk_bytes
+        if plan_contract_sha256 is not None and (
+            len(plan_contract_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in plan_contract_sha256)
+        ):
+            raise ValueError("plan_contract_sha256 must be a lowercase SHA-256")
+        self.plan_contract_sha256 = plan_contract_sha256
         if self.output_path.exists():
             raise FileExistsError(
                 f"refusing to overwrite rank checkpoint: {self.output_path}"
@@ -383,6 +496,7 @@ class StreamingRankWriter:
                 "index_sha256": GLM53_INDEX_SHA256,
                 "rank": str(self.inventory.rank),
                 "tp_degree": str(self.inventory.tp_degree),
+                "plan_contract_sha256": self.plan_contract_sha256 or "unbound",
             }
         }
         for spec in self.inventory.tensors:
@@ -492,6 +606,7 @@ class StreamingRankWriter:
             "rank": self.inventory.rank,
             "tp_degree": self.inventory.tp_degree,
             "rank_inventory_sha256": self.inventory.contract_sha256,
+            "rank_plan_sha256": self.plan_contract_sha256,
             "checkpoint": {
                 "path": self.output_path.name,
                 "sha256": checkpoint_sha256,
@@ -569,6 +684,7 @@ __all__ = [
     "IndexedTensorReader",
     "RankInventory",
     "SourceAuditReport",
+    "SourceTensorSpec",
     "StreamingRankWriter",
     "TensorChunk",
     "TensorSpec",
