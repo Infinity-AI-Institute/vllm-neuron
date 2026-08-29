@@ -1,0 +1,26 @@
+{
+  "emitted_contract": {
+    "cache_dtype": "bfloat16",
+    "compute_dtype": "bfloat16",
+    "dspark": false,
+    "fp8_kv": false,
+    "max_writer_chunk_bytes": 67108864,
+    "mtp": false,
+    "rank_checkpoint_dtype": "bfloat16",
+    "rank_count": 32,
+    "runtime_weight_quantized": false,
+    "sampler": "greedy_argmax",
+    "speculative_decode": false
+  },
+  "topology": {
+    "continuous_batching": true,
+    "ctx_batch_size": 1,
+    "hardware": "trn2.48xlarge",
+    "logical_neuroncore_config": 2,
+    "sequence_buckets": [
+      4096
+    ],
+    "tkg_batch_size": 1,
+    "tp_degree": 32
+  }
+}

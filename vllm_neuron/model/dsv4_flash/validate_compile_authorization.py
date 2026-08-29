@@ -28,7 +28,7 @@ EXPECTED_SATISFIED = {
     "tp32_rank_inventory": False,
     "compiler_inventory": False,
     "cpu_reference_bank": False,
-    "emitted_contract_receipt": False,
+    "emitted_contract_receipt": True,
 }
 PROMPTS = [
     ("prompt00", "Hi, what can you help me with?"),
@@ -211,6 +211,14 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
             "validate_tp32_rank_plan.py",
             "c23d5a4f7b5d6e499663b564ae113fea7112f88c0f6c44ae7209935736e0124d",
         ),
+        "host_inventory": (
+            "evidence/host-inventory-20260829.json",
+            "7ef2c0d54c8c5e7a995e7d3c9231e14e2dad31d4a4dbf3f0d68861f1b5966e31",
+        ),
+        "emitted_contract_receipt": (
+            "evidence/emitted-contract.json",
+            "3de8e16ee2722c6947e4827493040675f553c00ea2f11a0e573f9d6d74a413c2",
+        ),
     }
     _require(
         isinstance(production, Mapping) and set(production) == set(expected_production),
@@ -223,6 +231,7 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
             and identity == {"path": path, "sha256": digest},
             f"production evidence binding drift: {name}",
         )
+
     claims = packet.get("claims", {})
     _require(
         isinstance(claims, Mapping) and not any(claims.values()),
@@ -399,6 +408,142 @@ def _validate_source(
     )
 
 
+def _validate_host_inventory(
+    packet: Mapping[str, Any], inventory: Mapping[str, Any]
+) -> None:
+    _require(
+        inventory.get("schema") == "dsv4-read-only-host-inventory-v1",
+        "host inventory schema drift",
+    )
+    _require(
+        inventory.get("captured_at_utc") == "2026-08-29T21:55:19Z",
+        "host inventory capture time drift",
+    )
+    boundary = inventory.get("audit_boundary")
+    _require(
+        isinstance(boundary, Mapping)
+        and set(boundary)
+        == {
+            "compiles_started",
+            "devices_used",
+            "docker_jobs_started_or_stopped",
+            "downloads_started",
+            "files_created_on_hosts",
+            "services_started_or_stopped",
+        }
+        and not any(boundary.values()),
+        "host inventory exceeded its read-only boundary",
+    )
+
+    compiler = inventory.get("compiler_stack")
+    _require(isinstance(compiler, Mapping), "compiler host inventory missing")
+    _require(
+        compiler.get("image_reference") == packet["compiler_image"],
+        "inventoried compiler image drift",
+    )
+    _require(
+        compiler.get("image_manifest_digest")
+        == "sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1",
+        "compiler manifest digest drift",
+    )
+    _require(
+        compiler.get("image_config_digest")
+        == "sha256:cffb98efd1c380b1f3a8092aacb070e78fa7cc712e0225a5569094b332cc218d",
+        "compiler config digest drift",
+    )
+    _require(
+        compiler.get("versions_from_immutable_image_history")
+        == {
+            "nki": "0.4.0+25940409122.gd30719f9",
+            "neuron_runtime": "2.32.31.0-0234f5ed2",
+            "neuronx-cc": "2.25.3371.0+f524f7f8",
+            "neuronx-distributed": "0.19.28093+fc70b593",
+            "neuronx-distributed-inference": "0.10.17970+8548ba25",
+            "torch-neuronx": "2.9.0.2.14.27725+e2ff0410",
+        },
+        "compiler version inventory drift",
+    )
+
+    hosts = inventory.get("hosts")
+    _require(
+        isinstance(hosts, Mapping) and set(hosts) == {"r7i", "trn2"},
+        "host set drift",
+    )
+    r7i = hosts["r7i"]
+    trn2 = hosts["trn2"]
+    _require(
+        r7i.get("address") == "ubuntu@100.122.8.63" and r7i.get("cpu_count") == 48,
+        "r7i identity drift",
+    )
+    _require(
+        trn2.get("address") == "ubuntu@100.105.72.19" and trn2.get("cpu_count") == 192,
+        "Trn2 identity drift",
+    )
+    checkpoint = trn2.get("checkpoint")
+    _require(isinstance(checkpoint, Mapping), "checkpoint inventory missing")
+    for key in ("revision", "config_sha256", "index_sha256", "tokenizer_sha256"):
+        _require(checkpoint.get(key) == packet[key], f"checkpoint {key} drift")
+    _require(
+        checkpoint.get("shard_count") == packet["source_shard_count"]
+        and checkpoint.get("shard_bytes") == packet["source_total_bytes"]
+        and checkpoint.get("prior_payload_verification") == "48/48_PASS",
+        "checkpoint completeness drift",
+    )
+    _require(
+        checkpoint.get("complete_marker_sha256") == hashlib.sha256(b"").hexdigest(),
+        "checkpoint completion marker drift",
+    )
+
+    capacity = trn2.get("rank_materialization_capacity")
+    _require(isinstance(capacity, Mapping), "rank capacity inventory missing")
+    expected_output = 19_210_553_052 * 32
+    free_bytes = trn2["filesystem"]["available_bytes"]
+    reserve = capacity.get("safety_reserve_bytes")
+    _require(
+        capacity.get("rank_count") == 32
+        and capacity.get("target_bytes_per_rank") == 19_210_553_052
+        and capacity.get("output_bytes") == expected_output,
+        "TP32 output capacity arithmetic drift",
+    )
+    _require(
+        isinstance(reserve, int)
+        and reserve == 200 * 1024**3
+        and capacity.get("post_materialization_free_bytes")
+        == free_bytes - expected_output
+        and capacity.get("usable_headroom_after_output_and_reserve_bytes")
+        == free_bytes - expected_output - reserve
+        and capacity.get("fits_with_reserve") is True,
+        "TP32 guarded capacity drift",
+    )
+    _require(
+        r7i["filesystem"]["available_bytes"] < expected_output,
+        "r7i must not be claimed as a safe TP32 materialization target",
+    )
+
+    holds = inventory.get("formal_holds")
+    _require(isinstance(holds, Mapping), "formal hold inventory missing")
+    _require(
+        holds["tp32_rank_inventory"].get("resolved") is False
+        and holds["tp32_rank_inventory"].get("materialized_rank_files_found") == 0,
+        "rank materialization claim drift",
+    )
+    _require(
+        holds["compiler_inventory"].get("resolved") is False,
+        "compiler hold was overclaimed",
+    )
+    _require(
+        holds["cpu_reference_bank"].get("resolved") is False
+        and holds["cpu_reference_bank"]["existing_non_authorizing_asset"].get("weights")
+        == "UD-Q3_K_XL GGUF",
+        "CPU reference hold was overclaimed",
+    )
+    _require(
+        holds["emitted_contract_receipt"]
+        == {"path": "emitted-contract.json", "resolved": True},
+        "emitted-contract hold drift",
+    )
+
+
 def validate_production_source_evidence(
     packet: Mapping[str, Any], package_root: Path, repository: Path
 ) -> None:
@@ -414,6 +559,16 @@ def validate_production_source_evidence(
             f"production evidence hash drift: {name}",
         )
         resolved[name] = path
+
+    _validate_host_inventory(packet, _load(resolved["host_inventory"]))
+    _require(
+        _load(resolved["emitted_contract_receipt"])
+        == {
+            "topology": packet["topology"],
+            "emitted_contract": packet["emitted_contract"],
+        },
+        "committed emitted-contract receipt drift",
+    )
 
     source_path = resolved["source_provenance"]
     source_root = source_path.parent

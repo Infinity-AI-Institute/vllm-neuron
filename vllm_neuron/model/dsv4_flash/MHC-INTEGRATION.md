@@ -66,8 +66,17 @@ correctness, performance, or tokenomics claim.
 - The exact checkpoint must be rematerialized so all 32 rank files and
   manifests bind the 1,285-tensor inventories, including 261 replicated FP32
   mHC leaves.
-- The compile-authorization packet still requires compiler inventory, the
-  canonical CPU reference bank, and the emitted-contract receipt.
+- The read-only 2026-08-29 host inventory confirms the exact checkpoint and
+  compiler image are present on Trn2. It also commits the exact emitted-contract
+  receipt, closing that hold without starting a compile or touching a device.
+- TP32 materialization requires 614,737,697,664 bytes (572.52 GiB). Trn2 had
+  2,076,335,448,064 bytes free at capture, leaving 1,246,849,385,600 bytes after
+  output and a conservative 200 GiB reserve. r7i had only 607,038,689,280 bytes
+  free and is not a safe materialization target.
+- The compile-authorization packet still requires materialized TP32 rank files,
+  the complete compiler artifact/source inventory, and the canonical exact-
+  checkpoint CPU reference bank. Existing Q3_K_XL CPU logits are explicitly
+  non-authorizing.
 - Compiler lowering of the four-stream graph, 20-step Sinkhorn loop, FP32 mHC
   projections, BF16 placement, and 4x4 transposed combination matmul is
   untested. No compiler-success inference is made from host tests.

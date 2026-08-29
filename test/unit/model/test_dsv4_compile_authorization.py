@@ -313,6 +313,51 @@ def test_static_packet_and_exact_compile_contract_are_valid() -> None:
     assert not any(packet["claims"].values())
 
 
+def test_committed_read_only_host_inventory_is_capacity_safe() -> None:
+    packet = _packet()
+    inventory = json.loads(
+        (PACKAGE / "evidence" / "host-inventory-20260829.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    AUTH._validate_host_inventory(packet, inventory)
+    capacity = inventory["hosts"]["trn2"]["rank_materialization_capacity"]
+    assert capacity["fits_with_reserve"] is True
+    assert (
+        capacity["usable_headroom_after_output_and_reserve_bytes"] > 1_000_000_000_000
+    )
+    assert (
+        inventory["hosts"]["r7i"]["filesystem"]["available_bytes"]
+        < capacity["output_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["host_write", "checkpoint_revision", "capacity", "compiler", "oracle_overclaim"],
+)
+def test_host_inventory_tampering_fails_closed(mutation: str) -> None:
+    inventory = json.loads(
+        (PACKAGE / "evidence" / "host-inventory-20260829.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if mutation == "host_write":
+        inventory["audit_boundary"]["files_created_on_hosts"] = 1
+    elif mutation == "checkpoint_revision":
+        inventory["hosts"]["trn2"]["checkpoint"]["revision"] = "0" * 40
+    elif mutation == "capacity":
+        inventory["hosts"]["trn2"]["rank_materialization_capacity"]["output_bytes"] -= 1
+    elif mutation == "compiler":
+        inventory["compiler_stack"]["versions_from_immutable_image_history"][
+            "neuronx-cc"
+        ] = "unknown"
+    else:
+        inventory["formal_holds"]["cpu_reference_bank"]["resolved"] = True
+    with pytest.raises(AUTH.AuthorizationError):
+        AUTH._validate_host_inventory(_packet(), inventory)
+
+
 def test_driver_validates_the_same_contract_before_any_side_effect() -> None:
     driver = (PACKAGE / "command.sh").read_text(encoding="utf-8")
     validator = driver.index("validate_compile_authorization.py")

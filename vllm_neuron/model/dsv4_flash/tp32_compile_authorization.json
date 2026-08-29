@@ -56,6 +56,14 @@
     "tp32_rank_plan_validator": {
       "path": "validate_tp32_rank_plan.py",
       "sha256": "c23d5a4f7b5d6e499663b564ae113fea7112f88c0f6c44ae7209935736e0124d"
+    },
+    "host_inventory": {
+      "path": "evidence/host-inventory-20260829.json",
+      "sha256": "7ef2c0d54c8c5e7a995e7d3c9231e14e2dad31d4a4dbf3f0d68861f1b5966e31"
+    },
+    "emitted_contract_receipt": {
+      "path": "evidence/emitted-contract.json",
+      "sha256": "3de8e16ee2722c6947e4827493040675f553c00ea2f11a0e573f9d6d74a413c2"
     }
   },
   "blockers": [
@@ -86,8 +94,8 @@
     },
     {
       "id": "emitted_contract_receipt",
-      "satisfied": false,
-      "machine_check": "emitted-contract.json must exactly equal topology and emitted_contract above and reject missing/extra/drifted fields before compile"
+      "satisfied": true,
+      "machine_check": "the committed emitted-contract receipt must exactly equal topology and emitted_contract above and reject missing/extra/drifted fields before compile"
     }
   ],
   "claims": {

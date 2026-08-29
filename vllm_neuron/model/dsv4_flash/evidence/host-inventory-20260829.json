@@ -1,0 +1,129 @@
+{
+  "audit_boundary": {
+    "compiles_started": 0,
+    "devices_used": 0,
+    "docker_jobs_started_or_stopped": 0,
+    "downloads_started": 0,
+    "files_created_on_hosts": 0,
+    "services_started_or_stopped": 0
+  },
+  "captured_at_utc": "2026-08-29T21:55:19Z",
+  "compiler_stack": {
+    "availability": "exact_image_present_both_hosts",
+    "image_config_digest": "sha256:cffb98efd1c380b1f3a8092aacb070e78fa7cc712e0225a5569094b332cc218d",
+    "image_manifest_digest": "sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1",
+    "image_reference": "public.ecr.aws/neuron/pytorch-inference-neuronx@sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1",
+    "image_size_bytes": 8006869290,
+    "versions_from_immutable_image_history": {
+      "nki": "0.4.0+25940409122.gd30719f9",
+      "neuron_runtime": "2.32.31.0-0234f5ed2",
+      "neuronx-cc": "2.25.3371.0+f524f7f8",
+      "neuronx-distributed": "0.19.28093+fc70b593",
+      "neuronx-distributed-inference": "0.10.17970+8548ba25",
+      "torch-neuronx": "2.9.0.2.14.27725+e2ff0410"
+    }
+  },
+  "formal_holds": {
+    "compiler_inventory": {
+      "resolved": false,
+      "reason": "image and versions are exact, but installed wheel artifact hashes and full 40-character source commits are not exposed by image metadata"
+    },
+    "cpu_reference_bank": {
+      "existing_non_authorizing_asset": {
+        "engine": "llama.cpp unslothai fork at 2e0e57f1008053bae4902a772da85e3eb99d4aff",
+        "logit_artifacts": 4,
+        "logit_bytes_each": 5171200,
+        "path": "/mnt/compile/artifacts/dsv4-flash-reference-logits-llamacpp/f9bb268fdc8f971f",
+        "prompts": 4,
+        "tokens_per_prompt": 10,
+        "weights": "UD-Q3_K_XL GGUF"
+      },
+      "resolved": false,
+      "reason": "the existing 4x10 full-vocabulary logits use quantized GGUF weights, not the exact pinned checkpoint required by the formal oracle"
+    },
+    "emitted_contract_receipt": {
+      "path": "emitted-contract.json",
+      "resolved": true
+    },
+    "tp32_rank_inventory": {
+      "materialized_rank_files_found": 0,
+      "resolved": false
+    }
+  },
+  "hosts": {
+    "r7i": {
+      "address": "ubuntu@100.122.8.63",
+      "available_memory_bytes": 337292079104,
+      "cpu_count": 48,
+      "filesystem": {
+        "available_bytes": 607038689280,
+        "mount": "/mnt/compile",
+        "size_bytes": 2198943543296,
+        "type": "xfs",
+        "used_bytes": 1591904854016
+      },
+      "hostname": "ip-172-31-10-126.ec2.internal",
+      "source_exports": {
+        "/mnt/compile/src/trainium-dsv4": "present_without_git_metadata",
+        "/mnt/compile/src/vllm-neuron-bravo": "present_without_git_metadata"
+      },
+      "total_memory_bytes": 399170363392,
+      "workload_exclusion": {
+        "active_at_capture": [
+          "qwen235-tp64-compile-c00b6a7.service",
+          "qwen235-diskguard-c00b6a7.service"
+        ],
+        "deepseek_scheduled": false
+      }
+    },
+    "trn2": {
+      "address": "ubuntu@100.105.72.19",
+      "available_memory_bytes": 2073697263616,
+      "checkpoint": {
+        "complete_marker_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "config_sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
+        "full_payload_manifest_sha256": "ac05cbd738cb8866595257aec855bdb231b677280bbdcb6bd65950c356f68a8d",
+        "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+        "path": "/mnt/scratch/models/DeepSeek-V4-Flash-0731--7872f01b1d1fe23",
+        "prior_payload_verification": "48/48_PASS",
+        "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+        "shard_bytes": 166886535336,
+        "shard_count": 48,
+        "tokenizer_sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+      },
+      "cpu_count": 192,
+      "filesystem": {
+        "available_bytes": 2076335448064,
+        "mount": "/mnt/scratch",
+        "size_bytes": 4159355068416,
+        "type": "ext4",
+        "used_bytes": 2083002843136
+      },
+      "hostname": "ip-172-31-26-1",
+      "rank_materialization_capacity": {
+        "available_over_output_ratio": 3.3775957713,
+        "fits_with_reserve": true,
+        "output_bytes": 614737697664,
+        "post_materialization_free_bytes": 1461597750400,
+        "rank_count": 32,
+        "safety_reserve_bytes": 214748364800,
+        "target_bytes_per_rank": 19210553052,
+        "usable_headroom_after_output_and_reserve_bytes": 1246849385600,
+        "writer_peak_rule": "one transactional partial rank plus already-published ranks; no full duplicate rank set"
+      },
+      "total_memory_bytes": 2147422527488,
+      "unmounted_nvme_devices": {
+        "count": 4,
+        "size_bytes_each": 1900000000000
+      },
+      "workload_exclusion": {
+        "active_at_capture": [
+          "gemma4-b64-exact-20260829T212447Z-19765.service",
+          "qwen38-b64-soak512-pair01-20260829t2145z.service"
+        ],
+        "deepseek_scheduled": false
+      }
+    }
+  },
+  "schema": "dsv4-read-only-host-inventory-v1"
+}
