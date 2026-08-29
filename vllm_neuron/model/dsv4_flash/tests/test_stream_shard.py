@@ -133,12 +133,15 @@ def test_stream_shard_synthetic_33_shards_cpu_golden(tmp_path, monkeypatch) -> N
         json.dumps({"weight_map": weight_map}), encoding="utf-8"
     )
 
-    def cpu_golden(state, layer_idx, src, **kwargs):
+    def cpu_golden_parts(state, layer_idx, src, **kwargs):
         del layer_idx, src, kwargs
         # Return the exact CPU tensor; stream_shard applies the frozen TP slice.
-        return {"layers.0.attn.mqa.wq_a.weight": state["layers.0.attn.wq_a.weight"]}
+        yield stream_shard._ConvertedTensorPart(
+            "layers.0.attn.mqa.wq_a.weight",
+            state["layers.0.attn.wq_a.weight"],
+        )
 
-    monkeypatch.setattr(stream_shard, "_convert_one_layer", cpu_golden)
+    monkeypatch.setattr(stream_shard, "_iter_converted_layer_parts", cpu_golden_parts)
     src = SimpleNamespace(
         allow_reduced_shapes=True,
         num_hidden_layers=1,
