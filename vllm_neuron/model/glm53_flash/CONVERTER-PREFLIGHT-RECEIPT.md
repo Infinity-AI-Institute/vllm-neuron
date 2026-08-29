@@ -33,3 +33,9 @@ consumes only checkpoints which pass `preflight_checkpoint_metadata`, uses
 the two tested transforms here, and proves one complete rank manifest without
 materializing the approximately 611 GiB BF16 model. This patch does not claim
 that writer, model enablement, correctness, performance, or tokenomics.
+
+For a real checkpoint directory, callers must use `preflight_checkpoint_dir`.
+It resolves the HF snapshot path, requires the directory name to equal the
+full pinned revision, and verifies both immutable metadata SHA-256 values
+before parsing the schema. The in-memory metadata helper exists for tests and
+does not by itself establish checkpoint provenance.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from glm53_checkpoint_converter import (
     classify_tensor,
     dequantize_block_fp8,
     kda_conv1d_per_head_layout,
+    preflight_checkpoint_dir,
     preflight_checkpoint_metadata,
 )
 
@@ -187,3 +190,50 @@ def test_kda_conv_layout_is_per_head_not_stream_major() -> None:
     fused = kda_conv1d_per_head_layout(q, k, v, num_heads=2, head_dim=2)
     assert fused.flatten().tolist() == [10, 11, 30, 31, 50, 51, 20, 21, 40, 41, 60, 61]
     assert fused.flatten().tolist() != torch.cat((q, k, v), dim=0).flatten().tolist()
+
+
+def test_directory_preflight_binds_revision_and_metadata_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = tmp_path / MODULE.GLM53_CHECKPOINT_REVISION
+    snapshot.mkdir()
+    config_bytes = json.dumps(_config(), sort_keys=True).encode()
+    index_bytes = json.dumps({"weight_map": _weight_map()}, sort_keys=True).encode()
+    (snapshot / "config.json").write_bytes(config_bytes)
+    (snapshot / "model.safetensors.index.json").write_bytes(index_bytes)
+    monkeypatch.setattr(
+        MODULE, "GLM53_CONFIG_SHA256", hashlib.sha256(config_bytes).hexdigest()
+    )
+    monkeypatch.setattr(
+        MODULE, "GLM53_INDEX_SHA256", hashlib.sha256(index_bytes).hexdigest()
+    )
+    assert preflight_checkpoint_dir(snapshot).tensor_count == GLM53_EXPECTED_TENSORS
+
+    renamed = tmp_path / "fabricated-revision"
+    snapshot.rename(renamed)
+    with pytest.raises(Glm53ArchitectureMismatch, match="pinned revision"):
+        preflight_checkpoint_dir(renamed)
+
+
+def test_directory_preflight_rejects_tampered_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = tmp_path / MODULE.GLM53_CHECKPOINT_REVISION
+    snapshot.mkdir()
+    config_path = snapshot / "config.json"
+    index_path = snapshot / "model.safetensors.index.json"
+    config_path.write_text(json.dumps(_config()), encoding="utf-8")
+    index_path.write_text(json.dumps({"weight_map": _weight_map()}), encoding="utf-8")
+    monkeypatch.setattr(
+        MODULE,
+        "GLM53_CONFIG_SHA256",
+        hashlib.sha256(config_path.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "GLM53_INDEX_SHA256",
+        hashlib.sha256(index_path.read_bytes()).hexdigest(),
+    )
+    index_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(Glm53ArchitectureMismatch, match="SHA-256 mismatch"):
+        preflight_checkpoint_dir(snapshot)

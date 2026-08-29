@@ -16,6 +16,7 @@ reciprocal block-FP8 dequantization and per-head KDA Q/K/V convolution layout.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -212,10 +213,26 @@ def preflight_checkpoint_metadata(
 
 
 def preflight_checkpoint_dir(checkpoint_dir: str | Path) -> Glm53CheckpointReport:
-    root = Path(checkpoint_dir)
-    with (root / "config.json").open(encoding="utf-8") as stream:
+    """Bind an on-disk HF snapshot to the immutable revision and metadata.
+
+    Hugging Face cache snapshots resolve to a directory named by their full
+    commit SHA.  Requiring that name and hashing both metadata files prevents
+    a shape-compatible fabricated index from inheriting this checkpoint's
+    approval.
+    """
+    root = Path(checkpoint_dir).resolve(strict=True)
+    if root.name != GLM53_CHECKPOINT_REVISION:
+        raise Glm53ArchitectureMismatch(
+            f"checkpoint directory must resolve to pinned revision "
+            f"{GLM53_CHECKPOINT_REVISION}; got {root.name!r}"
+        )
+    config_path = root / "config.json"
+    index_path = root / "model.safetensors.index.json"
+    _require_file_sha256(config_path, GLM53_CONFIG_SHA256)
+    _require_file_sha256(index_path, GLM53_INDEX_SHA256)
+    with config_path.open(encoding="utf-8") as stream:
         config = json.load(stream)
-    with (root / "model.safetensors.index.json").open(encoding="utf-8") as stream:
+    with index_path.open(encoding="utf-8") as stream:
         index = json.load(stream)
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, Mapping):
@@ -223,6 +240,23 @@ def preflight_checkpoint_dir(checkpoint_dir: str | Path) -> Glm53CheckpointRepor
             "model.safetensors.index.json has no weight_map"
         )
     return preflight_checkpoint_metadata(config, weight_map)
+
+
+def _require_file_sha256(path: Path, expected: str) -> None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError as exc:
+        raise Glm53ArchitectureMismatch(
+            f"missing pinned metadata file: {path.name}"
+        ) from exc
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise Glm53ArchitectureMismatch(
+            f"{path.name} SHA-256 mismatch: expected {expected}, got {actual}"
+        )
 
 
 def dequantize_block_fp8(
