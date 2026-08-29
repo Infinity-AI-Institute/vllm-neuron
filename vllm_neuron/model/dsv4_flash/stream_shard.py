@@ -360,6 +360,7 @@ def _convert_one_layer(
                 layer_idx,
                 src,
                 expert_indices=indices,
+                include_static=start == 0,
             )
         else:
             _convert_routed_moe_layer(
@@ -368,6 +369,7 @@ def _convert_one_layer(
                 layer_idx,
                 src,
                 expert_indices=indices,
+                include_static=start == 0,
             )
         gate_chunk = partial.pop(expert_key)
         down_chunk = partial.pop(down_key)
