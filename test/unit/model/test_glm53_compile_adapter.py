@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +21,30 @@ from vllm_neuron.model.glm53_flash.runtime_config import (
     Glm53RuntimeConfig,
 )
 from vllm_neuron.model.glm53_flash.runtime_factory import GLM53_RUNTIME_ADAPTER
+
+MANIFEST = (
+    Path(__file__).parents[3]
+    / "vllm_neuron"
+    / "model"
+    / "glm53_flash"
+    / "TRANSPLANT-PROVENANCE.json"
+)
+
+
+def _git_blob_sha1(data: bytes) -> str:
+    header = f"blob {len(data)}".encode() + b"\0"
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _reviewed_bytes(commit: str, path: str) -> bytes:
+    return subprocess.check_output(["git", "cat-file", "-p", f"{commit}:{path}"])
+
+
+def _git_blob(treeish: str, path: str) -> str:
+    row = subprocess.check_output(
+        ["git", "ls-tree", treeish, "--", path], text=True
+    ).strip()
+    return row.split()[2]
 
 
 def _profile(**updates) -> Glm53RuntimeConfig:
@@ -116,3 +144,44 @@ def test_emitted_config_drift_fails_closed(mutation):
     mutation(emitted)
     with pytest.raises(Glm53CompileAdapterError):
         assert_emitted_neuron_config(profile, emitted)
+
+
+def test_transplant_manifest_binds_every_reviewed_file_to_current_bytes():
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    assert manifest["provenance_status"] == "external_origin_unavailable"
+    assert manifest["origin_claim"] is None
+    assert manifest["base_commit"] == "1b2e90d1f7fa5296aeaa57420794393958fe566e"
+    assert manifest["reviewed_source_commit"] == (
+        "d82f4f2d8c8a2b4a71965d3b401ecae060df46a8"
+    )
+    assert manifest["reviewed_source_tree"] == (
+        "0da3326192d16ed70a9eff1a92d133cd49fab4e4"
+    )
+    rows = manifest["files"]
+    assert len(rows) == 30
+    expected_paths = {
+        path
+        for path in subprocess.check_output(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                f"{manifest['base_commit']}..{manifest['reviewed_source_commit']}",
+            ],
+            text=True,
+        ).splitlines()
+        if path.startswith("vllm_neuron/")
+    }
+    assert {row["path"] for row in rows} == expected_paths
+    root = MANIFEST.parents[3]
+    for row in rows:
+        path = root / row["path"]
+        data = _reviewed_bytes(manifest["reviewed_source_commit"], row["path"])
+        assert path.is_file() and not path.is_symlink()
+        assert row["mode"] == "100644"
+        assert row["git_blob_sha1"] == _git_blob_sha1(data)
+        assert row["git_blob_sha1"] == _git_blob(
+            manifest["reviewed_source_tree"], row["path"]
+        )
+        assert row["git_blob_sha1"] == _git_blob("HEAD", row["path"])
+        assert row["raw_sha256"] == hashlib.sha256(data).hexdigest()
