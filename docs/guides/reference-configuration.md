@@ -49,6 +49,7 @@ For conceptual overview and trade-offs, see [Bucketing and dynamic shapes](featu
 | `num_seqs_buckets` | list[int] | Power-of-2 from 1 to `max_num_seqs` | Compiled decode batch sizes. Requests batched to smallest bucket >= current size. Largest must equal `max_num_seqs`. |
 | `kv_segment_size_buckets` | list[int] or null | null (disabled) | KV segment sizes for segmented attention kernel. Values must be in {512, 1024, 2048, 4096}, divisible by `block_size`. |
 | `decode_context_length_buckets` | list[int] or null | null (disabled) | Second decode bucketing dimension. Compiles smaller NEFFs sized to typical context lengths instead of `max_model_len`. Values must be ascending, < `max_model_len`, divisible by 128. |
+| `lm_head_dtype` | `"bfloat16"`, `"float32"`, or null | null (model dtype) | Llama-only language-model-head compute and output dtype. `"float32"` casts the final hidden state before the TP lm_head, constructs/loads that head in FP32, and requires FP32 logits before sampling. Unsupported values and misspelled lm_head/logits precision keys fail before model construction. This is not a post-hoc logits cast. |
 
 ## KV cache options
 

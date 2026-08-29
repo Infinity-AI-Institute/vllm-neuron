@@ -49,6 +49,12 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from .config import LlamaConfig
+from .lm_head_precision import (
+    prepare_lm_head_input,
+    require_lm_head_output_dtype,
+    require_lm_head_weight_dtype,
+    resolve_lm_head_dtype,
+)
 from .quantization import QuantScheme
 
 logger = logging.getLogger(__name__)
@@ -1450,6 +1456,12 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         ) or debug_logits_enabled
 
         lm_head_tp_rank = lm_head_tp_group.rank_in_group
+        requested_lm_head_dtype = (
+            config.neuron_config.lm_head_dtype if config.neuron_config else None
+        )
+        self.lm_head_dtype = resolve_lm_head_dtype(
+            config.torch_dtype, requested_lm_head_dtype
+        )
 
         # <-- MODEL-SPECIFIC: Tied embeddings — lm_head shares weight with embedding
         if config.tie_word_embeddings:
@@ -1458,7 +1470,7 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                dtype=config.torch_dtype,
+                dtype=self.lm_head_dtype,
                 gather_output=not self.on_device_sampling_config,
                 tp_group=lm_head_device_group,
             )
@@ -1469,7 +1481,7 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                dtype=config.torch_dtype,
+                dtype=self.lm_head_dtype,
                 gather_output=not self.on_device_sampling_config,
                 tp_group=lm_head_device_group,
             )
@@ -1550,7 +1562,14 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
                 hidden_states_for_logits, dim=0
             )
 
-        logits = self.lm_head(hidden_states_for_logits)
+        # The cast must precede the projection. A float32 cast after a bf16
+        # lm_head cannot recover winner margins already rounded into a tie.
+        hidden_states_for_logits = prepare_lm_head_input(
+            hidden_states_for_logits, self.lm_head_dtype
+        )
+        logits = require_lm_head_output_dtype(
+            self.lm_head(hidden_states_for_logits), self.lm_head_dtype
+        )
 
         # >>> PARALLELISM: Gather sharded logits for logprobs computation <<<
         # Only gather when lm_head returns sharded output (ODS mode).
@@ -1781,6 +1800,7 @@ class LlamaForCausalLM(nn.Module, SupportsEagle3):
         self._load_kv_cache_scales(checkpoint, device)
 
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+        require_lm_head_weight_dtype(self.lm_head.weight, self.lm_head_dtype)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None

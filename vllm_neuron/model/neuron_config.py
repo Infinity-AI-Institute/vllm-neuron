@@ -124,6 +124,11 @@ class NeuronConfig:
     )
     embedding_dp_size: int = 1  # Shard Embedding across TP * this many DP ranks
     lm_head_dp_size: int = 1  # Shard LM Head across TP * this many DP ranks
+    # Optional compute/output dtype for the language-model head. ``None``
+    # inherits the model dtype.  This is intentionally separate from a
+    # post-hoc logits cast: once a bf16 lm_head has rounded a close winner to a
+    # tie, converting those logits to fp32 cannot recover the lost ordering.
+    lm_head_dtype: str | None = None
     mlp_dp_size: int = 1  # Shard dense MLP across TP * this many DP ranks
     apply_prefill_dcp: bool = (
         False  # Shard attention across DCP sub-group (prefill DI server)
@@ -173,6 +178,22 @@ class NeuronConfig:
         Returns:
             NeuronConfig instance with parsed values.
         """
+        # Precision controls must fail closed.  Other historical, unrelated
+        # additional_config keys remain backward compatible, but a misspelled
+        # lm_head/logits precision key must not silently fall back to the model
+        # dtype and produce a different argmax boundary.
+        known_fields = set(cls.__dataclass_fields__)
+        unknown_precision_keys = sorted(
+            key
+            for key in config_dict
+            if key not in known_fields and ("lm_head" in key or "logit" in key)
+        )
+        if unknown_precision_keys:
+            raise ValueError(
+                "Unknown lm_head/logits precision option(s): "
+                f"{unknown_precision_keys}. Use 'lm_head_dtype'."
+            )
+
         # Parse on_device_sampling_config
         on_device_sampling_dict = config_dict.get("on_device_sampling_config")
         if on_device_sampling_dict is not None:
@@ -219,6 +240,7 @@ class NeuronConfig:
             attention_dp_size=config_dict.get("attention_dp_size", 1),
             embedding_dp_size=config_dict.get("embedding_dp_size", 1),
             lm_head_dp_size=config_dict.get("lm_head_dp_size", 1),
+            lm_head_dtype=config_dict.get("lm_head_dtype"),
             mlp_dp_size=config_dict.get("mlp_dp_size", 1),
             apply_prefill_dcp=config_dict.get("apply_prefill_dcp", False),
             on_device_sampling_config=on_device_sampling_config,
@@ -258,6 +280,11 @@ class NeuronConfig:
         if not isinstance(self.lm_head_dp_size, int) or self.lm_head_dp_size < 1:
             raise ValueError(
                 f"lm_head_dp_size must be a positive integer, got {self.lm_head_dp_size}"
+            )
+        if self.lm_head_dtype not in (None, "bfloat16", "float32"):
+            raise ValueError(
+                "lm_head_dtype must be null, 'bfloat16', or 'float32'; "
+                f"got {self.lm_head_dtype!r}"
             )
         if not isinstance(self.mlp_dp_size, int) or self.mlp_dp_size < 1:
             raise ValueError(
