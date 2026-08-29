@@ -707,6 +707,65 @@ def _convert_routed_moe_layer(
 HASH_TID2EID_KEY = "ffn.gate.tid2eid"
 
 
+def _convert_hash_tid2eid(
+    tid2eid: torch.Tensor,
+    *,
+    key: str,
+    vocab_size: int,
+    top_k: int,
+    n_experts: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Validate and losslessly normalize one hash-routing table to I32.
+
+    The pinned DSv4-Flash checkpoint stores ``tid2eid`` as I64, while the
+    Neuron wrapper owns a frozen I32 parameter.  A blind ``.to(torch.int32)``
+    would wrap values outside the I32 domain and could silently redirect
+    tokens.  Prove the exact shape and expert-index range before converting;
+    I32 inputs remain supported for bounded synthetic and legacy fixtures.
+    """
+    if vocab_size <= 0 or top_k <= 0:
+        raise ValueError(
+            f"invalid tid2eid contract dimensions: vocab_size={vocab_size}, "
+            f"top_k={top_k}"
+        )
+    expected_shape = (vocab_size, top_k)
+    if tuple(tid2eid.shape) != expected_shape:
+        raise ValueError(
+            f"tid2eid {key!r} shape {tuple(tid2eid.shape)} disagrees "
+            f"with expected {expected_shape}"
+        )
+    if tid2eid.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"tid2eid {key!r} dtype {tid2eid.dtype!r} is not int32/int64 — "
+            "refusing a non-integral hash-routing table"
+        )
+    if n_experts <= 0 or n_experts - 1 > torch.iinfo(torch.int32).max:
+        raise ValueError(
+            f"n_experts={n_experts} cannot be represented by the I32 wrapper "
+            "hash-routing contract"
+        )
+
+    tid_min = int(tid2eid.min().item())
+    tid_max = int(tid2eid.max().item())
+    if tid_min < 0 or tid_max >= n_experts:
+        raise ValueError(
+            f"tid2eid {key!r} contains out-of-range expert indices "
+            f"[{tid_min}, {tid_max}] outside [0, {n_experts})"
+        )
+
+    normalized = tid2eid.to(dtype=torch.int32).contiguous().clone()
+    if not torch.equal(normalized.to(dtype=torch.int64), tid2eid.to(torch.int64)):
+        raise ValueError(f"tid2eid {key!r} I64-to-I32 conversion was not lossless")
+    return normalized, {
+        "source_dtype": str(tid2eid.dtype),
+        "target_dtype": str(normalized.dtype),
+        "shape": tuple(normalized.shape),
+        "min_expert_index": tid_min,
+        "max_expert_index": tid_max,
+        "lossless_i64_to_i32": tid2eid.dtype == torch.int64,
+    }
+
+
 def _convert_hash_moe_block(
     state_dict: dict[str, Any],
     converted: dict[str, Any],
@@ -725,7 +784,9 @@ def _convert_hash_moe_block(
     routed-MoE that lands at layer 3 onwards.  Key differences from
     :func:`_convert_routed_moe_layer`:
 
-      * Reads ``layers.<i>.ffn.gate.tid2eid`` — an ``int32`` lookup table of
+      * Reads ``layers.<i>.ffn.gate.tid2eid`` — an ``int64`` lookup table in
+        the pinned checkpoint, losslessly range-checked and normalized to
+        ``int32`` for the wrapper — of
         shape ``[vocab_size, num_experts_per_tok]`` that selects the top-k
         experts per input token id.  Frozen (``requires_grad=False`` in HF).
         This tensor does NOT exist in routed-MoE layers.
@@ -798,31 +859,16 @@ def _convert_hash_moe_block(
     if tid2eid is None:
         raise KeyError(
             f"missing tid2eid lookup {tid_key!r} — hash-MoE layer requires "
-            "the frozen [vocab_size, num_experts_per_tok] int32 lookup"
+            "the frozen [vocab_size, num_experts_per_tok] integer lookup"
         )
-    if tuple(tid2eid.shape) != (vocab_size, top_k):
-        raise ValueError(
-            f"tid2eid {tid_key!r} shape {tuple(tid2eid.shape)} disagrees "
-            f"with expected ({vocab_size}, {top_k})"
-        )
-    # Enforce int32 dtype for round-trip fidelity with HF.
-    if tid2eid.dtype != torch.int32:
-        raise ValueError(
-            f"tid2eid {tid_key!r} dtype {tid2eid.dtype!r} is not int32 — "
-            "hash-MoE lookup dtype drift would break the wrapper's frozen "
-            "buffer contract (HF stores it as int32 per model.py:564)"
-        )
-    # Refuse out-of-range expert indices (an off-by-one from a mis-encoded
-    # tid2eid would silently route every affected token to expert 0 or to
-    # a non-existent expert index).
-    tid_min = int(tid2eid.min().item())
-    tid_max = int(tid2eid.max().item())
-    if tid_min < 0 or tid_max >= n_experts:
-        raise ValueError(
-            f"tid2eid {tid_key!r} contains out-of-range expert indices "
-            f"[{tid_min}, {tid_max}] outside [0, {n_experts})"
-        )
-    converted[f"{target}tid2eid"] = tid2eid.contiguous().clone()
+    normalized_tid2eid, tid2eid_report = _convert_hash_tid2eid(
+        tid2eid,
+        key=tid_key,
+        vocab_size=vocab_size,
+        top_k=top_k,
+        n_experts=n_experts,
+    )
+    converted[f"{target}tid2eid"] = normalized_tid2eid
 
     # ---- correction bias MUST be absent (hash mode) ----
     bias_key = f"{hf_base}{ROUTER_CORRECTION_BIAS_KEY}"
@@ -888,8 +934,9 @@ def _convert_hash_moe_block(
         "moe_intermediate": inter,
         "gate_up_shape": tuple(gate_up_stacked.shape),
         "down_shape": tuple(down_stacked.shape),
-        "tid2eid_shape": tuple(tid2eid.shape),
-        "tid2eid_dtype": str(tid2eid.dtype),
+        "tid2eid_shape": tuple(normalized_tid2eid.shape),
+        "tid2eid_dtype": str(normalized_tid2eid.dtype),
+        "tid2eid_conversion": tid2eid_report,
         "dtype": str(dtype),
         "block_size_fp4": DSV4_FP4_BLOCK_SIZE,
         "block_size_fp8_shared": block_fp8,
