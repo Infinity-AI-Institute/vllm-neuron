@@ -71,4 +71,3 @@ correctness, performance, or tokenomics claim.
 - Compiler lowering of the four-stream graph, 20-step Sinkhorn loop, FP32 mHC
   projections, BF16 placement, and 4x4 transposed combination matmul is
   untested. No compiler-success inference is made from host tests.
-
