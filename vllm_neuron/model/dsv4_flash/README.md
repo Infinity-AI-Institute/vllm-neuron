@@ -23,10 +23,15 @@ file. Gaps, overlaps, dtype drift, undeclared tensors, or incomplete coverage
 abort and remove the partial file. A completed checkpoint and manifest are
 published only after full coverage and `fsync`.
 
-The current conversion path still needs a production 32-rank inventory and
-resource receipt before compile authorization. In particular, the writer's
-chunk bound does not by itself prove the peak memory of every architecture
-conversion primitive.
+The production source receipt under `evidence/` binds validator merge
+`2543fe18c70f7d92a5bf498e4adaccacde425728`, all 48 prior full-payload
+SHA-256 identities, every SafeTensors header, 72,317 exact index routes, and
+the canonical shard inventory. Its audit reads only each eight-byte
+SafeTensors prefix and JSON header. It performs no rank conversion and creates
+no large output. The current conversion path still needs a production 32-rank
+inventory and resource receipt before compile authorization. In particular,
+the writer's chunk bound does not by itself prove the peak memory of every
+architecture conversion primitive.
 
 ## Compile authorization
 
@@ -35,8 +40,8 @@ weights/compute/cache, greedy argmax, and no FP8 KV, speculation, MTP, or
 DSpark. `validate_compile_authorization.py` keeps compilation on HOLD until all
 of these machine-verifiable receipts are present:
 
-1. validator-merged source provenance;
-2. exact 48-shard header, routing, and payload identity;
+1. validator-merged source provenance (**satisfied by the committed production receipt**);
+2. exact 48-shard header, routing, and payload identity (**satisfied by the committed production receipt**);
 3. all 32 rank inventories/manifests and checkpoint hashes;
 4. digest-bound compiler/runtime package and source inventory;
 5. exact-source canonical four-prompt x ten-token full-logit CPU bank;
@@ -62,3 +67,7 @@ python vllm_neuron/model/dsv4_flash/validate_compile_authorization.py \
 ```
 
 No r7i compile slot or Trainium device is required for these checks.
+
+The rank inventory, compiler inventory, CPU reference bank, and emitted
+contract receipt remain unsatisfied. Consequently `compile_permitted` remains
+false; the production source receipt makes no claim about those four gates.

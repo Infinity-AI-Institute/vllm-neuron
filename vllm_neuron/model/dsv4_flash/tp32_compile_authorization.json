@@ -32,15 +32,33 @@
     "max_writer_chunk_bytes": 67108864
   },
   "authorization_rule": "compile is permitted only when every machine check reports satisfied=true",
+  "production_evidence": {
+    "source_provenance": {
+      "path": "evidence/source-provenance.json",
+      "sha256": "6d8adb42de7664cbc2f76fb481aaab12ca1ba8deded4d9fb8daabb40f788a965"
+    },
+    "routing_manifest": {
+      "path": "evidence/routing-manifest.json",
+      "sha256": "93c516df53d1fc5e88e77acb043f68c9d37b7eb12a75f70d8469ab284a663547"
+    },
+    "checkpoint_payload_manifest": {
+      "path": "evidence/checkpoint-all-files.sha256",
+      "sha256": "ac05cbd738cb8866595257aec855bdb231b677280bbdcb6bd65950c356f68a8d"
+    },
+    "audit_tool": {
+      "path": "audit_source_provenance.py",
+      "sha256": "d7c6acf9ae3340ff01ef8aeac3b1ea2f93d53de456c310aab6b83c78ced6ab3a"
+    }
+  },
   "blockers": [
     {
       "id": "source_validator_merged",
-      "satisfied": false,
+      "satisfied": true,
       "machine_check": "git merge-base --is-ancestor <source_commit> origin/agent-main and bind the merge SHA in source-provenance.json"
     },
     {
       "id": "checkpoint_headers_and_payload_identity",
-      "satisfied": false,
+      "satisfied": true,
       "machine_check": "source-provenance.json must bind the pinned revision/config/index, 48 exact routed shard headers, 72317 tensors, zero orphan/missing/misrouted keys, and every LFS object SHA-256"
     },
     {
