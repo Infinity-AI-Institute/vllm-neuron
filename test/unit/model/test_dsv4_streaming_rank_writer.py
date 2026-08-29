@@ -64,6 +64,9 @@ def _fixture(tmp_path: Path, *, orphan: bool = False) -> Path:
     tensors = {
         "embed.weight": torch.arange(16).reshape(4, 4),
         "norm.weight": torch.arange(4),
+        "hc_head_fn": torch.arange(64, dtype=torch.float32).reshape(4, 16),
+        "hc_head_base": torch.arange(4, dtype=torch.float32),
+        "hc_head_scale": torch.ones(1, dtype=torch.float32),
         "layers.0.attn.wq_a.weight": torch.arange(16).reshape(4, 4),
     }
     if orphan:
@@ -84,6 +87,8 @@ def _source() -> SimpleNamespace:
         num_hidden_layers=1,
         tie_word_embeddings=True,
         torch_dtype=torch.int64,
+        hidden_size=4,
+        hc_mult=4,
     )
 
 
@@ -110,7 +115,7 @@ def test_two_pass_rank_inventory_and_transactional_bounded_publish(
     assert report["ranks_written"] == [0, 1]
     assert report["source_audit"] == {
         "shard_count": 1,
-        "tensor_count": 3,
+        "tensor_count": 6,
         "payload_bytes_loaded_during_audit": 0,
     }
     assert set(report["rank_inventory_sha256"]) == {"0", "1"}
@@ -121,6 +126,12 @@ def test_two_pass_rank_inventory_and_transactional_bounded_publish(
     rank0_path = out / "weights" / "tp0_sharded_checkpoint.safetensors"
     rank0 = load_file(rank0_path)
     assert torch.equal(rank0["embed_tokens.weight"], torch.arange(16).reshape(4, 4)[:2])
+    assert rank0["hc_head_fn"].dtype == torch.float32
+    assert torch.equal(
+        rank0["hc_head_fn"], torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    )
+    rank1 = load_file(out / "weights" / "tp1_sharded_checkpoint.safetensors")
+    torch.testing.assert_close(rank1["hc_head_fn"], rank0["hc_head_fn"], rtol=0, atol=0)
     with safe_open(rank0_path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata()
     assert metadata["model"] == "DeepSeek-V4-Flash-0731"

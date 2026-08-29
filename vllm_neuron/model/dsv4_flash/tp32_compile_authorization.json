@@ -51,11 +51,11 @@
     },
     "tp32_rank_plan_audit": {
       "path": "evidence/tp32-rank-plan-audit.json",
-      "sha256": "68952228ff0fd145544e84a276f5d61b35c07a360bd58b1a1bcaffc787589da1"
+      "sha256": "b329dab1c85dd7396fcd121814efb7da3b18d849977b5ff0dcdbff96406f3f39"
     },
     "tp32_rank_plan_validator": {
       "path": "validate_tp32_rank_plan.py",
-      "sha256": "9cdf18db18ee2eac01862bd978b6ef555560ac3cd4113eaea97bab462ad42a27"
+      "sha256": "c23d5a4f7b5d6e499663b564ae113fea7112f88c0f6c44ae7209935736e0124d"
     }
   },
   "blockers": [

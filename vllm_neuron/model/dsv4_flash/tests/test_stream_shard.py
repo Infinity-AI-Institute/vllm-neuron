@@ -116,6 +116,15 @@ def test_stream_shard_synthetic_33_shards_cpu_golden(tmp_path, monkeypatch) -> N
                 "layers.0.attn.wq_a.weight",
                 torch.arange(16).reshape(4, 4),
             )
+        elif index == 3:
+            key, tensor = (
+                "hc_head_fn",
+                torch.arange(64, dtype=torch.float32).reshape(4, 16),
+            )
+        elif index == 4:
+            key, tensor = "hc_head_base", torch.arange(4, dtype=torch.float32)
+        elif index == 5:
+            key, tensor = "hc_head_scale", torch.ones(1, dtype=torch.float32)
         else:
             key, tensor = f"filler.{index}", torch.tensor([index])
         save_file({key: tensor}, str(model_path / shard_name))
@@ -135,6 +144,8 @@ def test_stream_shard_synthetic_33_shards_cpu_golden(tmp_path, monkeypatch) -> N
         num_hidden_layers=1,
         tie_word_embeddings=True,
         torch_dtype=torch.float32,
+        hidden_size=4,
+        hc_mult=4,
     )
     out = tmp_path / "compiled"
     report = stream_shard.stream_shard_dsv4_checkpoint(

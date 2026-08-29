@@ -34,7 +34,7 @@ DSV4_MHC_SOURCE_KEYS_SHA256 = (
 )
 DSV4_MHC_SOURCE_PARENT_COMMIT = "2dc3d6a2a125cad006426d77a2998c5dd4b7bd13"
 DSV4_MHC_AUTH_PACKET_GIT_BLOB_SHA256 = (
-    "b9cdcfdaabccfcd807a6fd5cf9cc19f03730368796f5b0d9dde86bb7c5986822"
+    "1f8da802a22799cfce4d8a26e0b3676e27cd140045e51715a5e67630174f69b4"
 )
 DSV4_MHC_COMPILER_IMAGE = (
     "public.ecr.aws/neuron/pytorch-inference-neuronx@sha256:"
@@ -265,16 +265,27 @@ def mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    """Expand one branch result back to four HC streams."""
+    """Expand one branch result back to four HC streams.
+
+    The official decoder casts the FP32 Sinkhorn outputs to the incoming
+    hidden-stream dtype *before* the placement and residual-mix equations.
+    Preserve that boundary here: it is observably different from carrying the
+    whole post equation in FP32 and casting only the result.
+    """
     _require(branch.ndim == 3, "mHC branch shape drift")
     _require(residual.ndim == 4 and residual.shape[-2] == 4, "mHC residual shape drift")
+    _require(
+        branch.shape == (*residual.shape[:-2], residual.shape[-1]),
+        "mHC branch/residual shape drift",
+    )
+    _require(branch.dtype == residual.dtype, "mHC branch/residual dtype drift")
     _require(post.shape == residual.shape[:-1], "mHC post shape drift")
     _require(comb.shape == (*residual.shape[:-2], 4, 4), "mHC comb shape drift")
-    result = post.unsqueeze(-1) * branch.float().unsqueeze(-2)
-    result = result + torch.sum(
-        comb.unsqueeze(-1) * residual.float().unsqueeze(-2), dim=2
-    )
-    return result.to(branch.dtype)
+    post_local = post.to(branch.dtype)
+    comb_local = comb.to(branch.dtype)
+    result = post_local.unsqueeze(-1) * branch.unsqueeze(-2)
+    result = result + torch.matmul(comb_local.transpose(-1, -2), residual)
+    return result
 
 
 def mhc_head(
@@ -288,6 +299,7 @@ def mhc_head(
 ) -> torch.Tensor:
     """Collapse four HC streams before final normalization and LM head."""
     _require(residual.ndim == 4 and residual.shape[-2] == 4, "mHC head input drift")
+    _require(hc_eps == DSV4_MHC_EPS, "DeepSeek-V4-Flash requires hc_eps=1e-6")
     flat = residual.flatten(2).float()
     _require(
         fn.dtype == torch.float32 and fn.shape == (4, flat.shape[-1]),

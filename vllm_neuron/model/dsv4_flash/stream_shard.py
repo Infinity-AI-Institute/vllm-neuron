@@ -33,6 +33,8 @@ from .checkpoint_convert import (
     _convert_csa_block,
     _convert_hash_moe_block,
     _convert_hca_block,
+    _convert_mhc_head,
+    _convert_mhc_layer,
     _convert_routed_moe_layer,
     _convert_sliding_only_block,
 )
@@ -331,6 +333,7 @@ def _convert_one_layer(
     if ffn_norm is None:
         raise KeyError(f"missing {ffn_norm_key!r}")
     converted[ffn_norm_key] = ffn_norm.to(src.torch_dtype)
+    converted.update(_convert_mhc_layer(layer_state, layer_idx, src))
     mlp_type = src.mlp_layer_types[layer_idx]
     if mlp_type not in {"hash_moe", "moe"}:
         raise ValueError(f"unsupported MLP layer type {mlp_type!r} at {layer_idx}")
@@ -421,6 +424,8 @@ def _iter_rank_tensors(
     )
     yield "final_norm_weight", final_norm.to(src.torch_dtype).contiguous()
     yield "lm_head.weight", _row_shard(lm_head.to(src.torch_dtype), rank, tp_degree, 0)
+    for key, value in _convert_mhc_head(top_state, src).items():
+        yield key, value
 
     for layer_idx in range(src.num_hidden_layers):
         layer_keys = {

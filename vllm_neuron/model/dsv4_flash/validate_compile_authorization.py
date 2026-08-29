@@ -64,6 +64,11 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_git_text(path: Path) -> str:
+    """Hash committed text as canonical LF bytes across autocrlf checkouts."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -200,11 +205,11 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
         ),
         "tp32_rank_plan_audit": (
             "evidence/tp32-rank-plan-audit.json",
-            "68952228ff0fd145544e84a276f5d61b35c07a360bd58b1a1bcaffc787589da1",
+            "b329dab1c85dd7396fcd121814efb7da3b18d849977b5ff0dcdbff96406f3f39",
         ),
         "tp32_rank_plan_validator": (
             "validate_tp32_rank_plan.py",
-            "9cdf18db18ee2eac01862bd978b6ef555560ac3cd4113eaea97bab462ad42a27",
+            "c23d5a4f7b5d6e499663b564ae113fea7112f88c0f6c44ae7209935736e0124d",
         ),
     }
     _require(
@@ -378,7 +383,7 @@ def _validate_source(
     routing = source.get("routing_manifest", {})
     routing_path = _safe_artifact(root, routing.get("path"), "routing manifest")
     _require(
-        _sha256_file(routing_path)
+        _sha256_git_text(routing_path)
         == _require_sha256(routing.get("sha256"), "routing manifest"),
         "routing manifest file drift",
     )
@@ -405,7 +410,7 @@ def validate_production_source_evidence(
         _require(path.is_relative_to(package_root.resolve()), f"{name} escapes package")
         _require(path.is_file(), f"production evidence missing: {name}")
         _require(
-            _sha256_file(path) == identity["sha256"],
+            _sha256_git_text(path) == identity["sha256"],
             f"production evidence hash drift: {name}",
         )
         resolved[name] = path

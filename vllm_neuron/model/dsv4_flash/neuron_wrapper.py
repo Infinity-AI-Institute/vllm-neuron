@@ -51,6 +51,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import DeepseekV4FlashInferenceConfig
+from .mhc_contract import (
+    Dsv4MhcHeadMixer,
+    Dsv4MhcLayerMixer,
+    mhc_head,
+    mhc_post,
+    mhc_pre,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2899,6 +2906,17 @@ class DeepseekV4FlashNeuronInferenceConfig(_NxdiInferenceConfig):
             source_config: DeepseekV4FlashInferenceConfig | None = None,
             **kwargs: Any,
         ) -> None:
+            if isinstance(source_config, dict):
+                source_config = DeepseekV4FlashInferenceConfig.from_configs(
+                    source_config
+                )
+            if source_config is not None and not isinstance(
+                source_config, DeepseekV4FlashInferenceConfig
+            ):
+                raise TypeError(
+                    "source_config must be DeepseekV4FlashInferenceConfig or "
+                    f"its serialized mapping; got {type(source_config)!r}"
+                )
             self.source_config = source_config
             if source_config is not None:
                 for name in (
@@ -3268,16 +3286,16 @@ if _NXDI_AVAILABLE:
                              3 shared_expert, 2 stacked-expert leaves)
           Routed MoE:    7 (same layout, ``mlp.e_score_correction_bias``
                              replacing ``mlp.tid2eid``)
-          Plus per layer: 2 (``attn_norm.weight``, ``ffn_norm.weight``).
+          Plus per layer: 8 (two norms + six direct FP32 mHC leaves).
 
         Full total (43 layers, per the frozen schedule):
-          * 2 sliding + hash_moe  →  2 × (8 + 7 + 2) = 34
-          * 1 CSA + hash_moe      →  1 × (18 + 7 + 2) = 27
-          * 20 CSA + routed_moe   → 20 × (18 + 7 + 2) = 540
-          * 20 HCA + routed_moe   → 20 × (12 + 7 + 2) = 420
-          Sum per-layer =         1021
+          * 2 sliding + hash_moe  →  2 × (8 + 7 + 8) = 46
+          * 1 CSA + hash_moe      →  1 × (18 + 7 + 8) = 33
+          * 20 CSA + routed_moe   → 20 × (18 + 7 + 8) = 660
+          * 20 HCA + routed_moe   → 20 × (12 + 7 + 8) = 540
+          Sum per-layer =         1279
 
-        Plus 3 top-level (embed_tokens, final_norm, lm_head) = 1024
+        Plus 6 top-level (embed_tokens, final_norm, lm_head, three mHC head) = 1285
         wrapper-tree parameter names on the full compile.
 
         ``input_ids`` is threaded here as a real graph input (see the
@@ -3311,6 +3329,16 @@ if _NXDI_AVAILABLE:
             # snapshot's `model.safetensors.index.json`).
             self.attn_norm = _MQANormParam(src.hidden_size, dtype)
             self.ffn_norm = _MQANormParam(src.hidden_size, dtype)
+
+            # Register the six official FP32 mHC leaves directly on the
+            # decoder layer.  Moving them under a helper submodule would alter
+            # the checkpoint identities from `layers.i.hc_*` to
+            # `layers.i.<helper>.hc_*`, so transfer the prototype parameters
+            # without retaining the prototype as a child module.
+            mhc_parameters = Dsv4MhcLayerMixer(src.hidden_size)
+            for name, parameter in mhc_parameters.named_parameters(recurse=False):
+                parameter.requires_grad_(False)
+                self.register_parameter(name, parameter)
 
             layer_type = src.layer_types[layer_idx]
             if layer_type == "sliding_attention":
@@ -3377,8 +3405,11 @@ if _NXDI_AVAILABLE:
             sin_win: torch.Tensor,
             attention_mask: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-            """One decoder-layer body: pre-attn norm → dispatched attn →
-            residual → pre-mlp norm → dispatched mlp → residual.
+            """One official decoder-layer body over four hidden streams.
+
+            Each branch is mHC collapse → RMSNorm → branch → mHC
+            placement/Sinkhorn residual mix.  The stream axis remains present
+            around both attention and MoE at every layer.
 
             ``caches`` is this layer's slice of the model's aliased
             parameter list — an empty tuple for sliding/HCA, 4 tensors
@@ -3394,10 +3425,21 @@ if _NXDI_AVAILABLE:
             input-id side channel discussed in the module-level
             docstring above ``_HashMoEBlock``.
             """
-            # 1. Pre-attention norm.
-            norm_a = _weighted_rms_norm(
-                hidden_states, self.attn_norm.weight, self.rms_eps
+            if hidden_states.ndim != 4 or hidden_states.shape[-2] != 4:
+                raise ValueError(
+                    "DeepSeek-V4-Flash layers require hidden streams shaped "
+                    f"[B, S, 4, D]; got {tuple(hidden_states.shape)}"
+                )
+
+            # 1. Official attention-site mHC collapse, then pre-attention norm.
+            collapsed, post, comb = mhc_pre(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                norm_eps=self.rms_eps,
             )
+            norm_a = _weighted_rms_norm(collapsed, self.attn_norm.weight, self.rms_eps)
 
             # 2. Dispatched attention forward.
             new_caches: tuple[torch.Tensor, ...]
@@ -3452,13 +3494,22 @@ if _NXDI_AVAILABLE:
             else:  # pragma: no cover - guarded at __init__
                 raise RuntimeError(f"unreachable attn_kind {self.attn_kind!r}")
 
-            # 3. Residual add + pre-MLP norm.
-            hidden_states = hidden_states + attn_out.to(hidden_states.dtype)
-            norm_m = _weighted_rms_norm(
-                hidden_states, self.ffn_norm.weight, self.rms_eps
+            # 3. Official attention-site placement + transposed Sinkhorn mix.
+            hidden_states = mhc_post(
+                attn_out.to(hidden_states.dtype), hidden_states, post, comb
             )
 
-            # 4. Dispatched MLP forward.  Hash-MoE reads input_ids as
+            # 4. Official FFN-site mHC collapse, then pre-MLP norm.
+            collapsed, post, comb = mhc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm_eps=self.rms_eps,
+            )
+            norm_m = _weighted_rms_norm(collapsed, self.ffn_norm.weight, self.rms_eps)
+
+            # 5. Dispatched MLP forward.  Hash-MoE reads input_ids as
             # its second positional arg; routed-MoE does not accept
             # input_ids and would raise TypeError if we passed it.
             if self.mlp_kind == "hash_moe":
@@ -3466,7 +3517,9 @@ if _NXDI_AVAILABLE:
             else:
                 mlp_out = self.mlp(norm_m)
 
-            hidden_states = hidden_states + mlp_out.to(hidden_states.dtype)
+            hidden_states = mhc_post(
+                mlp_out.to(hidden_states.dtype), hidden_states, post, comb
+            )
             return hidden_states, new_caches
 
     class _NeuronDeepseekV4FlashModel(NeuronBaseModel):
@@ -3539,6 +3592,11 @@ if _NXDI_AVAILABLE:
             self.final_norm_weight = _rms_norm_weight(
                 config.hidden_size, config.neuron_config.torch_dtype
             )
+            # Top-level names must remain exactly hc_head_{fn,base,scale}.
+            mhc_head_parameters = Dsv4MhcHeadMixer(src.hidden_size)
+            for name, parameter in mhc_head_parameters.named_parameters(recurse=False):
+                parameter.requires_grad_(False)
+                self.register_parameter(name, parameter)
             self.lm_head = _NxdColumnParallelLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -3633,6 +3691,10 @@ if _NXDI_AVAILABLE:
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.unsqueeze(0)
             batch, length, _ = hidden_states.shape
+            # Official model entry: four identical, contiguous hidden streams.
+            hidden_states = (
+                hidden_states.unsqueeze(2).expand(-1, -1, 4, -1).contiguous()
+            )
             if position_ids is None:
                 position_ids = (
                     torch.arange(length, dtype=torch.int64, device=hidden_states.device)
@@ -3741,6 +3803,13 @@ if _NXDI_AVAILABLE:
                     )
                 caches_out.extend(updated)
 
+            hidden_states = mhc_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                norm_eps=self.rms_eps,
+            )
             hidden_states = _weighted_rms_norm(
                 hidden_states, self.final_norm_weight, self.rms_eps
             )
