@@ -177,6 +177,8 @@ def test_header_audit_rejects_adversarial_checkpoint_drift(
         ("routing_manifest", b"\n"),
         ("checkpoint_payload_manifest", b"\n"),
         ("audit_tool", b"\n# mutation\n"),
+        ("tp32_rank_plan_audit", b"\n"),
+        ("tp32_rank_plan_validator", b"\n# mutation\n"),
     ],
 )
 def test_every_bound_production_artifact_rejects_mutation(
@@ -189,6 +191,12 @@ def test_every_bound_production_artifact_rejects_mutation(
         (evidence / source.name).write_bytes(source.read_bytes())
     (package / "audit_source_provenance.py").write_bytes(
         (PACKAGE / "audit_source_provenance.py").read_bytes()
+    )
+    (package / "audit_tp32_rank_plan.py").write_bytes(
+        (PACKAGE / "audit_tp32_rank_plan.py").read_bytes()
+    )
+    (package / "validate_tp32_rank_plan.py").write_bytes(
+        (PACKAGE / "validate_tp32_rank_plan.py").read_bytes()
     )
     packet = json.loads(
         (PACKAGE / "tp32_compile_authorization.json").read_text(encoding="utf-8")

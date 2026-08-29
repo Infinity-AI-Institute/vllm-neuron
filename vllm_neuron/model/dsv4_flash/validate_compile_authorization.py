@@ -198,6 +198,14 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
             "audit_source_provenance.py",
             "d7c6acf9ae3340ff01ef8aeac3b1ea2f93d53de456c310aab6b83c78ced6ab3a",
         ),
+        "tp32_rank_plan_audit": (
+            "evidence/tp32-rank-plan-audit.json",
+            "68952228ff0fd145544e84a276f5d61b35c07a360bd58b1a1bcaffc787589da1",
+        ),
+        "tp32_rank_plan_validator": (
+            "validate_tp32_rank_plan.py",
+            "9cdf18db18ee2eac01862bd978b6ef555560ac3cd4113eaea97bab462ad42a27",
+        ),
     }
     _require(
         isinstance(production, Mapping) and set(production) == set(expected_production),
