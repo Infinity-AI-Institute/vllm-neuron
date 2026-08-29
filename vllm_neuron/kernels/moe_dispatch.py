@@ -62,7 +62,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
 
 log = logging.getLogger("moe_dispatch")
 
@@ -72,7 +71,6 @@ log = logging.getLogger("moe_dispatch")
 try:
     import nki
     import nki.language as nl
-
     from nkilib.core.moe.moe_tkg.moe_tkg import moe_tkg
     from nkilib.core.router_topk.router_topk import (
         XSBLayout_tp2013__1,
