@@ -208,7 +208,7 @@ def test_every_bound_production_artifact_rejects_mutation(
         AUTH.validate_production_source_evidence(packet, package, ROOT)
 
 
-def test_four_unrelated_production_receipts_remain_holds() -> None:
+def test_three_unresolved_production_receipts_remain_holds() -> None:
     packet = json.loads(
         (PACKAGE / "tp32_compile_authorization.json").read_text(encoding="utf-8")
     )
@@ -217,6 +217,5 @@ def test_four_unrelated_production_receipts_remain_holds() -> None:
         "tp32_rank_inventory",
         "compiler_inventory",
         "cpu_reference_bank",
-        "emitted_contract_receipt",
     }
     assert packet["claims"]["compile_permitted"] is False
