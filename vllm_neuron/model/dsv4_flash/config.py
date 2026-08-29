@@ -45,24 +45,65 @@ HF_SNAPSHOT_SHA = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 #   4   -> "compressed_sparse_attention" (CSA: pool m=4 + Lightning Indexer top-k=512)
 #   128 -> "heavily_compressed_attention" (HCA: pool m'=128, no indexer)
 _COMPRESS_RATIOS_HF = (
-    0, 0,
-    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-    4, 128, 4, 128, 4,
-    0, 0, 0,
+    0,
+    0,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    128,
+    4,
+    0,
+    0,
+    0,
 )
 # 43 hidden layers = 46-total - 2 leading sliding-pad - 3-of-3 trailing (of which 1 is MTP,
 # the other 2 are sliding tail on the last hidden slots).  Preserves the HF order verbatim.
 _DSV4_LAYER_TYPES = tuple(
     "sliding_attention"
     if ratio == 0
-    else ("compressed_sparse_attention" if ratio == 4 else "heavily_compressed_attention")
+    else (
+        "compressed_sparse_attention" if ratio == 4 else "heavily_compressed_attention"
+    )
     for ratio in _COMPRESS_RATIOS_HF[:43]
 )
 # MLP layers: first 3 are hash_moe (bootstrap), all others are moe (top-k routed).
-_DSV4_MLP_LAYER_TYPES = tuple(
-    "hash_moe" if idx < 3 else "moe" for idx in range(43)
-)
+_DSV4_MLP_LAYER_TYPES = tuple("hash_moe" if idx < 3 else "moe" for idx in range(43))
 
 FP8_SCALE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -245,7 +286,9 @@ class DeepseekV4FlashInferenceConfig:
     bos_token_id: int = 0
     eos_token_id: int = 1
     pad_token_id: int | None = None
-    num_nextn_predict_layers: int = 1  # MTP surface — DROPPED in wrapper (no spec-decode)
+    num_nextn_predict_layers: int = (
+        1  # MTP surface — DROPPED in wrapper (no spec-decode)
+    )
     expert_dtype: str = "fp4"  # routed experts stored at FP4; non-experts at FP8
     output_router_logits: bool = False
     router_aux_loss_coef: float = 0.001
@@ -331,9 +374,7 @@ class DeepseekV4FlashInferenceConfig:
                 "DeepSeek-V4-Flash requires mHC hc_mult=4 with 20 Sinkhorn iters"
             )
         if self.scoring_func != "sqrtsoftplus":
-            raise ValueError(
-                "DeepSeek-V4-Flash router uses sqrt(softplus(x)) scoring"
-            )
+            raise ValueError("DeepSeek-V4-Flash router uses sqrt(softplus(x)) scoring")
         if self.topk_method != "noaux_tc":
             raise ValueError(
                 "DeepSeek-V4-Flash requires noaux_tc topk method (with "
@@ -345,9 +386,7 @@ class DeepseekV4FlashInferenceConfig:
                 f"expert_dtype={self.expert_dtype!r}"
             )
         if self.quantization_config.scale_fmt != "ue8m0":
-            raise ValueError(
-                "DeepSeek-V4-Flash quantization uses UE8M0 block scales"
-            )
+            raise ValueError("DeepSeek-V4-Flash quantization uses UE8M0 block scales")
         if not self.allow_reduced_shapes:
             frozen = {
                 "vocab_size": 129280,

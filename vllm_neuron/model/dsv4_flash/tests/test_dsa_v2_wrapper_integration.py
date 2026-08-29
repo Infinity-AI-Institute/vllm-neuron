@@ -44,7 +44,6 @@ from pathlib import Path
 
 import pytest
 
-
 _DSV4_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -58,9 +57,7 @@ def _load_module(local_name: str, file_name: str):
         parent_module = types.ModuleType(parent)
         parent_module.__path__ = [str(_DSV4_DIR)]
         sys.modules[parent] = parent_module
-    spec = importlib.util.spec_from_file_location(
-        full_name, str(_DSV4_DIR / file_name)
-    )
+    spec = importlib.util.spec_from_file_location(full_name, str(_DSV4_DIR / file_name))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[full_name] = module
@@ -108,9 +105,7 @@ def test_default_env_resolves_to_dsa_v0_golden_slug() -> None:
     kd, _cfg, _nw = _load_all()
     with _env(kd.DSA_KERNEL_IMPL_ENV, None):
         assert kd.resolve_dsa_impl_slug() == kd.DSA_CPU_GOLDEN_SLUG
-        assert kd.get_emitted_kernel_slugs() == {
-            "dsa": kd.DSA_CPU_GOLDEN_SLUG
-        }
+        assert kd.get_emitted_kernel_slugs() == {"dsa": kd.DSA_CPU_GOLDEN_SLUG}
 
 
 @pytest.mark.parametrize(
@@ -243,9 +238,7 @@ if __name__ == "__main__":
             continue
         _fn = globals()[_name]
         _marks = getattr(_fn, "pytestmark", ())
-        _parametrised = any(
-            getattr(m, "name", "") == "parametrize" for m in _marks
-        )
+        _parametrised = any(getattr(m, "name", "") == "parametrize" for m in _marks)
         if _parametrised:
             _values = ["nki_v2", "v2", "dsa_sparse_attention.nki_v2"]
             for _v in _values:

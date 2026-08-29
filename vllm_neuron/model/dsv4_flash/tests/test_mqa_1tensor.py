@@ -48,8 +48,6 @@ intent is byte-clean verification; a skip is louder than a false pass.
 from __future__ import annotations
 
 import json
-import math
-import os
 import struct
 import sys
 from pathlib import Path
@@ -57,7 +55,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard — same lookup convention as test_fp4_dequant_1tensor.py
@@ -98,9 +95,14 @@ def _import_library():
     try:
         from vllm_neuron.model.dsv4_flash import (  # type: ignore
             checkpoint_convert as convert,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             config as cfg,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             neuron_wrapper as nw,
         )
+
         return cfg, convert, nw
     except Exception:
         pass
@@ -285,11 +287,15 @@ def _ref_apply_rotary(
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
     nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
-    rotated = ((rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)).to(x.dtype)
+    rotated = (
+        (rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)
+    ).to(x.dtype)
     return torch.cat([nope, rotated], dim=-1)
 
 
-def _ref_rms_norm_weighted(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _ref_rms_norm_weighted(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     """Reference impl of ``DeepseekV4RMSNorm.forward`` (lines 55-60)."""
     input_dtype = x.dtype
     x32 = x.to(torch.float32)
@@ -346,30 +352,36 @@ def _ref_forward(
     q = _ref_apply_rotary(q, cos, sin)
 
     # Line 821-822: kv = kv_norm(kv_proj(x)); rope(kv)
-    kv = _ref_rms_norm_weighted(
-        torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
-    ).view(*hidden_shape).transpose(1, 2)
+    kv = (
+        _ref_rms_norm_weighted(
+            torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
+        )
+        .view(*hidden_shape)
+        .transpose(1, 2)
+    )
     kv = _ref_apply_rotary(kv, cos, sin)
 
     # eager_attention_forward inline (lines 727-745).
     key_states = kv.expand(B, num_heads, kv.shape[2], head_dim)
     value_states = key_states
-    scaling = head_dim ** -0.5
+    scaling = head_dim**-0.5
     attn_weights = torch.matmul(q, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
     sinks = attn_sink.reshape(1, -1, 1, 1).expand(q.shape[0], -1, q.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-    probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    probs = torch.nn.functional.softmax(
+        combined_logits, dim=-1, dtype=combined_logits.dtype
+    )
     scores = probs[..., :-1]
     attn_output = torch.matmul(scores.to(value_states.dtype), value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     # Line 868: conjugate rotation on output rope slice.
-    attn_output = _ref_apply_rotary(
-        attn_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+    attn_output = _ref_apply_rotary(attn_output.transpose(1, 2), cos, -sin).transpose(
+        1, 2
+    )
 
     # Lines 870-872: grouped output projection then plain o_b.
     grouped = attn_output.reshape(*input_shape, o_groups, -1)  # [B, S, G, H*D/G]

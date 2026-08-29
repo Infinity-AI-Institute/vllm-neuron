@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import struct
 import sys
 from pathlib import Path
@@ -50,7 +49,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard: same lookup convention as the GLM-5.3-Flash tests so
@@ -86,8 +84,22 @@ except Exception as exc:  # pragma: no cover — surface the discovery gap
 # library tensor would be caught rather than papered over.
 _REF_FP4_TABLE = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ],
     dtype=torch.float32,
 )
@@ -123,9 +135,7 @@ def _ref_fp4_ue8m0_dequant(
     low = x & 0x0F
     high = (x >> 4) & 0x0F
     table = _REF_FP4_TABLE.to(x.device)
-    fp4_fp32 = torch.stack(
-        [table[low.long()], table[high.long()]], dim=-1
-    ).flatten(-2)
+    fp4_fp32 = torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(-2)
 
     # 2. UE8M0 → fp32 multiplier.
     if scale.dtype == torch.float8_e8m0fnu:
@@ -136,9 +146,7 @@ def _ref_fp4_ue8m0_dequant(
         )
     else:
         exp = scale.to(torch.int32) - 127
-        scale_fp32 = torch.ldexp(
-            torch.ones_like(exp, dtype=torch.float32), exp
-        )
+        scale_fp32 = torch.ldexp(torch.ones_like(exp, dtype=torch.float32), exp)
     assert torch.isfinite(scale_fp32).all(), "reference scale carries NaN/inf"
 
     # 3. Block broadcast + product.
@@ -157,7 +165,7 @@ _HF_SHA = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 _HF_SHARD = "model-00005-of-00048.safetensors"
 _HF_KEYS = (
     ("layers.3.ffn.experts.0.w2.weight", "w2_weight"),
-    ("layers.3.ffn.experts.0.w2.scale",  "w2_scale"),
+    ("layers.3.ffn.experts.0.w2.scale", "w2_scale"),
 )
 _CACHE_DIR = Path(__file__).parent / ".hf_cache"
 _CACHE_FILE = _CACHE_DIR / "dsv4_expert0_w2.safetensors"
@@ -284,6 +292,7 @@ def _import_library():
         from vllm_neuron.model.dsv4_flash.config import (  # type: ignore
             validate_ue8m0_scale,
         )
+
         return _FP4_E2M1_TABLE, dequantize_block_fp4_ue8m0, validate_ue8m0_scale
     except Exception:
         pass
@@ -368,9 +377,7 @@ def test_fp4_dequant_real_hf_tensor_byte_exact() -> None:
     )
 
     # Byte-exact match: max_abs_error_bf16 == 0.0.
-    diff = (
-        lib_bf16.to(torch.float32) - ref_bf16.to(torch.float32)
-    ).abs()
+    diff = (lib_bf16.to(torch.float32) - ref_bf16.to(torch.float32)).abs()
     max_abs_error_bf16 = float(diff.max().item())
     mean_abs_error_bf16 = float(diff.mean().item())
     print(
@@ -425,13 +432,17 @@ def test_fp4_dequant_identity_scale() -> None:
     assert out.shape == (1, 64), out.shape
     # Reference: unpack manually and look up.
     x = row.view(torch.uint8)
-    expected = torch.stack(
-        [
-            torch.tensor(lib_table)[(x & 0x0F).long()],
-            torch.tensor(lib_table)[((x >> 4) & 0x0F).long()],
-        ],
-        dim=-1,
-    ).flatten().to(torch.bfloat16)
+    expected = (
+        torch.stack(
+            [
+                torch.tensor(lib_table)[(x & 0x0F).long()],
+                torch.tensor(lib_table)[((x >> 4) & 0x0F).long()],
+            ],
+            dim=-1,
+        )
+        .flatten()
+        .to(torch.bfloat16)
+    )
     assert torch.equal(out[0], expected), (
         out[0].tolist()[:16],
         expected.tolist()[:16],
@@ -446,16 +457,19 @@ def test_fp4_dequant_max_positive_no_overflow() -> None:
     Pick raw code 250 — well inside range."""
     _, dequantize_block_fp4_ue8m0, _ = _import_library()
     # Byte 0x77 packs two 0x07 nibbles = two +6.0 FP4 values.
-    packed = torch.full((1, 16), 0x77, dtype=torch.uint8).view(torch.int8)  # 32 fp4 vals
+    packed = torch.full((1, 16), 0x77, dtype=torch.uint8).view(
+        torch.int8
+    )  # 32 fp4 vals
     scale = torch.full((1, 1), 250, dtype=torch.uint8)  # 2**123 ≈ 8.5e36
     out = dequantize_block_fp4_ue8m0(packed, scale, (1, 32), torch.bfloat16)
     assert out.shape == (1, 32), out.shape
     fp32 = out.to(torch.float32)
     assert torch.isfinite(fp32).all(), fp32
     # Value should be 6.0 * 2**123 = 3 * 2**124 -> exactly representable in bf16
-    expected = 6.0 * (2 ** 123)
+    expected = 6.0 * (2**123)
     assert float(fp32.max().item()) == expected, (
-        float(fp32.max().item()), expected,
+        float(fp32.max().item()),
+        expected,
     )
 
 
@@ -518,11 +532,11 @@ def _standalone_main() -> int:
         name = fn.__name__
         try:
             fn()
-        except pytest.skip.Exception as skip_exc:  # noqa: F401
+        except pytest.skip.Exception as skip_exc:
             n_skip += 1
             print(f"SKIP  {name}: {skip_exc}")
             continue
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             n_fail += 1
             print(f"FAIL  {name}: {exc!r}")
             import traceback

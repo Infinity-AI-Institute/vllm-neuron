@@ -33,20 +33,20 @@ from .neuron_wrapper import (
     NeuronDeepseekV4FlashForCausalLM,
     build_neuron_config,
 )
-from .registry import DSV4_SOURCE_CACHE_ABI, _DSV4_GRAPH_ID
+from .registry import _DSV4_GRAPH_ID, DSV4_SOURCE_CACHE_ABI
 
 __all__ = [
     "DSV4_BLOCKWISE_MATMUL_WORKAROUND",
     "DSV4_SOURCE_CACHE_ABI",
+    "HF_REPO_ID",
+    "HF_SNAPSHOT_SHA",
+    "_DSV4_GRAPH_ID",
     "DeepseekV4FlashForCausalLM",
     "DeepseekV4FlashInferenceConfig",
     "DeepseekV4FlashNeuronInferenceConfig",
     "DeepseekV4QuantizationConfig",
     "DeepseekV4RopeScalingConfig",
-    "HF_REPO_ID",
-    "HF_SNAPSHOT_SHA",
     "NeuronDeepseekV4FlashForCausalLM",
-    "_DSV4_GRAPH_ID",
     "build_neuron_config",
     "validate_ue8m0_scale",
 ]

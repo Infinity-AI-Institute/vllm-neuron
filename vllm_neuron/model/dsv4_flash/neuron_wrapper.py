@@ -47,8 +47,8 @@ import logging
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .config import DeepseekV4FlashInferenceConfig
 
@@ -56,19 +56,6 @@ logger = logging.getLogger(__name__)
 
 # NxDI-container guarded imports — same pattern as glm53_flash/neuron_wrapper.py.
 try:
-    from neuronx_distributed_inference.models.model_base import (
-        NeuronBaseForCausalLM,
-        NeuronBaseModel,
-    )
-    from neuronx_distributed_inference.models.config import (
-        InferenceConfig as _NxdiInferenceConfig,
-        MoENeuronConfig as _NxdiMoENeuronConfig,
-    )
-    from neuronx_distributed.parallel_layers.layers import (
-        ColumnParallelLinear as _NxdColumnParallelLinear,
-        ParallelEmbedding as _NxdParallelEmbedding,
-        RowParallelLinear as _NxdRowParallelLinear,
-    )
     # Round 2: routed-MoE lands on NxDI's own blockwise ExpertMLPs (identical
     # rationale to GLM-5.3-Flash Round 4 — the Python token-major gather
     # materialises `[T*top_k, hidden, inter]` per token which OOMs the tracer
@@ -77,9 +64,30 @@ try:
         ExpertMLPs as _NxdExpertMLPs,
     )
     from neuronx_distributed.modules.moe.model_utils import GLUType as _NxdGLUType
+    from neuronx_distributed.parallel_layers.layers import (
+        ColumnParallelLinear as _NxdColumnParallelLinear,
+    )
+    from neuronx_distributed.parallel_layers.layers import (
+        ParallelEmbedding as _NxdParallelEmbedding,
+    )
+    from neuronx_distributed.parallel_layers.layers import (
+        RowParallelLinear as _NxdRowParallelLinear,
+    )
+    from neuronx_distributed_inference.models.config import (
+        InferenceConfig as _NxdiInferenceConfig,
+    )
+    from neuronx_distributed_inference.models.config import (
+        MoENeuronConfig as _NxdiMoENeuronConfig,
+    )
+    from neuronx_distributed_inference.models.model_base import (
+        NeuronBaseForCausalLM,
+        NeuronBaseModel,
+    )
+
     _NXDI_AVAILABLE = True
     _NXDI_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - CPU-only guard
+except Exception as exc:  # pragma: no cover - optional NxDI import boundary
+
     class _NxdiUnavailable:
         """Placeholder used only when NxDI is missing on this host."""
 
@@ -148,8 +156,8 @@ DSV4_ROUTED_SCORING_FUNC: str = "sqrtsoftplus"
 
 
 def dsv4_route_affinities(
-    hidden_states: torch.Tensor,      # [B, L, hidden] or [T, hidden]
-    router_weight: torch.Tensor,      # [n_routed_experts, hidden]
+    hidden_states: torch.Tensor,  # [B, L, hidden] or [T, hidden]
+    router_weight: torch.Tensor,  # [n_routed_experts, hidden]
     *,
     top_k: int,
     scoring_func: str,
@@ -200,7 +208,7 @@ def dsv4_route_affinities(
     # L1 normalise is well-defined and can never divide by zero as long as
     # any selected score is strictly positive (which softplus guarantees
     # for finite logits).
-    scores = F.softplus(logits).sqrt()              # [T, E] fp32
+    scores = F.softplus(logits).sqrt()  # [T, E] fp32
     selection = scores
     if correction_bias is not None:
         selection = scores + correction_bias.to(torch.float32)
@@ -304,10 +312,10 @@ def dsv4_reference_router_forward(
 
 
 def dsv4_hash_route_affinities(
-    hidden_states: torch.Tensor,      # [B, L, hidden] or [T, hidden]
-    router_weight: torch.Tensor,      # [n_routed_experts, hidden]
-    tid2eid: torch.Tensor,            # [vocab_size, top_k] int32/int64
-    input_ids: torch.Tensor,          # [B, L] or [T] int
+    hidden_states: torch.Tensor,  # [B, L, hidden] or [T, hidden]
+    router_weight: torch.Tensor,  # [n_routed_experts, hidden]
+    tid2eid: torch.Tensor,  # [vocab_size, top_k] int32/int64
+    input_ids: torch.Tensor,  # [B, L] or [T] int
     *,
     scoring_func: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -357,8 +365,7 @@ def dsv4_hash_route_affinities(
         )
     if tid2eid.ndim != 2:
         raise ValueError(
-            f"tid2eid must be 2-D [vocab_size, top_k]; got shape "
-            f"{tuple(tid2eid.shape)}"
+            f"tid2eid must be 2-D [vocab_size, top_k]; got shape {tuple(tid2eid.shape)}"
         )
     if input_ids.dtype not in (
         torch.int32,
@@ -373,7 +380,7 @@ def dsv4_hash_route_affinities(
     hidden = hidden_states.shape[-1]
     flat = hidden_states.reshape(-1, hidden)
     logits = F.linear(flat.to(torch.float32), router_weight.to(torch.float32))
-    scores = F.softplus(logits).sqrt()              # [T, E] fp32
+    scores = F.softplus(logits).sqrt()  # [T, E] fp32
     ids_flat = input_ids.reshape(-1).to(torch.long)
     if ids_flat.numel() != flat.shape[0]:
         raise ValueError(
@@ -389,21 +396,21 @@ def dsv4_hash_route_affinities(
             "Refusing to gather tid2eid with an out-of-range token id — the "
             "resulting expert index would be silently wrong."
         )
-    indices = tid2eid.to(torch.long)[ids_flat]      # [T, top_k]
+    indices = tid2eid.to(torch.long)[ids_flat]  # [T, top_k]
     return scores, indices
 
 
 def dsv4_reference_hash_moe_forward(
-    hidden_states: torch.Tensor,             # [B, L, hidden]
-    input_ids: torch.Tensor,                 # [B, L]
-    router_weight: torch.Tensor,             # [n_routed_experts, hidden]
-    tid2eid: torch.Tensor,                   # [vocab_size, top_k] int
+    hidden_states: torch.Tensor,  # [B, L, hidden]
+    input_ids: torch.Tensor,  # [B, L]
+    router_weight: torch.Tensor,  # [n_routed_experts, hidden]
+    tid2eid: torch.Tensor,  # [vocab_size, top_k] int
     *,
-    shared_gate: torch.Tensor,               # [I, H]
-    shared_up: torch.Tensor,                 # [I, H]
-    shared_down: torch.Tensor,               # [H, I]
-    expert_gate_up_stack: torch.Tensor,      # [E, H, 2I]
-    expert_down_stack: torch.Tensor,         # [E, I, H]
+    shared_gate: torch.Tensor,  # [I, H]
+    shared_up: torch.Tensor,  # [I, H]
+    shared_down: torch.Tensor,  # [H, I]
+    expert_gate_up_stack: torch.Tensor,  # [E, H, 2I]
+    expert_down_stack: torch.Tensor,  # [E, I, H]
     swiglu_limit: float,
     routed_scaling_factor: float,
     weight_eps: float = 1e-20,
@@ -431,7 +438,8 @@ def dsv4_reference_hash_moe_forward(
     assert twoI % 2 == 0, twoI
     I = twoI // 2
     assert expert_down_stack.shape == (E, I, H), (
-        expert_down_stack.shape, (E, I, H),
+        expert_down_stack.shape,
+        (E, I, H),
     )
     dtype = hidden_states.dtype
     flat = hidden_states.reshape(-1, H)
@@ -439,32 +447,32 @@ def dsv4_reference_hash_moe_forward(
 
     # Router path — sqrtsoftplus, then gather at tid2eid[input_ids].
     logits = F.linear(flat.to(torch.float32), router_weight.to(torch.float32))
-    scores = F.softplus(logits).sqrt()                    # [T, E]
-    indices = tid2eid.to(torch.long)[ids_flat]            # [T, top_k]
-    gathered = scores.gather(-1, indices)                 # [T, top_k]
+    scores = F.softplus(logits).sqrt()  # [T, E]
+    indices = tid2eid.to(torch.long)[ids_flat]  # [T, top_k]
+    gathered = scores.gather(-1, indices)  # [T, top_k]
     weights = gathered / (gathered.sum(dim=-1, keepdim=True) + weight_eps)
-    weights = weights * routed_scaling_factor             # [T, top_k]
+    weights = weights * routed_scaling_factor  # [T, top_k]
 
     # Routed-expert dispatch (per HF MoE.forward loop).
     y = torch.zeros_like(flat, dtype=torch.float32)
     for e in range(E):
-        picks = (indices == e).nonzero(as_tuple=False)    # [Ne, 2]
+        picks = (indices == e).nonzero(as_tuple=False)  # [Ne, 2]
         if picks.numel() == 0:
             continue
         idx_t = picks[:, 0]
         idx_k = picks[:, 1]
-        we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)   # [Ne, 1]
-        xe = flat[idx_t]                                   # [Ne, H]
+        we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)  # [Ne, 1]
+        xe = flat[idx_t]  # [Ne, H]
         # Expert.forward: fp32 gate/up, ±swiglu_limit clamp, weight-multiply,
         # cast to input dtype before w2.
         gu = xe.to(torch.float32) @ expert_gate_up_stack[e].to(torch.float32)
         gate, up = gu.chunk(2, dim=-1)
         gate = torch.clamp(gate, max=swiglu_limit)
         up = torch.clamp(up, -swiglu_limit, swiglu_limit)
-        inter = F.silu(gate) * up                           # [Ne, I] fp32
-        inter = inter * we                                  # weight applied pre-w2
+        inter = F.silu(gate) * up  # [Ne, I] fp32
+        inter = inter * we  # weight applied pre-w2
         inter_cast = inter.to(dtype)
-        oe = inter_cast @ expert_down_stack[e]              # [Ne, H] input dtype
+        oe = inter_cast @ expert_down_stack[e]  # [Ne, H] input dtype
         y[idx_t] = y[idx_t] + oe.to(torch.float32)
 
     # Shared-expert forward (Expert.forward with weights=None).
@@ -474,7 +482,7 @@ def dsv4_reference_hash_moe_forward(
     up_s = torch.clamp(up_s, -swiglu_limit, swiglu_limit)
     inter_s = F.silu(gate_s) * up_s
     inter_s_cast = inter_s.to(dtype)
-    shared_out = F.linear(inter_s_cast, shared_down)         # [T, H]
+    shared_out = F.linear(inter_s_cast, shared_down)  # [T, H]
 
     combined = y.to(dtype) + shared_out
     return combined.reshape(B, L, H)
@@ -604,20 +612,25 @@ def build_main_rope_cos_sin(
     if rope_dim <= 0 or rope_dim % 2 != 0:
         raise ValueError(f"rope_dim must be positive and even, got {rope_dim}")
     if positions.ndim != 2:
-        raise ValueError(f"positions must be [B, S]; got shape {tuple(positions.shape)}")
+        raise ValueError(
+            f"positions must be [B, S]; got shape {tuple(positions.shape)}"
+        )
     inv_freq = 1.0 / (
         rope_theta
         ** (
-            torch.arange(0, rope_dim, 2, dtype=torch.int64, device=positions.device)
-            .to(torch.float32)
+            torch.arange(0, rope_dim, 2, dtype=torch.int64, device=positions.device).to(
+                torch.float32
+            )
             / rope_dim
         )
     )  # [rope_dim/2]
-    inv_freq_expanded = (
-        inv_freq[None, :, None].expand(positions.shape[0], -1, 1)
+    inv_freq_expanded = inv_freq[None, :, None].expand(
+        positions.shape[0], -1, 1
     )  # [B, rope_dim/2, 1]
     positions_expanded = positions[:, None, :].to(torch.float32)  # [B, 1, S]
-    freqs = (inv_freq_expanded @ positions_expanded).transpose(1, 2)  # [B, S, rope_dim/2]
+    freqs = (inv_freq_expanded @ positions_expanded).transpose(
+        1, 2
+    )  # [B, S, rope_dim/2]
     return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
 
@@ -753,7 +766,7 @@ class _MQABlock(nn.Module):
         self.o_lora_rank = int(src.o_lora_rank)
         self.rms_eps = float(src.rms_norm_eps)
         self.rope_theta = float(src.rope_theta)
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         # DSv4-Flash freeze: single shared KV head; verify to fail loudly
         # if a caller stripped that invariant off the frozen config.
         if self.num_kv_heads != 1:
@@ -785,9 +798,11 @@ class _MQABlock(nn.Module):
                 "(interleaved RoPE has one θ per pair)"
             )
         self._in_features_per_group = (self.num_heads * self.head_dim) // self.o_groups
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
 
         # Weights: stored as plain nn.Parameter so this class is CPU-portable
@@ -796,7 +811,9 @@ class _MQABlock(nn.Module):
         # ColumnParallel/RowParallel primitives at compile time; state-dict
         # spelling is invariant across the two backings because both use
         # trailing ``.weight``.
-        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False, dtype=dtype)
+        self.wq_a = nn.Linear(
+            self.hidden_size, self.q_lora_rank, bias=False, dtype=dtype
+        )
         self.wq_b = nn.Linear(
             self.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype
         )
@@ -843,10 +860,10 @@ class _MQABlock(nn.Module):
         q_residual = _weighted_rms_norm(
             self.wq_a(hidden_states), self.q_norm.weight, self.rms_eps
         )
-        q_flat = self.wq_b(q_residual)                                       # [B, S, H*D]
+        q_flat = self.wq_b(q_residual)  # [B, S, H*D]
         q = q_flat.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
-        q = _unweighted_rms_norm(q, self.rms_eps)                            # per-head
-        q = apply_partial_rope(q, cos, sin)                                  # trailing rope slice
+        q = _unweighted_rms_norm(q, self.rms_eps)  # per-head
+        q = apply_partial_rope(q, cos, sin)  # trailing rope slice
         return q, q_residual
 
     def project_kv(
@@ -866,17 +883,17 @@ class _MQABlock(nn.Module):
         batch, seq, _ = hidden_states.shape
         kv_flat = _weighted_rms_norm(
             self.wkv(hidden_states), self.kv_norm.weight, self.rms_eps
-        )                                                                     # [B, S, D]
-        kv = kv_flat.view(batch, seq, 1, self.head_dim).transpose(1, 2)      # [B, 1, S, D]
-        kv = apply_partial_rope(kv, cos, sin)                                # SAME rope as Q
+        )  # [B, S, D]
+        kv = kv_flat.view(batch, seq, 1, self.head_dim).transpose(1, 2)  # [B, 1, S, D]
+        kv = apply_partial_rope(kv, cos, sin)  # SAME rope as Q
         return kv
 
     def attend_and_project(
         self,
-        q: torch.Tensor,               # [B, H, S, D]
-        kv: torch.Tensor,              # [B, 1, T_kv, D] — SHARED K=V
-        cos: torch.Tensor,             # [B, S, rope_dim/2] — for the -sin conjugate on output
-        sin: torch.Tensor,             # [B, S, rope_dim/2]
+        q: torch.Tensor,  # [B, H, S, D]
+        kv: torch.Tensor,  # [B, 1, T_kv, D] — SHARED K=V
+        cos: torch.Tensor,  # [B, S, rope_dim/2] — for the -sin conjugate on output
+        sin: torch.Tensor,  # [B, S, rope_dim/2]
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the attention math (with sink) + grouped output projection.
@@ -912,20 +929,26 @@ class _MQABlock(nn.Module):
         v = k
 
         # Attention scores + sink.  Scale is fp32-safe.
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [B, H, S, T_kv]
+        attn_scores = (
+            torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        )  # [B, H, S, T_kv]
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
         # Per-head sink participates in the softmax denominator, then is
         # dropped from the weighted-value sum.  Matches
         # ``eager_attention_forward`` (modeling_deepseek_v4.py:733-741).
-        sinks = self.attn_sink.reshape(1, num_heads, 1, 1).expand(batch, num_heads, seq, 1)
+        sinks = self.attn_sink.reshape(1, num_heads, 1, 1).expand(
+            batch, num_heads, seq, 1
+        )
         combined_logits = torch.cat([attn_scores, sinks.to(attn_scores.dtype)], dim=-1)
-        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits = (
+            combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        )
         probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-        attn_weights = probs[..., :-1]                                       # drop sink
-        attn_output = torch.matmul(attn_weights.to(v.dtype), v)              # [B, H, S, D]
-        attn_output = attn_output.transpose(1, 2).contiguous()               # [B, S, H, D]
+        attn_weights = probs[..., :-1]  # drop sink
+        attn_output = torch.matmul(attn_weights.to(v.dtype), v)  # [B, H, S, D]
+        attn_output = attn_output.transpose(1, 2).contiguous()  # [B, S, H, D]
 
         # Undo K-side RoPE at the query position (paper eq. 26).  RoPE
         # helper expects ``[B, S, H, D]`` (its ``unsqueeze_dim=1`` adds a
@@ -938,20 +961,26 @@ class _MQABlock(nn.Module):
         # DeepseekV4GroupedLinear (modeling_deepseek_v4.py:303-332) views
         # it as ``[o_groups, o_lora_rank, in_per_group]`` and does a
         # batched-matmul against grouped input.
-        input_shape = attn_output.shape[:-2]                                 # [B, S]
-        hidden_per_group = attn_output.shape[-1]                             # head_dim=512
+        input_shape = attn_output.shape[:-2]  # [B, S]
+        hidden_per_group = attn_output.shape[-1]  # head_dim=512
         # Reshape [B, S, H, D] → [B, S, o_groups, H*D/o_groups].
-        grouped_in = attn_output.reshape(*input_shape, self.o_groups, -1)    # [B, S, G, H*D/G]
+        grouped_in = attn_output.reshape(
+            *input_shape, self.o_groups, -1
+        )  # [B, S, G, H*D/G]
         # DeepseekV4GroupedLinear.forward viewed step-by-step:
-        w = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, self._in_features_per_group).transpose(1, 2)
+        w = self.wo_a.weight.view(
+            self.o_groups, self.o_lora_rank, self._in_features_per_group
+        ).transpose(1, 2)
         # w now [G, in_per_group, o_lora_rank]
-        x = grouped_in.reshape(-1, self.o_groups, self._in_features_per_group).transpose(0, 1)
+        x = grouped_in.reshape(
+            -1, self.o_groups, self._in_features_per_group
+        ).transpose(0, 1)
         # x now [G, B*S, in_per_group]
-        y = torch.bmm(x, w).transpose(0, 1)                                  # [B*S, G, o_lora_rank]
+        y = torch.bmm(x, w).transpose(0, 1)  # [B*S, G, o_lora_rank]
         grouped_out = y.reshape(*input_shape, self.o_groups, self.o_lora_rank)
         # flatten the last two dims: [B, S, G*o_lora_rank]
         grouped_out = grouped_out.flatten(2)
-        output = self.wo_b(grouped_out)                                      # [B, S, hidden]
+        output = self.wo_b(grouped_out)  # [B, S, hidden]
         del hidden_per_group  # only used for the shape-doc comment above
         return output
 
@@ -985,9 +1014,7 @@ class _MQANormParam(nn.Module):
 
     def __init__(self, hidden: int, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.ones(hidden, dtype=dtype), requires_grad=False
-        )
+        self.weight = nn.Parameter(torch.ones(hidden, dtype=dtype), requires_grad=False)
 
 
 class _HCACompressor(nn.Module):
@@ -1098,9 +1125,11 @@ class _HCACompressor(nn.Module):
         self.compress_rate = ratio
         self.rms_eps = float(src.rms_norm_eps)
         self.compress_rope_theta = float(src.compress_rope_theta)
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
 
         # Weight tensors — plain nn.Parameter so this class is CPU-portable
@@ -1121,9 +1150,9 @@ class _HCACompressor(nn.Module):
 
     def compress(
         self,
-        hidden_states: torch.Tensor,             # [B, S, hidden]
-        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
     ) -> torch.Tensor:
         """Emit compressed KV entries — one per closed non-overlapping window.
 
@@ -1147,21 +1176,23 @@ class _HCACompressor(nn.Module):
             return hidden_states.new_zeros((batch, 1, 0, self.head_dim))
 
         chunk = hidden_states[:, :usable]
-        kv = self.wkv(chunk)                                          # [B, U, D]
-        gate = self.wgate(chunk)                                      # [B, U, D]
+        kv = self.wkv(chunk)  # [B, U, D]
+        gate = self.wgate(chunk)  # [B, U, D]
         n_windows = usable // self.compress_rate
 
         # Reshape into per-window tiles.  ``self.ape`` broadcasts across the
         # (batch, n_windows) leading dims to match the [compress_rate, D]
         # trailing shape — same broadcast HF relies on at line 415.
         kv_r = kv.view(batch, n_windows, self.compress_rate, self.head_dim)
-        gate_r = gate.view(batch, n_windows, self.compress_rate, self.head_dim) + self.ape
+        gate_r = (
+            gate.view(batch, n_windows, self.compress_rate, self.head_dim) + self.ape
+        )
 
         # Softmax over the intra-window axis in fp32 for stability (HF line
         # 417).  Cast back to kv's dtype for the weighted sum so the
         # accumulator dtype tracks the source-tensor dtype.
         softmax_w = gate_r.softmax(dim=2, dtype=torch.float32).to(kv_r.dtype)
-        compressed = (kv_r * softmax_w).sum(dim=2)                    # [B, n_windows, D]
+        compressed = (kv_r * softmax_w).sum(dim=2)  # [B, n_windows, D]
 
         # RMSNorm with the learned gain.
         compressed = _weighted_rms_norm(compressed, self.norm.weight, self.rms_eps)
@@ -1178,7 +1209,7 @@ class _HCACompressor(nn.Module):
 
     def build_block_bias(
         self,
-        position_ids: torch.Tensor,              # [B, S]
+        position_ids: torch.Tensor,  # [B, S]
         compressed_len: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -1285,10 +1316,9 @@ class _HCABlock(nn.Module):
     #   * 8 MQA params under `mqa.*`
     #   * 4 HCA compressor params under `compressor.*`
     #   * 12 total
-    PARAM_KEYS: tuple[str, ...] = (
-        tuple(f"mqa.{k}" for k in _MQABlock.PARAM_KEYS)
-        + tuple(f"compressor.{k}" for k in _HCACompressor.PARAM_KEYS)
-    )
+    PARAM_KEYS: tuple[str, ...] = tuple(
+        f"mqa.{k}" for k in _MQABlock.PARAM_KEYS
+    ) + tuple(f"compressor.{k}" for k in _HCACompressor.PARAM_KEYS)
 
     def __init__(
         self,
@@ -1325,12 +1355,12 @@ class _HCABlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,             # [B, S, hidden]
-        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        position_ids: torch.Tensor,              # [B, S]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        cos: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,  # [B, S]
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Full HCA block forward — see class docstring for the source-cited
@@ -1349,7 +1379,7 @@ class _HCABlock(nn.Module):
 
         # 1. Q + main KV via _MQABlock hooks.
         q, _q_residual = self.mqa.project_q(hidden_states, cos, sin)
-        kv_main = self.mqa.project_kv(hidden_states, cos, sin)       # [B, 1, S, D]
+        kv_main = self.mqa.project_kv(hidden_states, cos, sin)  # [B, 1, S, D]
 
         # 2. HCA compressor emits [B, 1, T_c, D] compressed KV entries.
         compressed_kv = self.compressor.compress(hidden_states, cos_win, sin_win)
@@ -1365,7 +1395,7 @@ class _HCABlock(nn.Module):
         )
 
         # 4. Cat compressed KV entries onto the main KV axis (HF line 832).
-        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)      # [B, 1, S+T_c, D]
+        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)  # [B, 1, S+T_c, D]
 
         # 5. Extend the attention mask.  Contract mirrors HF lines 840-844:
         #    * If the caller passed an attention_mask AND block_bias exists
@@ -1385,9 +1415,7 @@ class _HCABlock(nn.Module):
                     [attention_mask, block_bias.to(attention_mask.dtype)], dim=-1
                 )
             else:
-                extended_mask = F.pad(
-                    attention_mask, (0, t_compressed), value=0.0
-                )
+                extended_mask = F.pad(attention_mask, (0, t_compressed), value=0.0)
         else:
             if block_bias is not None:
                 zeros_prefix = hidden_states.new_zeros(
@@ -1535,11 +1563,11 @@ class _CSAOverlapCompressor(nn.Module):
 
     def compress(
         self,
-        hidden_states: torch.Tensor,               # [B, S, hidden]
-        cos_win: torch.Tensor,                     # [B, n_windows, rope_dim/2]
-        sin_win: torch.Tensor,                     # [B, n_windows, rope_dim/2]
-        overlap_kv_prev: torch.Tensor | None = None,   # [B, compress_rate, head_dim]
-        overlap_gate_prev: torch.Tensor | None = None, # [B, compress_rate, head_dim]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        overlap_kv_prev: torch.Tensor | None = None,  # [B, compress_rate, head_dim]
+        overlap_gate_prev: torch.Tensor | None = None,  # [B, compress_rate, head_dim]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Emit compressed entries and the state hand-off for the next call.
 
@@ -1583,8 +1611,8 @@ class _CSAOverlapCompressor(nn.Module):
             )
             return empty_c, empty_state, empty_state
         chunk = hidden_states[:, :usable]
-        kv = self.wkv(chunk)                                    # [B, U, 2*D]
-        gate = self.wgate(chunk)                                # [B, U, 2*D]
+        kv = self.wkv(chunk)  # [B, U, 2*D]
+        gate = self.wgate(chunk)  # [B, U, 2*D]
         n_windows = usable // self.compress_rate
         # Reshape to per-window tiles [B, n_windows, compress_rate, 2*D].
         chunk_kv = kv.view(batch, n_windows, self.compress_rate, -1)
@@ -1600,15 +1628,13 @@ class _CSAOverlapCompressor(nn.Module):
         #   [compress_rate : 2*compress_rate)   = Cb slice of the *current* window.
         # Cells left unset stay zero-kv / -inf-gate → softmax weight 0.
         ratio = self.compress_rate
-        new_kv = chunk_kv.new_zeros(
-            (batch, n_windows, 2 * ratio, self.head_dim)
-        )
+        new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
         new_gate = chunk_gate.new_full(
             (batch, n_windows, 2 * ratio, self.head_dim), float("-inf")
         )
         # Cb of the current window → second half.
-        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim:]
-        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim:]
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim :]
         # Ca of the prior window → first half (windows 1..n_windows-1).
         if n_windows > 1:
             new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
@@ -1642,12 +1668,12 @@ class _CSAOverlapCompressor(nn.Module):
         # Softmax over the 2*compress_rate intra-window slots in fp32 for
         # stability (HF line 671-675) — matches HCA's fp32 softmax reason.
         softmax_w = new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)
-        compressed = (new_kv * softmax_w).sum(dim=2)               # [B, n_windows, D]
+        compressed = (new_kv * softmax_w).sum(dim=2)  # [B, n_windows, D]
         compressed = _weighted_rms_norm(compressed, self.norm.weight, self.rms_eps)
         # Compress-rope at window positions; caller pre-computes cos_win, sin_win.
         compressed = apply_partial_rope(
             compressed.unsqueeze(1), cos_win, sin_win, unsqueeze_dim=1
-        )                                                          # [B, 1, n_win, D]
+        )  # [B, 1, n_win, D]
 
         # Persist the Ca slice of *this* call's last window for the next call.
         new_overlap_kv = chunk_kv[:, -1, :, : self.head_dim].clone()
@@ -1725,6 +1751,7 @@ class _LightningIndexerHead(nn.Module):
         # block_bias mask; softmax runs on the extended KV axis), so
         # the slug here is metadata-only for cache-identity audit.
         from .kernel_dispatch import resolve_dsa_impl_slug
+
         self._emitted_dsa_slug = resolve_dsa_impl_slug()
         self.hidden_size = int(src.hidden_size)
         self.q_lora_rank = int(src.q_lora_rank)
@@ -1741,16 +1768,18 @@ class _LightningIndexerHead(nn.Module):
                 "COMPRESSOR_CLASSES table (modeling_deepseek_v4.py:748-752)."
             )
         self.compress_rate = ratio
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
 
         # Softmax scale for the inner product (HF line 451): head_dim**-0.5.
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
         # Weight normalisation for the sum over heads (HF line 452):
         # index_n_heads**-0.5.  Applied to weights_proj output, not to inputs.
-        self.weights_scaling = self.num_heads ** -0.5
+        self.weights_scaling = self.num_heads**-0.5
 
         # Inner compressor at index_head_dim — same overlap-aware Ca/Cb
         # scheme as the outer CSA compressor, minus the outer's larger
@@ -1783,13 +1812,13 @@ class _LightningIndexerHead(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,             # [B, S, hidden]
-        q_residual: torch.Tensor,                # [B, S, q_lora_rank]
-        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        position_ids: torch.Tensor,              # [B, S]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        q_residual: torch.Tensor,  # [B, S, q_lora_rank]
+        cos: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,  # [B, S]
         overlap_kv_prev: torch.Tensor | None = None,
         overlap_gate_prev: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1822,7 +1851,7 @@ class _LightningIndexerHead(nn.Module):
         # HF's scorer sees compressed_kv as [B, T, D] (line 455-459: it does
         # `compressed_kv.transpose(-1, -2).float().unsqueeze(1)` giving
         # [B, 1, D, T]).  We match by squeezing the head axis.
-        compressed_kv = compressed_kv_bh.squeeze(1)                # [B, T, D]
+        compressed_kv = compressed_kv_bh.squeeze(1)  # [B, T, D]
         compressed_len = compressed_kv.shape[1]
 
         # Q_B projection + partial RoPE at per-source-token positions (HF
@@ -1830,7 +1859,7 @@ class _LightningIndexerHead(nn.Module):
         # via `apply_partial_rope` with unsqueeze_dim=1 (adds head-broadcast
         # axis to cos/sin) on the [B, H_idx, S, D_idx] transpose, then
         # transposed back to [B, S, H_idx, D_idx] per HF.
-        q_flat = self.wq_b(q_residual)                             # [B, S, H*D]
+        q_flat = self.wq_b(q_residual)  # [B, S, H*D]
         q = q_flat.view(batch, seq, self.num_heads, self.head_dim)
         q = apply_partial_rope(q.transpose(1, 2), cos, sin).transpose(1, 2)
         # After transpose-back q is [B, S, H_idx, D_idx].  HF's scorer expects
@@ -1845,19 +1874,17 @@ class _LightningIndexerHead(nn.Module):
             top_k = min(self.index_topk, compressed_len)
             # Return empty top_k of shape [B, S, 0].
             return (
-                torch.zeros(
-                    (batch, seq, top_k), dtype=torch.int64, device=q.device
-                ),
+                torch.zeros((batch, seq, top_k), dtype=torch.int64, device=q.device),
                 new_overlap_kv,
                 new_overlap_gate,
             )
         q_fp32 = q.float()
-        k_fp32 = compressed_kv.transpose(-1, -2).float().unsqueeze(1)   # [B, 1, D, T]
-        scores = torch.matmul(q_fp32, k_fp32)                           # [B, S, H, T]
+        k_fp32 = compressed_kv.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
+        scores = torch.matmul(q_fp32, k_fp32)  # [B, S, H, T]
         scores = F.relu(scores) * self.softmax_scale
         weights = self.weights_proj(hidden_states).float() * self.weights_scaling
         # weights: [B, S, H] → [B, S, H, 1] for broadcast.
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)      # [B, S, T]
+        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
 
         top_k = min(self.index_topk, compressed_len)
         # Per-query causality — the same threshold the outer CSA compressor's
@@ -1865,16 +1892,14 @@ class _LightningIndexerHead(nn.Module):
         # cover source positions `[w*ratio, (w+1)*ratio)`; a query at absolute
         # position `t` may only see them once `t >= w*ratio + ratio - 1` i.e.
         # `w < (t + 1) // ratio`.
-        causal_threshold = (position_ids + 1) // self.compress_rate     # [B, S]
-        entry_indices = torch.arange(
-            compressed_len, device=index_scores.device
-        )
+        causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+        entry_indices = torch.arange(compressed_len, device=index_scores.device)
         future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
         index_scores = index_scores.masked_fill(future_mask, float("-inf"))
         # `topk` — HF line 582; picks that still land ≥ causal_threshold
         # (only possible when there are fewer legal entries than K) are
         # tagged with the ``-1`` sentinel HF line 583-584 defines.
-        top_k_indices = index_scores.topk(top_k, dim=-1).indices        # [B, S, k]
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
         invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
         top_k_indices = torch.where(
             invalid, torch.full_like(top_k_indices, -1), top_k_indices
@@ -1947,9 +1972,7 @@ class _CSABlock(nn.Module):
     PARAM_KEYS: tuple[str, ...] = (
         tuple(f"mqa.{k}" for k in _MQABlock.PARAM_KEYS)
         + tuple(f"compressor.{k}" for k in _CSAOverlapCompressor.PARAM_KEYS)
-        + tuple(
-            f"indexer.compressor.{k}" for k in _CSAOverlapCompressor.PARAM_KEYS
-        )
+        + tuple(f"indexer.compressor.{k}" for k in _CSAOverlapCompressor.PARAM_KEYS)
         + ("indexer.wq_b.weight", "indexer.weights_proj.weight")
     )
 
@@ -1974,17 +1997,18 @@ class _CSABlock(nn.Module):
         ratio = int(src.compress_ratios[layer_idx])
         if ratio != 4:
             raise ValueError(
-                f"_CSABlock requires compress_ratios[{layer_idx}]=4 (CSA); "
-                f"got {ratio}."
+                f"_CSABlock requires compress_ratios[{layer_idx}]=4 (CSA); got {ratio}."
             )
         self.layer_idx = layer_idx
         self.head_dim = int(src.head_dim)
         self.compress_rate = ratio
         self.compress_rope_theta = float(src.compress_rope_theta)
         self.qk_rope_head_dim = int(src.qk_rope_head_dim)
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
         # Same wrapper-tree convention as _HCABlock: `mqa` + `compressor` +
         # (new for CSA) `indexer`.  The state-dict lands under
@@ -1998,6 +2022,7 @@ class _CSABlock(nn.Module):
         # of `.kernel_dispatch` for why DSv4 does not swap the runtime
         # callable.
         from .kernel_dispatch import resolve_dsa_impl_slug
+
         self._emitted_dsa_slug = resolve_dsa_impl_slug()
         self.mqa = _MQABlock(config, layer_idx=layer_idx)
         self.compressor = _CSAOverlapCompressor(
@@ -2055,12 +2080,12 @@ class _CSABlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,             # [B, S, hidden]
-        cos: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        sin: torch.Tensor,                       # [B, S, rope_dim/2] "compress"
-        cos_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        sin_win: torch.Tensor,                   # [B, n_windows, rope_dim/2]
-        position_ids: torch.Tensor,              # [B, S]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        cos: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        sin: torch.Tensor,  # [B, S, rope_dim/2] "compress"
+        cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+        position_ids: torch.Tensor,  # [B, S]
         attention_mask: torch.Tensor | None = None,
         overlap_state: dict[str, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -2103,7 +2128,7 @@ class _CSABlock(nn.Module):
         # 1. Q + main KV via _MQABlock hooks.  Q_A + q_norm gives q_residual,
         # which the indexer *reuses* (avoids recomputing Q_A twice per layer).
         q, q_residual = self.mqa.project_q(hidden_states, cos, sin)
-        kv_main = self.mqa.project_kv(hidden_states, cos, sin)       # [B, 1, S, D]
+        kv_main = self.mqa.project_kv(hidden_states, cos, sin)  # [B, 1, S, D]
 
         # 2. CSA compressor emits [B, 1, T_c, head_dim] compressed KV +
         # new overlap-state tensors for the next forward call.
@@ -2127,7 +2152,7 @@ class _CSABlock(nn.Module):
             position_ids,
             overlap_kv_prev=idx_kv_prev,
             overlap_gate_prev=idx_gate_prev,
-        )                                                             # [B, S, K]
+        )  # [B, S, K]
 
         # 4. Build indexer-gated per-query block_bias (HF lines 693-702).
         # `valid` marks non-sentinel picks; `safe_indices` clamps sentinels
@@ -2149,16 +2174,14 @@ class _CSABlock(nn.Module):
             block_bias = None
 
         # 5. Cat compressed KV onto main KV axis (HF line 832) + extend mask.
-        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)      # [B, 1, S+T_c, D]
+        kv_extended = torch.cat([kv_main, compressed_kv], dim=2)  # [B, 1, S+T_c, D]
         if attention_mask is not None:
             if block_bias is not None:
                 extended_mask = torch.cat(
                     [attention_mask, block_bias.to(attention_mask.dtype)], dim=-1
                 )
             else:
-                extended_mask = F.pad(
-                    attention_mask, (0, t_compressed), value=0.0
-                )
+                extended_mask = F.pad(attention_mask, (0, t_compressed), value=0.0)
         else:
             if block_bias is not None:
                 zeros_prefix = hidden_states.new_zeros(
@@ -2273,9 +2296,7 @@ class _SlidingOnlyAttentionBlock(nn.Module):
     # class attribute so the per-layer dispatch loop can enumerate the
     # sliding-only block's owned params without instantiating it (the
     # 8 MQA params under `mqa.*`, no compressor, no indexer).
-    PARAM_KEYS: tuple[str, ...] = tuple(
-        f"mqa.{k}" for k in _MQABlock.PARAM_KEYS
-    )
+    PARAM_KEYS: tuple[str, ...] = tuple(f"mqa.{k}" for k in _MQABlock.PARAM_KEYS)
 
     def __init__(self, config: Any, *, layer_idx: int) -> None:
         super().__init__()
@@ -2315,10 +2336,10 @@ class _SlidingOnlyAttentionBlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,             # [B, S, hidden]
-        cos: torch.Tensor,                       # [B, S, rope_dim/2] "main"
-        sin: torch.Tensor,                       # [B, S, rope_dim/2] "main"
-        position_ids: torch.Tensor,              # [B, S]
+        hidden_states: torch.Tensor,  # [B, S, hidden]
+        cos: torch.Tensor,  # [B, S, rope_dim/2] "main"
+        sin: torch.Tensor,  # [B, S, rope_dim/2] "main"
+        position_ids: torch.Tensor,  # [B, S]
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sliding-only forward — Q + KV via _MQABlock hooks, sliding-window
@@ -2343,7 +2364,7 @@ class _SlidingOnlyAttentionBlock(nn.Module):
 
         # 1. Q + KV via _MQABlock hooks (same boundary CSA/HCA compose).
         q, _q_residual = self.mqa.project_q(hidden_states, cos, sin)
-        kv = self.mqa.project_kv(hidden_states, cos, sin)                    # [B, 1, S, D]
+        kv = self.mqa.project_kv(hidden_states, cos, sin)  # [B, 1, S, D]
 
         # 2. Build (or extend) the additive sliding-window causal mask.
         sliding_mask = build_sliding_window_causal_mask(
@@ -2460,9 +2481,11 @@ class _HashMoESharedExpert(nn.Module):
         self.hidden_size = int(src.hidden_size)
         self.moe_intermediate_size = int(src.moe_intermediate_size)
         self.swiglu_limit = float(src.swiglu_limit)
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
         self.gate_proj = nn.Linear(
             self.hidden_size, self.moe_intermediate_size, bias=False, dtype=dtype
@@ -2539,9 +2562,11 @@ class _HashMoEStackedExperts(nn.Module):
         self.hidden_size = int(src.hidden_size)
         self.moe_intermediate_size = int(src.moe_intermediate_size)
         self.swiglu_limit = float(src.swiglu_limit)
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
         self.mlp_op = _HashMoEStackedExpertsMlpOp(
             n_experts=self.n_routed_experts,
@@ -2552,9 +2577,9 @@ class _HashMoEStackedExperts(nn.Module):
 
     def dispatch(
         self,
-        flat_hidden: torch.Tensor,        # [T, H] input dtype
-        weights: torch.Tensor,            # [T, top_k] fp32
-        indices: torch.Tensor,            # [T, top_k] int64
+        flat_hidden: torch.Tensor,  # [T, H] input dtype
+        weights: torch.Tensor,  # [T, top_k] fp32
+        indices: torch.Tensor,  # [T, top_k] int64
     ) -> torch.Tensor:
         """CPU-portable per-expert dispatch — bit-exact against HF's
         `MoE.forward` loop (model.py:634-649).
@@ -2573,8 +2598,8 @@ class _HashMoEStackedExperts(nn.Module):
         T, H = flat_hidden.shape
         E = self.n_routed_experts
         I = self.moe_intermediate_size
-        gate_up = self.mlp_op.gate_up_proj.weight           # [E, H, 2I]
-        down = self.mlp_op.down_proj.weight                 # [E, I, H]
+        gate_up = self.mlp_op.gate_up_proj.weight  # [E, H, 2I]
+        down = self.mlp_op.down_proj.weight  # [E, I, H]
         assert gate_up.shape == (E, H, 2 * I), gate_up.shape
         assert down.shape == (E, I, H), down.shape
 
@@ -2585,16 +2610,16 @@ class _HashMoEStackedExperts(nn.Module):
                 continue
             idx_t = picks[:, 0]
             idx_k = picks[:, 1]
-            we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)   # [Ne, 1]
-            xe = flat_hidden[idx_t]                          # [Ne, H]
+            we = weights[idx_t, idx_k].unsqueeze(-1).to(torch.float32)  # [Ne, 1]
+            xe = flat_hidden[idx_t]  # [Ne, H]
             # Expert.forward — fp32 gate/up, ±swiglu_limit clamp,
             # weight-multiply, cast to input dtype before w2.
             gu = xe.to(torch.float32) @ gate_up[e].to(torch.float32)
             g_slice, u_slice = gu.chunk(2, dim=-1)
             g_slice = torch.clamp(g_slice, max=self.swiglu_limit)
             u_slice = torch.clamp(u_slice, -self.swiglu_limit, self.swiglu_limit)
-            inter = F.silu(g_slice) * u_slice * we           # [Ne, I] fp32
-            oe = inter.to(dtype) @ down[e]                    # [Ne, H] input dtype
+            inter = F.silu(g_slice) * u_slice * we  # [Ne, I] fp32
+            oe = inter.to(dtype) @ down[e]  # [Ne, H] input dtype
             y[idx_t] = y[idx_t] + oe.to(torch.float32)
         return y
 
@@ -2677,9 +2702,11 @@ class _HashMoEBlock(nn.Module):
         self.norm_topk_prob = bool(src.norm_topk_prob)
         self.scoring_func = str(src.scoring_func)
         self.swiglu_limit = float(src.swiglu_limit)
-        dtype = getattr(config, "torch_dtype", None) or getattr(
-            getattr(config, "neuron_config", None), "torch_dtype", None
-        ) or src.torch_dtype
+        dtype = (
+            getattr(config, "torch_dtype", None)
+            or getattr(getattr(config, "neuron_config", None), "torch_dtype", None)
+            or src.torch_dtype
+        )
         self._dtype = dtype
 
         # Router lives in fp32 — same rationale as `_RoutedMoEBlock`
@@ -2756,16 +2783,16 @@ class _HashMoEBlock(nn.Module):
         # lines 585-588; scale is deferred to the OUTPUT via the same
         # linear-through-normalise argument documented on
         # dsv4_route_affinities).
-        gathered = scores.gather(-1, indices)                # [T, top_k] fp32
+        gathered = scores.gather(-1, indices)  # [T, top_k] fp32
         if self.norm_topk_prob:
             weights = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             weights = gathered
-        weights = weights * self.routed_scaling_factor       # [T, top_k]
+        weights = weights * self.routed_scaling_factor  # [T, top_k]
 
         # Shared expert forward (per HF MoE.forward line 648, added
         # unconditionally to every token AFTER the routed contribution).
-        shared_out = self.shared_expert(hidden_states)       # [B, L, H]
+        shared_out = self.shared_expert(hidden_states)  # [B, L, H]
 
         # Routed dispatch — per-expert loop, weight-multiply before down proj.
         routed_flat = self.expert_mlps.dispatch(flat, weights, indices)  # fp32
@@ -2949,7 +2976,7 @@ if _NXDI_AVAILABLE:
 
             try:
                 world = int(get_tensor_model_parallel_size())
-            except Exception:
+            except Exception:  # distributed runtime may be absent in CPU inspection
                 world = 1
             if world > 1:
                 raise RuntimeError(
@@ -2982,9 +3009,7 @@ if _NXDI_AVAILABLE:
         sum.
         """
 
-        def __init__(
-            self, config: DeepseekV4FlashNeuronInferenceConfig
-        ) -> None:
+        def __init__(self, config: DeepseekV4FlashNeuronInferenceConfig) -> None:
             super().__init__()
             src = getattr(config, "source_config", None)
             if src is None:
@@ -3107,9 +3132,7 @@ if _NXDI_AVAILABLE:
                     f"({self.moe_intermediate_size}) divisible by TP degree "
                     f"({tp_degree})."
                 )
-            self.moe_intermediate_per_tp = (
-                self.moe_intermediate_size // tp_degree
-            )
+            self.moe_intermediate_per_tp = self.moe_intermediate_size // tp_degree
             # Router lives in fp32.  The scoring function is
             # numerically-sensitive (softplus of large-magnitude logits
             # would saturate at fp16 far short of where fp32 stays
@@ -3126,9 +3149,7 @@ if _NXDI_AVAILABLE:
             # Round 4 (glm53_flash/neuron_wrapper.py:1810-1832).  DSv4's
             # SwiGLU is `silu(clamp(gate, max=L)) * clamp(up, -L, L)` with
             # L=10.0, exactly what GLU + gate/up clamp limits express.
-            blockwise = getattr(
-                config.neuron_config, "blockwise_matmul_config", None
-            )
+            blockwise = getattr(config.neuron_config, "blockwise_matmul_config", None)
             if blockwise is None or not getattr(
                 blockwise, "use_shard_on_intermediate_dynamic_while", False
             ):
@@ -3157,7 +3178,7 @@ if _NXDI_AVAILABLE:
                 hidden_act=src.hidden_act,
                 glu_mlp=True,
                 glu_type=_NxdGLUType.GLU,
-                capacity_factor=None,          # dropless / full capacity
+                capacity_factor=None,  # dropless / full capacity
                 normalize_top_k_affinities=self.norm_topk_prob,
                 gate_clamp_upper_limit=self.swiglu_limit,
                 gate_clamp_lower_limit=None,
@@ -3167,9 +3188,7 @@ if _NXDI_AVAILABLE:
                 dtype=dtype,
                 logical_nc_config=lnc,
                 use_shard_on_intermediate_dynamic_while=True,
-                skip_dma_token=bool(
-                    getattr(blockwise, "skip_dma_token", True)
-                ),
+                skip_dma_token=bool(getattr(blockwise, "skip_dma_token", True)),
                 block_size=int(getattr(blockwise, "block_size", 512)),
             )
             self.shared_expert = _MoESharedExpert(config)
@@ -3296,9 +3315,7 @@ if _NXDI_AVAILABLE:
             layer_type = src.layer_types[layer_idx]
             if layer_type == "sliding_attention":
                 self.attn_kind = "sliding"
-                self.attn = _SlidingOnlyAttentionBlock(
-                    config, layer_idx=layer_idx
-                )
+                self.attn = _SlidingOnlyAttentionBlock(config, layer_idx=layer_idx)
             elif layer_type == "compressed_sparse_attention":
                 self.attn_kind = "csa"
                 self.attn = _CSABlock(config, layer_idx=layer_idx)
@@ -3347,10 +3364,10 @@ if _NXDI_AVAILABLE:
 
         def forward(
             self,
-            hidden_states: torch.Tensor,        # [B, S, hidden]
-            position_ids: torch.Tensor,          # [B, S]
-            caches: tuple[torch.Tensor, ...],    # this layer's aliased slice
-            input_ids: torch.Tensor,             # [B, S] — hash-MoE side channel
+            hidden_states: torch.Tensor,  # [B, S, hidden]
+            position_ids: torch.Tensor,  # [B, S]
+            caches: tuple[torch.Tensor, ...],  # this layer's aliased slice
+            input_ids: torch.Tensor,  # [B, S] — hash-MoE side channel
             *,
             cos_main: torch.Tensor,
             sin_main: torch.Tensor,
@@ -3420,9 +3437,7 @@ if _NXDI_AVAILABLE:
                         f"{len(caches)} aliased state tensors but expects "
                         f"{len(names)} (order: {names})."
                     )
-                overlap_in: dict[str, torch.Tensor | None] = dict(
-                    zip(names, caches)
-                )
+                overlap_in: dict[str, torch.Tensor | None] = dict(zip(names, caches))
                 attn_out, new_state = self.attn(
                     norm_a,
                     cos_compress,
@@ -3435,9 +3450,7 @@ if _NXDI_AVAILABLE:
                 )
                 new_caches = tuple(new_state[name] for name in names)
             else:  # pragma: no cover - guarded at __init__
-                raise RuntimeError(
-                    f"unreachable attn_kind {self.attn_kind!r}"
-                )
+                raise RuntimeError(f"unreachable attn_kind {self.attn_kind!r}")
 
             # 3. Residual add + pre-MLP norm.
             hidden_states = hidden_states + attn_out.to(hidden_states.dtype)
@@ -3487,9 +3500,7 @@ if _NXDI_AVAILABLE:
             self.max_batch_size = config.neuron_config.max_batch_size
             self.buckets = config.neuron_config.buckets
 
-        def init_model(
-            self, config: DeepseekV4FlashNeuronInferenceConfig
-        ) -> None:
+        def init_model(self, config: DeepseekV4FlashNeuronInferenceConfig) -> None:
             src = getattr(config, "source_config", None)
             if src is None:
                 raise RuntimeError(
@@ -3587,9 +3598,7 @@ if _NXDI_AVAILABLE:
             self.state_cache_names = [name for name, _, _ in specs]
             self.past_key_values = nn.ParameterList(
                 [
-                    nn.Parameter(
-                        torch.zeros(shape, dtype=dtype), requires_grad=False
-                    )
+                    nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
                     for _, shape, dtype in specs
                 ]
             )
@@ -3625,9 +3634,11 @@ if _NXDI_AVAILABLE:
                 hidden_states = hidden_states.unsqueeze(0)
             batch, length, _ = hidden_states.shape
             if position_ids is None:
-                position_ids = torch.arange(
-                    length, dtype=torch.int64, device=hidden_states.device
-                ).unsqueeze(0).expand(batch, -1)
+                position_ids = (
+                    torch.arange(length, dtype=torch.int64, device=hidden_states.device)
+                    .unsqueeze(0)
+                    .expand(batch, -1)
+                )
             if position_ids.ndim == 1:
                 position_ids = position_ids.expand(batch, -1)
             position_ids = position_ids.to(torch.int64)
@@ -3668,7 +3679,9 @@ if _NXDI_AVAILABLE:
                     n_windows_hca,
                     dtype=torch.int64,
                     device=hidden_states.device,
-                ).unsqueeze(0).expand(batch, -1)
+                )
+                .unsqueeze(0)
+                .expand(batch, -1)
                 * hca_compress_rate
             )
             cos_win_hca, sin_win_hca = build_main_rope_cos_sin(
@@ -3684,7 +3697,9 @@ if _NXDI_AVAILABLE:
                     n_windows_csa,
                     dtype=torch.int64,
                     device=hidden_states.device,
-                ).unsqueeze(0).expand(batch, -1)
+                )
+                .unsqueeze(0)
+                .expand(batch, -1)
                 * csa_compress_rate
             )
             cos_win_csa, sin_win_csa = build_main_rope_cos_sin(
@@ -3763,7 +3778,7 @@ if _NXDI_AVAILABLE:
             cls,
             hf_config: Any,
             neuron_config: Any,
-        ) -> "NeuronDeepseekV4FlashForCausalLM":
+        ) -> NeuronDeepseekV4FlashForCausalLM:
             _require_nxdi()
             source_config = DeepseekV4FlashInferenceConfig.from_configs(hf_config)
             inference_config = DeepseekV4FlashNeuronInferenceConfig(
@@ -3779,11 +3794,13 @@ else:  # pragma: no cover - CPU-only guard
 
 
 __all__ = [
+    "DSA_CPU_GOLDEN_SLUG",
+    "DSA_NKI_V2_SLUG",
     "DSV4_BLOCKWISE_MATMUL_WORKAROUND",
     "DSV4_ROUTED_SCORING_FUNC",
+    "FORBIDDEN_FP8_KV_KEYS",
     "DeepseekV4FlashLayer",
     "DeepseekV4FlashNeuronInferenceConfig",
-    "FORBIDDEN_FP8_KV_KEYS",
     "NeuronDeepseekV4FlashForCausalLM",
     "_CSABlock",
     "_CSAOverlapCompressor",
@@ -3804,15 +3821,13 @@ __all__ = [
     "dsv4_reference_router_forward",
     "dsv4_route_affinities",
     "get_emitted_kernel_slugs",
-    "DSA_CPU_GOLDEN_SLUG",
-    "DSA_NKI_V2_SLUG",
 ]
 
 
 # Re-export slug identities + resolver so the compile driver / audit
 # tools have a single import surface (parallel to
 # ``glm53_flash/neuron_wrapper.py``).
-from .kernel_dispatch import (  # noqa: E402
+from .kernel_dispatch import (
     DSA_CPU_GOLDEN_SLUG,
     DSA_NKI_V2_SLUG,
     get_emitted_kernel_slugs,

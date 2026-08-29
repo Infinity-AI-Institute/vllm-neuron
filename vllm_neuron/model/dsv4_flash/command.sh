@@ -10,30 +10,28 @@ set -euo pipefail
 : "${COMPILE_CONTRACT:?set COMPILE_CONTRACT to the lane contract JSON}"
 : "${COMPILE_RUN_ROOT:?set COMPILE_RUN_ROOT to the lane run root}"
 
-IMAGE="$(jq -r '.stack.container_digest' "$COMPILE_CONTRACT")"
-TP="$(jq -r '.compile.tp // 32' "$COMPILE_CONTRACT")"
-SEQ="$(jq -r '.compile.sequence_buckets[0] // 4096' "$COMPILE_CONTRACT")"
-CTX_BATCH="$(jq -r '.compile.ctx_batch_size // 1' "$COMPILE_CONTRACT")"
-TKG_BATCH="$(jq -r '.compile.tkg_batch_size // 1' "$COMPILE_CONTRACT")"
-DISABLE_ARGMAX="$(jq -r '.compile.disable_argmax_kernel // false' "$COMPILE_CONTRACT")"
-DRY_RUN="$(jq -r '.compile.dry_run // false' "$COMPILE_CONTRACT")"
-CONTRACT_SLUG="$(jq -r '.contract_slug // empty' "$COMPILE_CONTRACT")"
+IMAGE="$(jq -er '.stack.container_digest' "$COMPILE_CONTRACT")"
+TP="$(jq -er '.compile.tp' "$COMPILE_CONTRACT")"
+SEQ="$(jq -er '.compile.sequence_buckets | if length == 1 then .[0] else error("one sequence bucket required") end' "$COMPILE_CONTRACT")"
+CTX_BATCH="$(jq -er '.compile.ctx_batch_size' "$COMPILE_CONTRACT")"
+TKG_BATCH="$(jq -er '.compile.tkg_batch_size' "$COMPILE_CONTRACT")"
+DISABLE_ARGMAX="$(jq -er '.compile.disable_argmax_kernel' "$COMPILE_CONTRACT")"
+DRY_RUN="$(jq -er '.compile.dry_run' "$COMPILE_CONTRACT")"
+CONTRACT_SLUG="$(jq -er '.contract_slug' "$COMPILE_CONTRACT")"
 
 MODEL_DIR="${MODEL_DIR:-/mnt/compile/hf-cache/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
 SRC_DIR="${SRC_DIR:-/mnt/compile/src/vllm-neuron-bravo}"
 : "${AUTH_EVIDENCE_ROOT:?set AUTH_EVIDENCE_ROOT to the reviewed host-only evidence directory}"
 AUTH_PACKET="${AUTH_PACKET:-$SRC_DIR/vllm_neuron/model/dsv4_flash/tp32_compile_authorization.json}"
 OUT_DIR="$COMPILE_RUN_ROOT/artifacts/model"
-if [[ -z "$CONTRACT_SLUG" ]]; then
-  CONTRACT_SLUG="tp${TP}-lnc2-b1c1-s${SEQ}-bf16-shard_intermediate-skip_dma-cont_batch"
-fi
-
 test -s "$MODEL_DIR/config.json"
 test -f "$SRC_DIR/vllm_neuron/model/dsv4_flash/neuron_wrapper.py"
 test "$TP" -eq 32
 python "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py" \
   --packet "$AUTH_PACKET" \
+  --compile-contract "$COMPILE_CONTRACT" \
   --evidence-root "$AUTH_EVIDENCE_ROOT" \
+  --repository "$SRC_DIR" \
   --require-compile-permitted
 mkdir -p "$COMPILE_RUN_ROOT"/{cache,work/tmp,work/nxd,artifacts/model,logs}
 

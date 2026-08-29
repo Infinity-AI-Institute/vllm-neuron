@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,14 @@ EXPECTED_BLOCKERS = {
     "cpu_reference_bank",
     "emitted_contract_receipt",
 }
+PROMPTS = [
+    ("prompt00", "Hi, what can you help me with?"),
+    ("prompt01", "What is 84 * 3 / 2?"),
+    ("prompt02", "Tell me an interesting fact about the universe!"),
+    ("prompt03", "Explain quantum computing in simple terms."),
+]
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_OID_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class AuthorizationError(ValueError):
@@ -34,6 +45,43 @@ def _load(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     _require(isinstance(value, dict), f"{path} must contain an object")
     return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    _require(
+        isinstance(value, str) and SHA256_RE.fullmatch(value) is not None,
+        f"{label} must be a lowercase SHA-256",
+    )
+    return value
+
+
+def _require_git_oid(value: Any, label: str) -> str:
+    _require(
+        isinstance(value, str) and GIT_OID_RE.fullmatch(value) is not None,
+        f"{label} must be a 40-character Git object ID",
+    )
+    return value
+
+
+def _safe_artifact(root: Path, relative: Any, label: str) -> Path:
+    _require(isinstance(relative, str) and relative, f"{label} path missing")
+    path = (root / relative).resolve()
+    _require(path.is_relative_to(root.resolve()), f"{label} escapes evidence root")
+    _require(path.is_file(), f"{label} file missing: {relative}")
+    return path
 
 
 def validate_packet(packet: Mapping[str, Any]) -> None:
@@ -52,26 +100,51 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
         == "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
         "index drift",
     )
+    _require(
+        packet.get("tokenizer_sha256")
+        == "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+        "tokenizer drift",
+    )
     _require(packet.get("source_tensor_count") == 72317, "tensor census drift")
     _require(packet.get("source_shard_count") == 48, "shard census drift")
-    topology = packet.get("topology", {})
-    _require(topology.get("tp_degree") == 32, "TP must be 32")
-    _require(topology.get("logical_neuroncore_config") == 2, "LNC drift")
-    _require(topology.get("sequence_buckets") == [4096], "sequence drift")
-    emitted = packet.get("emitted_contract", {})
-    _require(emitted.get("rank_count") == 32, "rank count drift")
-    _require(emitted.get("rank_checkpoint_dtype") == "bfloat16", "weight dtype drift")
-    _require(emitted.get("compute_dtype") == "bfloat16", "compute dtype drift")
-    _require(emitted.get("cache_dtype") == "bfloat16", "cache dtype drift")
-    _require(emitted.get("fp8_kv") is False, "FP8 KV is forbidden")
     _require(
-        emitted.get("runtime_weight_quantized") is False, "weight quantization drift"
+        packet.get("source_total_bytes") == 166886535336, "source byte census drift"
     )
-    _require(emitted.get("sampler") == "greedy_argmax", "sampler drift")
-    _require(emitted.get("speculative_decode") is False, "speculation is forbidden")
+    _require_sha256(
+        str(packet.get("compiler_image", "")).rsplit("sha256:", 1)[-1],
+        "compiler image digest",
+    )
+    topology = packet.get("topology", {})
     _require(
-        emitted.get("mtp") is False and emitted.get("dspark") is False,
-        "MTP/DSpark forbidden",
+        topology
+        == {
+            "hardware": "trn2.48xlarge",
+            "tp_degree": 32,
+            "logical_neuroncore_config": 2,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 1,
+            "sequence_buckets": [4096],
+            "continuous_batching": True,
+        },
+        "topology drift",
+    )
+    emitted = packet.get("emitted_contract", {})
+    _require(
+        emitted
+        == {
+            "rank_count": 32,
+            "rank_checkpoint_dtype": "bfloat16",
+            "compute_dtype": "bfloat16",
+            "cache_dtype": "bfloat16",
+            "fp8_kv": False,
+            "runtime_weight_quantized": False,
+            "sampler": "greedy_argmax",
+            "speculative_decode": False,
+            "mtp": False,
+            "dspark": False,
+            "max_writer_chunk_bytes": 67108864,
+        },
+        "emitted contract drift",
     )
     blockers = packet.get("blockers")
     _require(isinstance(blockers, list), "blockers must be a list")
@@ -79,12 +152,11 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
         {item.get("id") for item in blockers} == EXPECTED_BLOCKERS, "blocker drift"
     )
     _require(
-        all(item.get("satisfied") is False for item in blockers),
-        "static packet may not pre-authorize blockers",
-    )
-    _require(
-        all(item.get("machine_check") for item in blockers),
-        "every blocker needs a machine check",
+        all(
+            item.get("satisfied") is False and item.get("machine_check")
+            for item in blockers
+        ),
+        "static blockers must remain falsifiable HOLDs",
     )
     claims = packet.get("claims", {})
     _require(
@@ -93,34 +165,114 @@ def validate_packet(packet: Mapping[str, Any]) -> None:
     )
 
 
-def validate_evidence(packet: Mapping[str, Any], root: Path) -> list[str]:
-    """Validate evidence when present; absence remains a normal HOLD."""
-    required = {
-        "source_validator_merged": root / "source-provenance.json",
-        "checkpoint_headers_and_payload_identity": root / "source-provenance.json",
-        "tp32_rank_inventory": root / "rank-inventory.json",
-        "compiler_inventory": root / "compiler-provenance.json",
-        "cpu_reference_bank": root / "cpu-reference-manifest.json",
-        "emitted_contract_receipt": root / "emitted-contract.json",
+def validate_compile_contract(
+    packet: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
+    expected = {
+        "contract_slug": "tp32-lnc2-b1c1-s4096-bf16-shard_intermediate-skip_dma-cont_batch",
+        "model": {"repo_id": packet["model"], "revision": packet["revision"]},
+        "stack": {"container_digest": packet["compiler_image"]},
+        "compile": {
+            "tp": 32,
+            "logical_nc_config": 2,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 1,
+            "sequence_buckets": [4096],
+            "disable_argmax_kernel": False,
+            "dry_run": False,
+            "blockwise_matmul_config": {
+                "use_shard_on_intermediate_dynamic_while": True
+            },
+        },
+        "emitted_contract": packet["emitted_contract"],
     }
-    missing = sorted({item.name for item in required.values() if not item.is_file()})
-    if missing:
-        return [f"missing:{name}" for name in missing]
+    _require(
+        contract == expected, "effective compile contract is not exactly authorized"
+    )
 
-    source = _load(required["source_validator_merged"])
+
+def _validate_source(
+    packet: Mapping[str, Any], source: Mapping[str, Any], root: Path, repository: Path
+) -> None:
+    for key in ("source_commit", "validator_merge_sha"):
+        _require_git_oid(source.get(key), key)
     _require(
         source.get("validator_merged_to_agent_main") is True,
         "source is not validator-merged",
     )
-    _require(source.get("revision") == packet["revision"], "source revision drift")
+    for key in ("revision", "config_sha256", "index_sha256"):
+        _require(source.get(key) == packet[key], f"source {key} drift")
+    command = ["git", "-C", str(repository), "merge-base", "--is-ancestor"]
+    for ancestor, descendant in (
+        (source["source_commit"], source["validator_merge_sha"]),
+        (source["validator_merge_sha"], "origin/agent-main"),
+    ):
+        result = subprocess.run(
+            [*command, ancestor, descendant], check=False, capture_output=True
+        )
+        _require(
+            result.returncode == 0,
+            f"source ancestry failed: {ancestor} -> {descendant}",
+        )
+
+    shards = source.get("shards")
     _require(
-        source.get("config_sha256") == packet["config_sha256"], "source config drift"
+        isinstance(shards, list) and len(shards) == 48,
+        "exact 48-entry shard inventory required",
     )
-    _require(source.get("index_sha256") == packet["index_sha256"], "source index drift")
-    _require(source.get("shard_count") == 48, "source shard audit drift")
-    _require(source.get("tensor_count") == 72317, "source tensor audit drift")
+    expected_names = [
+        f"model-{index:05d}-of-00048.safetensors" for index in range(1, 49)
+    ]
     _require(
-        source.get("header_audit_payload_bytes") == 0, "header audit loaded payload"
+        [item.get("name") for item in shards] == expected_names,
+        "shard names/order drift",
+    )
+    required_keys = {
+        "name",
+        "lfs_sha256",
+        "size",
+        "header_sha256",
+        "header_bytes",
+        "tensor_count",
+        "routing_sha256",
+    }
+    _require(
+        all(set(item) == required_keys for item in shards),
+        "shard identity fields drift",
+    )
+    for index, item in enumerate(shards):
+        _require_sha256(item["lfs_sha256"], f"shard {index} LFS")
+        _require_sha256(item["header_sha256"], f"shard {index} header")
+        _require_sha256(item["routing_sha256"], f"shard {index} routing")
+        _require(
+            isinstance(item["size"], int) and item["size"] > 0, "invalid shard size"
+        )
+        _require(
+            isinstance(item["header_bytes"], int) and item["header_bytes"] > 0,
+            "invalid header bytes",
+        )
+        _require(
+            isinstance(item["tensor_count"], int) and item["tensor_count"] > 0,
+            "invalid shard tensor count",
+        )
+    _require(
+        len({item["lfs_sha256"] for item in shards}) == 48, "duplicate LFS identities"
+    )
+    _require(
+        len({item["header_sha256"] for item in shards}) == 48,
+        "duplicate header identities",
+    )
+    _require(
+        sum(item["size"] for item in shards) == packet["source_total_bytes"],
+        "source byte total drift",
+    )
+    _require(
+        sum(item["tensor_count"] for item in shards) == packet["source_tensor_count"],
+        "source tensor total drift",
+    )
+    _require(
+        source.get("payload_bytes_read_during_header_audit") == 0,
+        "header audit read payload",
     )
     _require(
         source.get("missing") == []
@@ -128,64 +280,212 @@ def validate_evidence(packet: Mapping[str, Any], root: Path) -> list[str]:
         and source.get("misrouted") == [],
         "source routing audit failed",
     )
+    _require(
+        source.get("canonical_shard_inventory_sha256") == _canonical_sha256(shards),
+        "canonical shard inventory drift",
+    )
+    routing = source.get("routing_manifest", {})
+    routing_path = _safe_artifact(root, routing.get("path"), "routing manifest")
+    _require(
+        _sha256_file(routing_path)
+        == _require_sha256(routing.get("sha256"), "routing manifest"),
+        "routing manifest file drift",
+    )
+    routing_body = _load(routing_path)
+    _require(
+        routing_body
+        == {
+            "revision": packet["revision"],
+            "index_sha256": packet["index_sha256"],
+            "shards": shards,
+        },
+        "routing manifest body drift",
+    )
 
-    inventory = _load(required["tp32_rank_inventory"])
+
+def _validate_ranks(
+    packet: Mapping[str, Any], inventory: Mapping[str, Any], root: Path
+) -> None:
     ranks = inventory.get("ranks")
     _require(
         isinstance(ranks, list)
         and [item.get("rank") for item in ranks] == list(range(32)),
         "rank inventory must cover 0..31",
     )
-    _require(all(item.get("tp_degree") == 32 for item in ranks), "rank TP drift")
-    _require(all(item.get("dtype") == "bfloat16" for item in ranks), "rank dtype drift")
+    inventory_hashes: set[str] = set()
+    checkpoint_hashes: set[str] = set()
+    for item in ranks:
+        _require(
+            set(item)
+            == {
+                "rank",
+                "tp_degree",
+                "dtype",
+                "inventory_sha256",
+                "checkpoint",
+                "manifest",
+            },
+            "rank receipt fields drift",
+        )
+        _require(
+            item["tp_degree"] == 32 and item["dtype"] == "bfloat16",
+            "rank contract drift",
+        )
+        inventory_hashes.add(
+            _require_sha256(item["inventory_sha256"], "rank inventory")
+        )
+        checkpoint = item["checkpoint"]
+        manifest_ref = item["manifest"]
+        checkpoint_path = _safe_artifact(
+            root, checkpoint.get("path"), "rank checkpoint"
+        )
+        checkpoint_sha = _require_sha256(checkpoint.get("sha256"), "rank checkpoint")
+        _require(
+            _sha256_file(checkpoint_path) == checkpoint_sha,
+            "rank checkpoint hash drift",
+        )
+        _require(
+            checkpoint_path.stat().st_size == checkpoint.get("bytes") > 0,
+            "rank checkpoint byte drift",
+        )
+        checkpoint_hashes.add(checkpoint_sha)
+        manifest_path = _safe_artifact(root, manifest_ref.get("path"), "rank manifest")
+        _require(
+            _sha256_file(manifest_path)
+            == _require_sha256(manifest_ref.get("sha256"), "rank manifest"),
+            "rank manifest hash drift",
+        )
+        manifest = _load(manifest_path)
+        _require(
+            manifest.get("schema") == "dsv4-streaming-rank-v1",
+            "rank manifest schema drift",
+        )
+        _require(
+            manifest.get("rank") == item["rank"] and manifest.get("tp_degree") == 32,
+            "rank manifest topology drift",
+        )
+        _require(
+            manifest.get("rank_inventory_sha256") == item["inventory_sha256"],
+            "rank inventory binding drift",
+        )
+        _require(
+            manifest.get("checkpoint", {}).get("sha256") == checkpoint_sha,
+            "rank checkpoint binding drift",
+        )
+        _require(
+            manifest.get("resource_bound", {}).get("observed_max_chunk_bytes", 1 << 63)
+            <= packet["emitted_contract"]["max_writer_chunk_bytes"],
+            "rank chunk bound exceeded",
+        )
+    _require(len(inventory_hashes) == 32, "duplicate rank inventory identities")
+    _require(len(checkpoint_hashes) == 32, "duplicate rank checkpoint identities")
     _require(
-        all(
-            item.get("observed_max_chunk_bytes", 1 << 63) <= 67108864 for item in ranks
-        ),
-        "rank chunk bound exceeded",
-    )
-    _require(
-        all(
-            item.get("inventory_sha256") and item.get("checkpoint_sha256")
-            for item in ranks
-        ),
-        "rank identities missing",
+        inventory.get("canonical_rank_inventory_sha256") == _canonical_sha256(ranks),
+        "canonical rank inventory drift",
     )
 
-    compiler = _load(required["compiler_inventory"])
-    required_compiler = {
-        "image_digest",
-        "image_config_digest",
-        "neuronx_cc",
-        "torch_neuronx",
-        "nxdi",
-        "nxd",
-        "nki",
-        "torch",
-        "runtime",
-    }
+
+def _validate_compiler(packet: Mapping[str, Any], compiler: Mapping[str, Any]) -> None:
     _require(
-        required_compiler <= set(compiler)
-        and all(compiler[key] for key in required_compiler),
-        "compiler inventory incomplete",
+        compiler.get("image_digest") == packet["compiler_image"], "compiler image drift"
+    )
+    _require_sha256(compiler.get("image_config_digest"), "image config")
+    packages = compiler.get("packages")
+    names = {"neuronx-cc", "torch-neuronx", "nxdi", "nxd", "nki", "torch", "runtime"}
+    _require(
+        isinstance(packages, Mapping) and set(packages) == names,
+        "compiler package inventory drift",
+    )
+    for name, identity in packages.items():
+        _require(
+            set(identity) == {"version", "artifact_sha256", "source_commit"},
+            f"{name} identity fields drift",
+        )
+        _require(
+            isinstance(identity["version"], str) and identity["version"],
+            f"{name} version missing",
+        )
+        _require_sha256(identity["artifact_sha256"], f"{name} artifact")
+        _require_git_oid(identity["source_commit"], f"{name} source")
+    _require(
+        compiler.get("canonical_inventory_sha256") == _canonical_sha256(packages),
+        "compiler canonical digest drift",
     )
 
-    reference = _load(required["cpu_reference_bank"])
+
+def _validate_reference(
+    packet: Mapping[str, Any], reference: Mapping[str, Any], root: Path
+) -> None:
+    for key in ("revision", "config_sha256", "index_sha256", "tokenizer_sha256"):
+        _require(reference.get(key) == packet[key], f"CPU reference {key} drift")
     _require(reference.get("prompts_sha16") == "99f702c72d2fafcc", "prompt bank drift")
+    prompts = reference.get("prompts")
     _require(
-        reference.get("prompt_count") == 4 and reference.get("tokens_per_prompt") == 10,
-        "4x10 bank incomplete",
+        isinstance(prompts, list) and len(prompts) == 4, "four prompt receipts required"
     )
-    _require(
-        reference.get("token_id_count") == 40
-        and reference.get("full_vocab_logit_count") == 40,
-        "reference evidence incomplete",
-    )
-    _require(reference.get("manifest_sha256"), "reference manifest identity missing")
+    logit_hashes: set[str] = set()
+    for expected, prompt in zip(PROMPTS, prompts, strict=True):
+        _require(
+            prompt.get("id") == expected[0] and prompt.get("text") == expected[1],
+            "prompt identity drift",
+        )
+        _require(
+            isinstance(prompt.get("prompt_token_ids"), list)
+            and all(isinstance(value, int) for value in prompt["prompt_token_ids"]),
+            "prompt tokens missing",
+        )
+        _require(
+            isinstance(prompt.get("generated_token_ids"), list)
+            and len(prompt["generated_token_ids"]) == 10
+            and all(isinstance(value, int) for value in prompt["generated_token_ids"]),
+            "generated 4x10 IDs incomplete",
+        )
+        logits = prompt.get("logits")
+        _require(
+            isinstance(logits, list) and len(logits) == 10,
+            "ten logit receipts required per prompt",
+        )
+        for position, receipt in enumerate(logits):
+            _require(
+                receipt.get("position") == position
+                and receipt.get("dtype") == "float32"
+                and receipt.get("vocab_size") == 129280
+                and receipt.get("bytes") == 129280 * 4
+                and receipt.get("finite") is True,
+                "logit contract drift",
+            )
+            path = _safe_artifact(root, receipt.get("path"), "logit artifact")
+            _require(
+                path.stat().st_size == receipt["bytes"], "logit artifact byte drift"
+            )
+            digest = _require_sha256(receipt.get("sha256"), "logit artifact")
+            _require(_sha256_file(path) == digest, "logit artifact hash drift")
+            logit_hashes.add(digest)
+    _require(len(logit_hashes) == 40, "duplicate or missing full-logit identities")
+    body = dict(reference)
+    claimed = body.pop("manifest_sha256", None)
+    _require(claimed == _canonical_sha256(body), "CPU reference canonical digest drift")
 
-    emitted = _load(required["emitted_contract_receipt"])
+
+def validate_evidence(
+    packet: Mapping[str, Any], root: Path, repository: Path
+) -> list[str]:
+    required = {
+        "source": root / "source-provenance.json",
+        "ranks": root / "rank-inventory.json",
+        "compiler": root / "compiler-provenance.json",
+        "reference": root / "cpu-reference-manifest.json",
+        "emitted": root / "emitted-contract.json",
+    }
+    missing = sorted(path.name for path in required.values() if not path.is_file())
+    if missing:
+        return [f"missing:{name}" for name in missing]
+    _validate_source(packet, _load(required["source"]), root, repository)
+    _validate_ranks(packet, _load(required["ranks"]), root)
+    _validate_compiler(packet, _load(required["compiler"]))
+    _validate_reference(packet, _load(required["reference"]), root)
     _require(
-        emitted
+        _load(required["emitted"])
         == {
             "topology": packet["topology"],
             "emitted_contract": packet["emitted_contract"],
@@ -198,14 +498,23 @@ def validate_evidence(packet: Mapping[str, Any], root: Path) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packet", type=Path, default=PACKET)
+    parser.add_argument("--compile-contract", type=Path)
     parser.add_argument("--evidence-root", type=Path)
+    parser.add_argument("--repository", type=Path)
     parser.add_argument("--require-compile-permitted", action="store_true")
     args = parser.parse_args()
     packet = _load(args.packet)
     validate_packet(packet)
+    if args.compile_contract is not None:
+        validate_compile_contract(packet, _load(args.compile_contract))
     holds = [item["id"] for item in packet["blockers"]]
     if args.evidence_root is not None:
-        holds = validate_evidence(packet, args.evidence_root)
+        _require(args.repository is not None, "--repository is required with evidence")
+        _require(
+            args.compile_contract is not None,
+            "--compile-contract is required with evidence",
+        )
+        holds = validate_evidence(packet, args.evidence_root, args.repository)
     permitted = not holds
     print(json.dumps({"compile_permitted": permitted, "holds": holds}, sort_keys=True))
     return 2 if args.require_compile_permitted and not permitted else 0

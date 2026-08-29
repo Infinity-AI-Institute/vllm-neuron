@@ -75,7 +75,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Import helper (CPU-only tolerant, mirrors test_hash_moe_1layer.py).
 # ---------------------------------------------------------------------------
@@ -89,7 +88,10 @@ def _import_library():
     """
     try:
         from vllm_neuron.model.dsv4_flash import config as cfg_mod  # type: ignore
-        from vllm_neuron.model.dsv4_flash import neuron_wrapper as wrap_mod  # type: ignore
+        from vllm_neuron.model.dsv4_flash import (
+            neuron_wrapper as wrap_mod,  # type: ignore
+        )
+
         return cfg_mod, wrap_mod
     except Exception:
         pass
@@ -132,8 +134,8 @@ def _import_library():
 EXPECTED_TOTAL_LAYERS = 43
 
 EXPECTED_SLIDING_INDICES = frozenset({0, 1})
-EXPECTED_CSA_INDICES = frozenset(range(2, 43, 2))      # 2, 4, 6, ..., 42
-EXPECTED_HCA_INDICES = frozenset(range(3, 42, 2))      # 3, 5, 7, ..., 41
+EXPECTED_CSA_INDICES = frozenset(range(2, 43, 2))  # 2, 4, 6, ..., 42
+EXPECTED_HCA_INDICES = frozenset(range(3, 42, 2))  # 3, 5, 7, ..., 41
 EXPECTED_HASH_MOE_INDICES = frozenset({0, 1, 2})
 EXPECTED_ROUTED_MOE_INDICES = frozenset(range(3, 43))
 
@@ -169,18 +171,14 @@ def test_schedule_partitions_all_43_layers() -> None:
     cfg, _nw = _import_library()
     src = cfg.DeepseekV4FlashInferenceConfig()
     assert len(src.layer_types) == EXPECTED_TOTAL_LAYERS, len(src.layer_types)
-    assert len(src.mlp_layer_types) == EXPECTED_TOTAL_LAYERS, len(
-        src.mlp_layer_types
-    )
+    assert len(src.mlp_layer_types) == EXPECTED_TOTAL_LAYERS, len(src.mlp_layer_types)
 
     sliding = {i for i, t in enumerate(src.layer_types) if t == "sliding_attention"}
     csa = {
-        i for i, t in enumerate(src.layer_types)
-        if t == "compressed_sparse_attention"
+        i for i, t in enumerate(src.layer_types) if t == "compressed_sparse_attention"
     }
     hca = {
-        i for i, t in enumerate(src.layer_types)
-        if t == "heavily_compressed_attention"
+        i for i, t in enumerate(src.layer_types) if t == "heavily_compressed_attention"
     }
     assert sliding == EXPECTED_SLIDING_INDICES, sorted(sliding)
     assert csa == EXPECTED_CSA_INDICES, sorted(csa)
@@ -224,14 +222,8 @@ def test_block_class_param_key_counts() -> None:
     _cfg, nw = _import_library()
     assert len(nw._MQABlock.PARAM_KEYS) == EXPECTED_MQA_KEY_COUNT
     assert len(nw._HCACompressor.PARAM_KEYS) == EXPECTED_HCA_COMPRESSOR_KEY_COUNT
-    assert (
-        len(nw._CSAOverlapCompressor.PARAM_KEYS)
-        == EXPECTED_CSA_COMPRESSOR_KEY_COUNT
-    )
-    assert (
-        len(nw._SlidingOnlyAttentionBlock.PARAM_KEYS)
-        == EXPECTED_SLIDING_KEY_COUNT
-    )
+    assert len(nw._CSAOverlapCompressor.PARAM_KEYS) == EXPECTED_CSA_COMPRESSOR_KEY_COUNT
+    assert len(nw._SlidingOnlyAttentionBlock.PARAM_KEYS) == EXPECTED_SLIDING_KEY_COUNT
     assert len(nw._HCABlock.PARAM_KEYS) == EXPECTED_HCA_KEY_COUNT
     assert len(nw._CSABlock.PARAM_KEYS) == EXPECTED_CSA_KEY_COUNT
     assert len(nw._HashMoEBlock.PARAM_KEYS) == EXPECTED_HASH_MOE_KEY_COUNT
@@ -246,19 +238,12 @@ def test_routed_moe_block_class_param_keys_if_available() -> None:
     if not getattr(nw, "_NXDI_AVAILABLE", False):
         pytest.skip("_RoutedMoEBlock only accessible when NxDI is available")
     assert hasattr(nw._RoutedMoEBlock, "PARAM_KEYS")
-    assert (
-        len(nw._RoutedMoEBlock.PARAM_KEYS)
-        == EXPECTED_ROUTED_MOE_KEY_COUNT
-    )
+    assert len(nw._RoutedMoEBlock.PARAM_KEYS) == EXPECTED_ROUTED_MOE_KEY_COUNT
     # Structural: the routed MoE has `e_score_correction_bias` where
     # hash_moe has `tid2eid` — the two families are otherwise identical
     # at the state-dict level.
-    hash_only = set(nw._HashMoEBlock.PARAM_KEYS) - set(
-        nw._RoutedMoEBlock.PARAM_KEYS
-    )
-    routed_only = set(nw._RoutedMoEBlock.PARAM_KEYS) - set(
-        nw._HashMoEBlock.PARAM_KEYS
-    )
+    hash_only = set(nw._HashMoEBlock.PARAM_KEYS) - set(nw._RoutedMoEBlock.PARAM_KEYS)
+    routed_only = set(nw._RoutedMoEBlock.PARAM_KEYS) - set(nw._HashMoEBlock.PARAM_KEYS)
     assert hash_only == {"tid2eid"}, hash_only
     assert routed_only == {"e_score_correction_bias"}, routed_only
 
@@ -303,9 +288,7 @@ def test_full_wrapper_tree_key_count_reaches_1024() -> None:
     for layer_idx in range(EXPECTED_TOTAL_LAYERS):
         attn_keys = _attn_keys_for_layer(nw, src.layer_types[layer_idx])
         mlp_keys = _mlp_keys_for_layer(nw, src.mlp_layer_types[layer_idx])
-        layer_key_count = (
-            len(attn_keys) + len(mlp_keys) + EXPECTED_LAYER_NORM_KEY_COUNT
-        )
+        layer_key_count = len(attn_keys) + len(mlp_keys) + EXPECTED_LAYER_NORM_KEY_COUNT
         per_layer_counts[layer_idx] = layer_key_count
         total_keys += layer_key_count
 
@@ -313,19 +296,23 @@ def test_full_wrapper_tree_key_count_reaches_1024() -> None:
 
     # Cross-check per-family sub-totals.
     sliding_hash_total = sum(
-        v for i, v in per_layer_counts.items()
+        v
+        for i, v in per_layer_counts.items()
         if i in EXPECTED_SLIDING_INDICES and i in EXPECTED_HASH_MOE_INDICES
     )
     csa_hash_total = sum(
-        v for i, v in per_layer_counts.items()
+        v
+        for i, v in per_layer_counts.items()
         if i in EXPECTED_CSA_INDICES and i in EXPECTED_HASH_MOE_INDICES
     )
     csa_routed_total = sum(
-        v for i, v in per_layer_counts.items()
+        v
+        for i, v in per_layer_counts.items()
         if i in EXPECTED_CSA_INDICES and i in EXPECTED_ROUTED_MOE_INDICES
     )
     hca_routed_total = sum(
-        v for i, v in per_layer_counts.items()
+        v
+        for i, v in per_layer_counts.items()
         if i in EXPECTED_HCA_INDICES and i in EXPECTED_ROUTED_MOE_INDICES
     )
     assert sliding_hash_total == 34, sliding_hash_total
@@ -333,7 +320,10 @@ def test_full_wrapper_tree_key_count_reaches_1024() -> None:
     assert csa_routed_total == 540, csa_routed_total
     assert hca_routed_total == 420, hca_routed_total
     assert (
-        sliding_hash_total + csa_hash_total + csa_routed_total + hca_routed_total
+        sliding_hash_total
+        + csa_hash_total
+        + csa_routed_total
+        + hca_routed_total
         + EXPECTED_TOP_LEVEL_KEY_COUNT
         == EXPECTED_TOTAL_WRAPPER_TREE_KEYS
     )
@@ -356,9 +346,7 @@ def test_state_cache_specs_aggregate_to_84_across_csa_layers() -> None:
         "indexer_overlap_kv",
         "indexer_overlap_gate",
     )
-    assert (
-        len(csa_state_names) == EXPECTED_STATE_CACHE_PAIRS_PER_CSA_LAYER
-    )
+    assert len(csa_state_names) == EXPECTED_STATE_CACHE_PAIRS_PER_CSA_LAYER
     total = len(EXPECTED_CSA_INDICES) * len(csa_state_names)
     assert total == EXPECTED_STATE_CACHE_PAIRS, total
     # Sliding + HCA contribute zero aliased state.

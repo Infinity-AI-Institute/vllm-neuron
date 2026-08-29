@@ -46,7 +46,6 @@ intent is byte-clean verification; a skip is louder than a false pass.
 from __future__ import annotations
 
 import json
-import os
 import struct
 import sys
 from pathlib import Path
@@ -54,7 +53,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard — same lookup convention as the FP4 / MQA tests.
@@ -87,9 +85,14 @@ def _import_library():
     try:
         from vllm_neuron.model.dsv4_flash import (  # type: ignore
             checkpoint_convert as convert,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             config as cfg,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             neuron_wrapper as nw,
         )
+
         return cfg, convert, nw
     except Exception:
         pass
@@ -172,12 +175,10 @@ def _build_local_cache() -> Path:
     """
     try:
         from huggingface_hub import hf_hub_url
+
         url = hf_hub_url(_HF_REPO, _HF_SHARD, revision=_HF_SHA)
     except Exception:
-        url = (
-            f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/"
-            f"{_HF_SHARD}"
-        )
+        url = f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/{_HF_SHARD}"
 
     first = _fetch_range(url, (0, _HEADER_CHUNK_BYTES - 1))
     header_len = struct.unpack("<Q", first[:8])[0]
@@ -273,11 +274,15 @@ def _ref_apply_rotary(
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
     nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
-    rotated = ((rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)).to(x.dtype)
+    rotated = (
+        (rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)
+    ).to(x.dtype)
     return torch.cat([nope, rotated], dim=-1)
 
 
-def _ref_rms_norm_weighted(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _ref_rms_norm_weighted(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     x32 = x.to(torch.float32)
     variance = x32.pow(2).mean(-1, keepdim=True)
     x32 = x32 * torch.rsqrt(variance + eps)
@@ -289,17 +294,17 @@ def _ref_rms_norm_unweighted(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _ref_compressor_forward(
-    hidden_states: torch.Tensor,     # [B, S, hidden]
-    wkv: torch.Tensor,               # [head_dim, hidden]
-    wgate: torch.Tensor,             # [head_dim, hidden]
-    ape: torch.Tensor,               # [compress_rate, head_dim]
-    norm_weight: torch.Tensor,       # [head_dim]
+    hidden_states: torch.Tensor,  # [B, S, hidden]
+    wkv: torch.Tensor,  # [head_dim, hidden]
+    wgate: torch.Tensor,  # [head_dim, hidden]
+    ape: torch.Tensor,  # [compress_rate, head_dim]
+    norm_weight: torch.Tensor,  # [head_dim]
     *,
     compress_rate: int,
     head_dim: int,
     rms_eps: float,
-    cos_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
-    sin_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
+    cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+    sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
 ) -> tuple[torch.Tensor, int]:
     """Reference HCA compressor: emits [B, 1, n_windows, head_dim].
 
@@ -311,8 +316,8 @@ def _ref_compressor_forward(
     if usable == 0:
         return hidden_states.new_zeros((batch, 1, 0, head_dim)), 0
     chunk = hidden_states[:, :usable]
-    kv = torch.nn.functional.linear(chunk, wkv)                          # [B, U, D]
-    gate = torch.nn.functional.linear(chunk, wgate)                      # [B, U, D]
+    kv = torch.nn.functional.linear(chunk, wkv)  # [B, U, D]
+    gate = torch.nn.functional.linear(chunk, wgate)  # [B, U, D]
     n_windows = usable // compress_rate
     kv_r = kv.view(batch, n_windows, compress_rate, head_dim)
     gate_r = gate.view(batch, n_windows, compress_rate, head_dim) + ape
@@ -322,11 +327,11 @@ def _ref_compressor_forward(
     # Apply "compress" rope at window positions.  compressed is [B, n_windows, D];
     # unsqueeze the head axis so apply_rotary_pos_emb (unsqueeze_dim=1) broadcasts.
     compressed = _ref_apply_rotary(compressed.unsqueeze(1), cos_win, sin_win).squeeze(1)
-    return compressed.unsqueeze(1), n_windows                            # [B, 1, T, D]
+    return compressed.unsqueeze(1), n_windows  # [B, 1, T, D]
 
 
 def _ref_hca_forward(
-    hidden_states: torch.Tensor,     # [B, S, hidden]
+    hidden_states: torch.Tensor,  # [B, S, hidden]
     weights: dict[str, torch.Tensor],
     *,
     num_heads: int,
@@ -335,11 +340,11 @@ def _ref_hca_forward(
     o_lora_rank: int,
     rms_eps: float,
     compress_rate: int,
-    position_ids: torch.Tensor,      # [B, S]
-    cos: torch.Tensor,               # [B, S, rope_dim/2]
-    sin: torch.Tensor,               # [B, S, rope_dim/2]
-    cos_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
-    sin_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
+    position_ids: torch.Tensor,  # [B, S]
+    cos: torch.Tensor,  # [B, S, rope_dim/2]
+    sin: torch.Tensor,  # [B, S, rope_dim/2]
+    cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+    sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
 ) -> torch.Tensor:
     """Reference DSv4 HCA attention block forward.
 
@@ -374,9 +379,13 @@ def _ref_hca_forward(
     q = _ref_rms_norm_unweighted(q, rms_eps)
     q = _ref_apply_rotary(q, cos, sin)
 
-    kv_main = _ref_rms_norm_weighted(
-        torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
-    ).view(*hidden_shape).transpose(1, 2)
+    kv_main = (
+        _ref_rms_norm_weighted(
+            torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
+        )
+        .view(*hidden_shape)
+        .transpose(1, 2)
+    )
     kv_main = _ref_apply_rotary(kv_main, cos, sin)
 
     # HCA compressor emits [B, 1, T_c, D] compressed KV entries.
@@ -400,7 +409,8 @@ def _ref_hca_forward(
         causal_threshold = (position_ids + 1) // compress_rate  # [B, S]
         block_bias = hidden_states.new_zeros((B, 1, S, t_compressed))
         block_bias = block_bias.masked_fill(
-            entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+            entry_indices.view(1, 1, 1, -1)
+            >= causal_threshold.unsqueeze(1).unsqueeze(-1),
             float("-inf"),
         )
     else:
@@ -422,7 +432,7 @@ def _ref_hca_forward(
 
     # Attention math with per-head sink (eager_attention_forward,
     # modeling_deepseek_v4.py:727-745).  scaling = head_dim ** -0.5.
-    scaling = head_dim ** -0.5
+    scaling = head_dim**-0.5
     key_states = kv_extended.expand(B, num_heads, kv_extended.shape[2], head_dim)
     value_states = key_states
     attn_weights = torch.matmul(q, key_states.transpose(2, 3)) * scaling
@@ -431,15 +441,17 @@ def _ref_hca_forward(
     sinks = attn_sink.reshape(1, -1, 1, 1).expand(q.shape[0], -1, q.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-    probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    probs = torch.nn.functional.softmax(
+        combined_logits, dim=-1, dtype=combined_logits.dtype
+    )
     scores = probs[..., :-1]
     attn_output = torch.matmul(scores.to(value_states.dtype), value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     # -sin conjugate rotation on output rope slice (HF line 868).
-    attn_output = _ref_apply_rotary(
-        attn_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+    attn_output = _ref_apply_rotary(attn_output.transpose(1, 2), cos, -sin).transpose(
+        1, 2
+    )
 
     # Grouped output projection.
     grouped = attn_output.reshape(*input_shape, o_groups, -1)
@@ -570,10 +582,7 @@ def test_hca_wrapper_matches_hf_reference_on_real_layer3_tensors() -> None:
     prefix_attn = f"layers.{_LAYER_IDX}.attn."
     expected_converted = set(
         [f"{prefix_attn}{k}" for k in nw._MQABlock.PARAM_KEYS]
-        + [
-            f"{prefix_attn}compressor.{k}"
-            for k in nw._HCACompressor.PARAM_KEYS
-        ]
+        + [f"{prefix_attn}compressor.{k}" for k in nw._HCACompressor.PARAM_KEYS]
         + [f"layers.{_LAYER_IDX}.attn_norm.weight"]
     )
     got_converted = set(converted.keys())
@@ -595,7 +604,9 @@ def test_hca_wrapper_matches_hf_reference_on_real_layer3_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"mqa.{pname}"] = tuple(tensor.shape)
@@ -608,7 +619,9 @@ def test_hca_wrapper_matches_hf_reference_on_real_layer3_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"compressor.{pname}"] = tuple(tensor.shape)
@@ -635,9 +648,7 @@ def test_hca_wrapper_matches_hf_reference_on_real_layer3_tensors() -> None:
         dtype=dtype,
     )
     n_windows = S // compress_rate
-    win_positions = (
-        torch.arange(n_windows).unsqueeze(0).expand(B, -1) * compress_rate
-    )
+    win_positions = torch.arange(n_windows).unsqueeze(0).expand(B, -1) * compress_rate
     cos_win, sin_win = nw.build_main_rope_cos_sin(
         win_positions,
         rope_dim=src.qk_rope_head_dim,

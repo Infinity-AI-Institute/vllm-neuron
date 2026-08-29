@@ -78,7 +78,6 @@ intent is byte-clean verification; a skip is louder than a false pass.
 from __future__ import annotations
 
 import json
-import os
 import struct
 import sys
 from pathlib import Path
@@ -86,7 +85,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard — same lookup convention as the FP4 / MQA / HCA tests.
@@ -118,9 +116,14 @@ def _import_library():
     try:
         from vllm_neuron.model.dsv4_flash import (  # type: ignore
             checkpoint_convert as convert,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             config as cfg,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             neuron_wrapper as nw,
         )
+
         return cfg, convert, nw
     except Exception:
         pass
@@ -180,7 +183,10 @@ _LAYER2_KEYS: tuple[str, ...] = tuple(
     + [f"layers.{_LAYER_IDX}.attn.{n}.scale" for n in _ATTN_KEYS_FP8]
     + [f"layers.{_LAYER_IDX}.attn.{n}" for n in _ATTN_KEYS_DENSE]
     + [f"layers.{_LAYER_IDX}.attn.compressor.{n}" for n in _CSA_COMPRESSOR_KEYS_DENSE]
-    + [f"layers.{_LAYER_IDX}.attn.indexer.compressor.{n}" for n in _INDEXER_COMPRESSOR_KEYS_DENSE]
+    + [
+        f"layers.{_LAYER_IDX}.attn.indexer.compressor.{n}"
+        for n in _INDEXER_COMPRESSOR_KEYS_DENSE
+    ]
     + [f"layers.{_LAYER_IDX}.attn.indexer.{n}" for n in _INDEXER_KEYS_DENSE]
     + [f"layers.{_LAYER_IDX}.attn.indexer.{n}.weight" for n in _INDEXER_KEYS_FP8]
     + [f"layers.{_LAYER_IDX}.attn.indexer.{n}.scale" for n in _INDEXER_KEYS_FP8]
@@ -211,12 +217,10 @@ def _build_local_cache() -> Path:
     """Pull the layer-2 attn+compressor+indexer tensors and repack as mini-safetensors."""
     try:
         from huggingface_hub import hf_hub_url
+
         url = hf_hub_url(_HF_REPO, _HF_SHARD, revision=_HF_SHA)
     except Exception:
-        url = (
-            f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/"
-            f"{_HF_SHARD}"
-        )
+        url = f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/{_HF_SHARD}"
 
     first = _fetch_range(url, (0, _HEADER_CHUNK_BYTES - 1))
     header_len = struct.unpack("<Q", first[:8])[0]
@@ -315,11 +319,15 @@ def _ref_apply_rotary(
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
     nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
-    rotated = ((rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)).to(x.dtype)
+    rotated = (
+        (rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)
+    ).to(x.dtype)
     return torch.cat([nope, rotated], dim=-1)
 
 
-def _ref_rms_norm_weighted(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _ref_rms_norm_weighted(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     x32 = x.to(torch.float32)
     variance = x32.pow(2).mean(-1, keepdim=True)
     x32 = x32 * torch.rsqrt(variance + eps)
@@ -331,19 +339,19 @@ def _ref_rms_norm_unweighted(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _ref_overlap_compressor_forward(
-    hidden_states: torch.Tensor,       # [B, S, hidden]
-    wkv: torch.Tensor,                 # [2*head_dim, hidden]
-    wgate: torch.Tensor,               # [2*head_dim, hidden]
-    ape: torch.Tensor,                 # [compress_rate, 2*head_dim]
-    norm_weight: torch.Tensor,         # [head_dim]
+    hidden_states: torch.Tensor,  # [B, S, hidden]
+    wkv: torch.Tensor,  # [2*head_dim, hidden]
+    wgate: torch.Tensor,  # [2*head_dim, hidden]
+    ape: torch.Tensor,  # [compress_rate, 2*head_dim]
+    norm_weight: torch.Tensor,  # [head_dim]
     *,
     compress_rate: int,
     head_dim: int,
     rms_eps: float,
-    cos_win: torch.Tensor,             # [B, n_windows, rope_dim/2]
-    sin_win: torch.Tensor,             # [B, n_windows, rope_dim/2]
-    overlap_kv_prev: torch.Tensor | None = None,   # [B, compress_rate, head_dim]
-    overlap_gate_prev: torch.Tensor | None = None, # [B, compress_rate, head_dim]
+    cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+    sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+    overlap_kv_prev: torch.Tensor | None = None,  # [B, compress_rate, head_dim]
+    overlap_gate_prev: torch.Tensor | None = None,  # [B, compress_rate, head_dim]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference CSA-style overlap compressor.
 
@@ -360,43 +368,45 @@ def _ref_overlap_compressor_forward(
         empty_state = hidden_states.new_zeros((batch, compress_rate, head_dim))
         return empty_c, empty_state, empty_state
     chunk = hidden_states[:, :usable]
-    kv = torch.nn.functional.linear(chunk, wkv)                     # [B, U, 2D]
-    gate = torch.nn.functional.linear(chunk, wgate)                 # [B, U, 2D]
+    kv = torch.nn.functional.linear(chunk, wkv)  # [B, U, 2D]
+    gate = torch.nn.functional.linear(chunk, wgate)  # [B, U, 2D]
     n_windows = usable // compress_rate
     ratio = compress_rate
     chunk_kv = kv.view(batch, n_windows, ratio, -1)
     chunk_gate = gate.view(batch, n_windows, ratio, -1) + ape
 
     new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, head_dim))
-    new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, head_dim), float("-inf"))
-    new_kv[:, :, ratio:] = chunk_kv[..., head_dim:]                # Cb → second half current window
+    new_gate = chunk_gate.new_full(
+        (batch, n_windows, 2 * ratio, head_dim), float("-inf")
+    )
+    new_kv[:, :, ratio:] = chunk_kv[..., head_dim:]  # Cb → second half current window
     new_gate[:, :, ratio:] = chunk_gate[..., head_dim:]
     if n_windows > 1:
-        new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, :head_dim]     # Ca of prior window
+        new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, :head_dim]  # Ca of prior window
         new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, :head_dim]
     if overlap_kv_prev is not None:
         new_kv[:, 0, :ratio] = overlap_kv_prev.to(new_kv.dtype)
         new_gate[:, 0, :ratio] = overlap_gate_prev.to(new_gate.dtype)
 
     softmax_w = new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)
-    compressed = (new_kv * softmax_w).sum(dim=2)                    # [B, n_win, D]
+    compressed = (new_kv * softmax_w).sum(dim=2)  # [B, n_win, D]
     compressed = _ref_rms_norm_weighted(compressed, norm_weight, rms_eps)
     compressed = _ref_apply_rotary(
         compressed.unsqueeze(1), cos_win, sin_win
-    )                                                                # [B, 1, n_win, D]
+    )  # [B, 1, n_win, D]
     new_overlap_kv = chunk_kv[:, -1, :, :head_dim].clone()
     new_overlap_gate = chunk_gate[:, -1, :, :head_dim].clone()
     return compressed, new_overlap_kv, new_overlap_gate
 
 
 def _ref_indexer_top_k(
-    hidden_states: torch.Tensor,       # [B, S, hidden]
-    q_residual: torch.Tensor,          # [B, S, q_lora_rank]
-    idx_wq_b: torch.Tensor,            # [n_heads*head_dim, q_lora_rank]
-    idx_weights_proj: torch.Tensor,    # [n_heads, hidden]
-    compressed_kv: torch.Tensor,       # [B, T, head_dim]
+    hidden_states: torch.Tensor,  # [B, S, hidden]
+    q_residual: torch.Tensor,  # [B, S, q_lora_rank]
+    idx_wq_b: torch.Tensor,  # [n_heads*head_dim, q_lora_rank]
+    idx_weights_proj: torch.Tensor,  # [n_heads, hidden]
+    compressed_kv: torch.Tensor,  # [B, T, head_dim]
     *,
-    cos_q: torch.Tensor,               # [B, S, rope_dim/2]
+    cos_q: torch.Tensor,  # [B, S, rope_dim/2]
     sin_q: torch.Tensor,
     n_heads: int,
     head_dim: int,
@@ -409,20 +419,19 @@ def _ref_indexer_top_k(
     Transcribes ``DeepseekV4Indexer.forward`` lines 563-586 + the scorer.
     """
     batch, seq, _ = hidden_states.shape
-    q_flat = torch.nn.functional.linear(q_residual, idx_wq_b)              # [B, S, H*D]
+    q_flat = torch.nn.functional.linear(q_residual, idx_wq_b)  # [B, S, H*D]
     q = q_flat.view(batch, seq, n_heads, head_dim)
     # HF applies rope on [B, H, S, D]; we transpose in-out to match.
     q = _ref_apply_rotary(q.transpose(1, 2), cos_q, sin_q).transpose(1, 2)
     # Scorer.
     q_fp32 = q.float()
-    k_fp32 = compressed_kv.transpose(-1, -2).float().unsqueeze(1)          # [B, 1, D, T]
-    scores = torch.matmul(q_fp32, k_fp32)                                  # [B, S, H, T]
-    scores = torch.nn.functional.relu(scores) * (head_dim ** -0.5)
-    weights = (
-        torch.nn.functional.linear(hidden_states, idx_weights_proj)
-        .float() * (n_heads ** -0.5)
-    )                                                                       # [B, S, H]
-    index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)             # [B, S, T]
+    k_fp32 = compressed_kv.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
+    scores = torch.matmul(q_fp32, k_fp32)  # [B, S, H, T]
+    scores = torch.nn.functional.relu(scores) * (head_dim**-0.5)
+    weights = torch.nn.functional.linear(hidden_states, idx_weights_proj).float() * (
+        n_heads**-0.5
+    )  # [B, S, H]
+    index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
 
     compressed_len = compressed_kv.shape[1]
     top_k = min(index_topk, compressed_len)
@@ -442,7 +451,7 @@ def _ref_indexer_top_k(
 
 
 def _ref_csa_forward(
-    hidden_states: torch.Tensor,     # [B, S, hidden]
+    hidden_states: torch.Tensor,  # [B, S, hidden]
     weights: dict[str, torch.Tensor],
     *,
     num_heads: int,
@@ -454,11 +463,11 @@ def _ref_csa_forward(
     index_head_dim: int,
     index_n_heads: int,
     index_topk: int,
-    position_ids: torch.Tensor,      # [B, S]
-    cos: torch.Tensor,               # [B, S, rope_dim/2]
-    sin: torch.Tensor,               # [B, S, rope_dim/2]
-    cos_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
-    sin_win: torch.Tensor,           # [B, n_windows, rope_dim/2]
+    position_ids: torch.Tensor,  # [B, S]
+    cos: torch.Tensor,  # [B, S, rope_dim/2]
+    sin: torch.Tensor,  # [B, S, rope_dim/2]
+    cos_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
+    sin_win: torch.Tensor,  # [B, n_windows, rope_dim/2]
 ) -> torch.Tensor:
     """Reference DSv4 CSA attention block forward (stateless single-shot).
 
@@ -503,16 +512,23 @@ def _ref_csa_forward(
     q = _ref_rms_norm_unweighted(q, rms_eps)
     q = _ref_apply_rotary(q, cos, sin)
 
-    kv_main = _ref_rms_norm_weighted(
-        torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
-    ).view(*hidden_shape).transpose(1, 2)
+    kv_main = (
+        _ref_rms_norm_weighted(
+            torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
+        )
+        .view(*hidden_shape)
+        .transpose(1, 2)
+    )
     kv_main = _ref_apply_rotary(kv_main, cos, sin)
 
     # CSA compressor emits [B, 1, T_c, D] + updated overlap state (unused
     # in stateless single-shot).
     compressed_kv, _, _ = _ref_overlap_compressor_forward(
         hidden_states,
-        comp_wkv, comp_wgate, comp_ape, comp_norm,
+        comp_wkv,
+        comp_wgate,
+        comp_ape,
+        comp_norm,
         compress_rate=compress_rate,
         head_dim=head_dim,
         rms_eps=rms_eps,
@@ -526,7 +542,10 @@ def _ref_csa_forward(
     # Indexer's own inner compressor at index_head_dim=128.
     idx_compressed_kv_bh, _, _ = _ref_overlap_compressor_forward(
         hidden_states,
-        idx_wkv, idx_wgate, idx_ape, idx_norm,
+        idx_wkv,
+        idx_wgate,
+        idx_ape,
+        idx_norm,
         compress_rate=compress_rate,
         head_dim=index_head_dim,
         rms_eps=rms_eps,
@@ -535,13 +554,14 @@ def _ref_csa_forward(
         overlap_kv_prev=None,
         overlap_gate_prev=None,
     )
-    idx_compressed_kv = idx_compressed_kv_bh.squeeze(1)                    # [B, T, D_idx]
+    idx_compressed_kv = idx_compressed_kv_bh.squeeze(1)  # [B, T, D_idx]
 
     # Lightning Indexer top-K.
     top_k_indices = _ref_indexer_top_k(
         hidden_states,
         q_residual,
-        idx_wq_b, idx_wproj,
+        idx_wq_b,
+        idx_wproj,
         idx_compressed_kv,
         cos_q=cos,
         sin_q=sin,
@@ -550,7 +570,7 @@ def _ref_csa_forward(
         index_topk=index_topk,
         compress_rate=compress_rate,
         position_ids=position_ids,
-    )                                                                       # [B, S, K]
+    )  # [B, S, K]
 
     # Build indexer-gated block_bias — HF lines 693-702.
     if t_compressed > 0:
@@ -558,9 +578,7 @@ def _ref_csa_forward(
         safe_indices = torch.where(
             valid, top_k_indices, torch.full_like(top_k_indices, t_compressed)
         )
-        block_bias = compressed_kv.new_full(
-            (B, 1, S, t_compressed + 1), float("-inf")
-        )
+        block_bias = compressed_kv.new_full((B, 1, S, t_compressed + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
         block_bias = block_bias[..., :t_compressed]
     else:
@@ -568,7 +586,7 @@ def _ref_csa_forward(
 
     # Cat compressed KV onto main KV, extend mask (attention_mask=None
     # here so we synthesise a zero prefix over the sliding KV region).
-    kv_extended = torch.cat([kv_main, compressed_kv], dim=2)               # [B, 1, S+T_c, D]
+    kv_extended = torch.cat([kv_main, compressed_kv], dim=2)  # [B, 1, S+T_c, D]
     if block_bias is not None:
         zeros_prefix = hidden_states.new_zeros((B, 1, S, kv_main.shape[2]))
         extended_mask = torch.cat([zeros_prefix, block_bias], dim=-1)
@@ -577,7 +595,7 @@ def _ref_csa_forward(
 
     # Attention math with per-head sink (eager_attention_forward lines
     # 727-745).
-    scaling = head_dim ** -0.5
+    scaling = head_dim**-0.5
     key_states = kv_extended.expand(B, num_heads, kv_extended.shape[2], head_dim)
     value_states = key_states
     attn_weights = torch.matmul(q, key_states.transpose(2, 3)) * scaling
@@ -586,15 +604,17 @@ def _ref_csa_forward(
     sinks = attn_sink.reshape(1, -1, 1, 1).expand(q.shape[0], -1, q.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-    probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    probs = torch.nn.functional.softmax(
+        combined_logits, dim=-1, dtype=combined_logits.dtype
+    )
     scores = probs[..., :-1]
     attn_output = torch.matmul(scores.to(value_states.dtype), value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     # -sin conjugate rotation on output rope slice (HF line 868).
-    attn_output = _ref_apply_rotary(
-        attn_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+    attn_output = _ref_apply_rotary(attn_output.transpose(1, 2), cos, -sin).transpose(
+        1, 2
+    )
 
     # Grouped output projection.
     grouped = attn_output.reshape(*input_shape, o_groups, -1)
@@ -642,10 +662,7 @@ def test_csa_wrapper_tree_key_set() -> None:
     expected = sorted(
         [f"mqa.{k}" for k in nw._MQABlock.PARAM_KEYS]
         + [f"compressor.{k}" for k in nw._CSAOverlapCompressor.PARAM_KEYS]
-        + [
-            f"indexer.compressor.{k}"
-            for k in nw._CSAOverlapCompressor.PARAM_KEYS
-        ]
+        + [f"indexer.compressor.{k}" for k in nw._CSAOverlapCompressor.PARAM_KEYS]
         + ["indexer.wq_b.weight", "indexer.weights_proj.weight"]
     )
     assert names == expected, (names, expected)
@@ -682,10 +699,26 @@ def test_csa_state_cache_specs_shape_and_dtype() -> None:
         "indexer_overlap_gate",
     ]
     shape_map = {name: shape for name, shape, _ in specs}
-    assert shape_map["compressor_overlap_kv"] == (3, src.compress_ratios[_LAYER_IDX], src.head_dim)
-    assert shape_map["compressor_overlap_gate"] == (3, src.compress_ratios[_LAYER_IDX], src.head_dim)
-    assert shape_map["indexer_overlap_kv"] == (3, src.compress_ratios[_LAYER_IDX], src.index_head_dim)
-    assert shape_map["indexer_overlap_gate"] == (3, src.compress_ratios[_LAYER_IDX], src.index_head_dim)
+    assert shape_map["compressor_overlap_kv"] == (
+        3,
+        src.compress_ratios[_LAYER_IDX],
+        src.head_dim,
+    )
+    assert shape_map["compressor_overlap_gate"] == (
+        3,
+        src.compress_ratios[_LAYER_IDX],
+        src.head_dim,
+    )
+    assert shape_map["indexer_overlap_kv"] == (
+        3,
+        src.compress_ratios[_LAYER_IDX],
+        src.index_head_dim,
+    )
+    assert shape_map["indexer_overlap_gate"] == (
+        3,
+        src.compress_ratios[_LAYER_IDX],
+        src.index_head_dim,
+    )
     dtypes = {name: dt for name, _, dt in specs}
     assert dtypes == {n: src.torch_dtype for n in shape_map}
 
@@ -719,11 +752,23 @@ def test_csa_synthetic_shape_gate() -> None:
     y, state = block(hidden, cos, sin, cos_win, sin_win, positions)
     assert tuple(y.shape) == (B, S, src.hidden_size)
     assert y.dtype == dtype
-    for k in ("compressor_overlap_kv", "compressor_overlap_gate",
-              "indexer_overlap_kv", "indexer_overlap_gate"):
+    for k in (
+        "compressor_overlap_kv",
+        "compressor_overlap_gate",
+        "indexer_overlap_kv",
+        "indexer_overlap_gate",
+    ):
         assert k in state
-    assert tuple(state["compressor_overlap_kv"].shape) == (B, block.compress_rate, src.head_dim)
-    assert tuple(state["indexer_overlap_kv"].shape) == (B, block.compress_rate, src.index_head_dim)
+    assert tuple(state["compressor_overlap_kv"].shape) == (
+        B,
+        block.compress_rate,
+        src.head_dim,
+    )
+    assert tuple(state["indexer_overlap_kv"].shape) == (
+        B,
+        block.compress_rate,
+        src.index_head_dim,
+    )
     require_comparable(
         y.detach().to(torch.float32).cpu().numpy(), "csa_synthetic_output_fp32"
     )
@@ -748,10 +793,7 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
     prefix_attn = f"layers.{_LAYER_IDX}.attn."
     expected_converted = set(
         [f"{prefix_attn}{k}" for k in nw._MQABlock.PARAM_KEYS]
-        + [
-            f"{prefix_attn}compressor.{k}"
-            for k in nw._CSAOverlapCompressor.PARAM_KEYS
-        ]
+        + [f"{prefix_attn}compressor.{k}" for k in nw._CSAOverlapCompressor.PARAM_KEYS]
         + [
             f"{prefix_attn}indexer.compressor.{k}"
             for k in nw._CSAOverlapCompressor.PARAM_KEYS
@@ -780,7 +822,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"mqa.{pname}"] = tuple(tensor.shape)
@@ -793,7 +837,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"compressor.{pname}"] = tuple(tensor.shape)
@@ -806,7 +852,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"indexer.compressor.{pname}"] = tuple(tensor.shape)
@@ -819,7 +867,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"indexer.{pname}"] = tuple(tensor.shape)
@@ -841,9 +891,7 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
         dtype=dtype,
     )
     n_windows = S // compress_rate
-    win_positions = (
-        torch.arange(n_windows).unsqueeze(0).expand(B, -1) * compress_rate
-    )
+    win_positions = torch.arange(n_windows).unsqueeze(0).expand(B, -1) * compress_rate
     cos_win, sin_win = nw.build_main_rope_cos_sin(
         win_positions,
         rope_dim=src.qk_rope_head_dim,
@@ -870,9 +918,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
             f"{prefix_attn}indexer.compressor.{pname}"
         ].to(dtype)
     for pname in ("wq_b.weight", "weights_proj.weight"):
-        ref_weights[f"indexer.{pname}"] = converted[
-            f"{prefix_attn}indexer.{pname}"
-        ].to(dtype)
+        ref_weights[f"indexer.{pname}"] = converted[f"{prefix_attn}indexer.{pname}"].to(
+            dtype
+        )
 
     with torch.no_grad():
         y_ref, ref_t_compressed, ref_top_k = _ref_csa_forward(
@@ -888,7 +936,10 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
             index_n_heads=src.index_n_heads,
             index_topk=src.index_topk,
             position_ids=positions,
-            cos=cos, sin=sin, cos_win=cos_win, sin_win=sin_win,
+            cos=cos,
+            sin=sin,
+            cos_win=cos_win,
+            sin_win=sin_win,
         )
     assert ref_t_compressed == n_windows == 4
 
@@ -921,9 +972,9 @@ def test_csa_wrapper_matches_hf_reference_on_real_layer2_tensors() -> None:
     causal_threshold = (positions + 1) // compress_rate  # [B, S]
     valid_mask = wrap_top_k >= 0
     max_causal = causal_threshold.unsqueeze(-1).expand_as(wrap_top_k)
-    assert torch.all(
-        (~valid_mask) | (wrap_top_k < max_causal)
-    ), "Lightning Indexer emitted a top-K index that violates causal_threshold"
+    assert torch.all((~valid_mask) | (wrap_top_k < max_causal)), (
+        "Lightning Indexer emitted a top-K index that violates causal_threshold"
+    )
 
     # ---- byte-clean bf16 diff on first-step output ----
     diff = (y_wrap.to(torch.float32) - y_ref.to(torch.float32)).abs()
@@ -990,9 +1041,7 @@ def test_csa_state_evolution_multi_step() -> None:
             obj = block.mqa
             for p in parts[:-1]:
                 obj = getattr(obj, p)
-            getattr(obj, parts[-1]).copy_(
-                converted[f"{prefix_attn}{pname}"].to(dtype)
-            )
+            getattr(obj, parts[-1]).copy_(converted[f"{prefix_attn}{pname}"].to(dtype))
         for pname in nw._CSAOverlapCompressor.PARAM_KEYS:
             parts = pname.split(".")
             obj = block.compressor
@@ -1025,19 +1074,27 @@ def test_csa_state_evolution_multi_step() -> None:
     # ---- Path A: full-shot compressor.compress on the entire sequence ----
     positions_full = torch.arange(S).unsqueeze(0).expand(B, -1)
     n_win_full = S // compress_rate
-    wp_full = (
-        torch.arange(n_win_full).unsqueeze(0).expand(B, -1) * compress_rate
-    )
+    wp_full = torch.arange(n_win_full).unsqueeze(0).expand(B, -1) * compress_rate
     cw_full, sw_full = nw.build_main_rope_cos_sin(
-        wp_full, rope_dim=src.qk_rope_head_dim,
-        rope_theta=src.compress_rope_theta, dtype=dtype,
+        wp_full,
+        rope_dim=src.qk_rope_head_dim,
+        rope_theta=src.compress_rope_theta,
+        dtype=dtype,
     )
     with torch.no_grad():
         comp_full, _, _ = block.compressor.compress(
-            hidden, cw_full, sw_full, overlap_kv_prev=None, overlap_gate_prev=None,
+            hidden,
+            cw_full,
+            sw_full,
+            overlap_kv_prev=None,
+            overlap_gate_prev=None,
         )
         idx_full, _, _ = block.indexer.compressor.compress(
-            hidden, cw_full, sw_full, overlap_kv_prev=None, overlap_gate_prev=None,
+            hidden,
+            cw_full,
+            sw_full,
+            overlap_kv_prev=None,
+            overlap_gate_prev=None,
         )
     assert comp_full.shape == (B, 1, n_win_full, src.head_dim)
     assert idx_full.shape == (B, 1, n_win_full, src.index_head_dim)
@@ -1052,37 +1109,52 @@ def test_csa_state_evolution_multi_step() -> None:
     S_chunk = 8
     n_win_chunk = S_chunk // compress_rate
     # Chunk 1 window positions [0, 4].
-    wp1 = (torch.arange(n_win_chunk).unsqueeze(0).expand(B, -1)
-           * compress_rate)                                    # [0, 4]
+    wp1 = torch.arange(n_win_chunk).unsqueeze(0).expand(B, -1) * compress_rate  # [0, 4]
     cw1, sw1 = nw.build_main_rope_cos_sin(
-        wp1, rope_dim=src.qk_rope_head_dim,
-        rope_theta=src.compress_rope_theta, dtype=dtype,
+        wp1,
+        rope_dim=src.qk_rope_head_dim,
+        rope_theta=src.compress_rope_theta,
+        dtype=dtype,
     )
     # Chunk 2 window positions [8, 12] (absolute).
-    wp2 = wp1 + S_chunk                                        # [8, 12]
+    wp2 = wp1 + S_chunk  # [8, 12]
     cw2, sw2 = nw.build_main_rope_cos_sin(
-        wp2, rope_dim=src.qk_rope_head_dim,
-        rope_theta=src.compress_rope_theta, dtype=dtype,
+        wp2,
+        rope_dim=src.qk_rope_head_dim,
+        rope_theta=src.compress_rope_theta,
+        dtype=dtype,
     )
     with torch.no_grad():
         # ---- outer CSA compressor split ----
         comp_c1, new_comp_kv, new_comp_gate = block.compressor.compress(
-            hidden[:, :S_chunk], cw1, sw1,
-            overlap_kv_prev=None, overlap_gate_prev=None,
+            hidden[:, :S_chunk],
+            cw1,
+            sw1,
+            overlap_kv_prev=None,
+            overlap_gate_prev=None,
         )
         comp_c2, _, _ = block.compressor.compress(
-            hidden[:, S_chunk:], cw2, sw2,
-            overlap_kv_prev=new_comp_kv, overlap_gate_prev=new_comp_gate,
+            hidden[:, S_chunk:],
+            cw2,
+            sw2,
+            overlap_kv_prev=new_comp_kv,
+            overlap_gate_prev=new_comp_gate,
         )
         comp_concat = torch.cat([comp_c1, comp_c2], dim=2)
         # ---- indexer inner compressor split ----
         idx_c1, new_idx_kv, new_idx_gate = block.indexer.compressor.compress(
-            hidden[:, :S_chunk], cw1, sw1,
-            overlap_kv_prev=None, overlap_gate_prev=None,
+            hidden[:, :S_chunk],
+            cw1,
+            sw1,
+            overlap_kv_prev=None,
+            overlap_gate_prev=None,
         )
         idx_c2, _, _ = block.indexer.compressor.compress(
-            hidden[:, S_chunk:], cw2, sw2,
-            overlap_kv_prev=new_idx_kv, overlap_gate_prev=new_idx_gate,
+            hidden[:, S_chunk:],
+            cw2,
+            sw2,
+            overlap_kv_prev=new_idx_kv,
+            overlap_gate_prev=new_idx_gate,
         )
         idx_concat = torch.cat([idx_c1, idx_c2], dim=2)
 

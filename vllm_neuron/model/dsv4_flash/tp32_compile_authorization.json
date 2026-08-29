@@ -4,8 +4,11 @@
   "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
   "config_sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
   "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+  "tokenizer_sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
   "source_tensor_count": 72317,
   "source_shard_count": 48,
+  "source_total_bytes": 166886535336,
+  "compiler_image": "public.ecr.aws/neuron/pytorch-inference-neuronx@sha256:011d49c7495457fc2932dedd3fbecf67d28833a3f12c147377cee4d72889ebc1",
   "topology": {
     "hardware": "trn2.48xlarge",
     "tp_degree": 32,

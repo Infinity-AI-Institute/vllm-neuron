@@ -18,5 +18,18 @@
     "blockwise_matmul_config": {
       "use_shard_on_intermediate_dynamic_while": true
     }
+  },
+  "emitted_contract": {
+    "rank_count": 32,
+    "rank_checkpoint_dtype": "bfloat16",
+    "compute_dtype": "bfloat16",
+    "cache_dtype": "bfloat16",
+    "fp8_kv": false,
+    "runtime_weight_quantized": false,
+    "sampler": "greedy_argmax",
+    "speculative_decode": false,
+    "mtp": false,
+    "dspark": false,
+    "max_writer_chunk_bytes": 67108864
   }
 }

@@ -38,7 +38,6 @@ network fetch cannot complete.
 from __future__ import annotations
 
 import json
-import os
 import struct
 import sys
 from pathlib import Path
@@ -46,7 +45,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard — same lookup convention as the sibling tests.
@@ -78,9 +76,14 @@ def _import_library():
     try:
         from vllm_neuron.model.dsv4_flash import (  # type: ignore
             checkpoint_convert as convert,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             config as cfg,
+        )
+        from vllm_neuron.model.dsv4_flash import (
             neuron_wrapper as nw,
         )
+
         return cfg, convert, nw
     except Exception:
         pass
@@ -151,12 +154,10 @@ def _fetch_range(url: str, byte_range: tuple[int, int]) -> bytes:
 def _build_local_cache() -> Path:
     try:
         from huggingface_hub import hf_hub_url
+
         url = hf_hub_url(_HF_REPO, _HF_SHARD, revision=_HF_SHA)
     except Exception:
-        url = (
-            f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/"
-            f"{_HF_SHARD}"
-        )
+        url = f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/{_HF_SHARD}"
 
     first = _fetch_range(url, (0, _HEADER_CHUNK_BYTES - 1))
     header_len = struct.unpack("<Q", first[:8])[0]
@@ -247,8 +248,7 @@ def _ref_apply_rotary(
     rope_dim = cos.shape[-1]
     nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
     rotated = (
-        (rope.float() * cos)
-        + (_ref_rotate_half_interleaved(rope).float() * sin)
+        (rope.float() * cos) + (_ref_rotate_half_interleaved(rope).float() * sin)
     ).to(x.dtype)
     return torch.cat([nope, rotated], dim=-1)
 
@@ -263,9 +263,7 @@ def _ref_rms_norm_weighted(
 
 
 def _ref_rms_norm_unweighted(x: torch.Tensor, eps: float) -> torch.Tensor:
-    return x * torch.rsqrt(
-        x.float().square().mean(-1, keepdim=True) + eps
-    ).to(x.dtype)
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
 
 
 def _ref_build_sliding_causal_mask(
@@ -317,17 +315,17 @@ def _ref_sliding_only_forward(
     q_residual = _ref_rms_norm_weighted(
         torch.nn.functional.linear(hidden_states, wq_a), q_norm_weight, rms_eps
     )
-    q = (
-        torch.nn.functional.linear(q_residual, wq_b)
-        .view(*hidden_shape)
-        .transpose(1, 2)
-    )
+    q = torch.nn.functional.linear(q_residual, wq_b).view(*hidden_shape).transpose(1, 2)
     q = _ref_rms_norm_unweighted(q, rms_eps)
     q = _ref_apply_rotary(q, cos, sin)
 
-    kv = _ref_rms_norm_weighted(
-        torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
-    ).view(*hidden_shape).transpose(1, 2)
+    kv = (
+        _ref_rms_norm_weighted(
+            torch.nn.functional.linear(hidden_states, wkv), kv_norm_weight, rms_eps
+        )
+        .view(*hidden_shape)
+        .transpose(1, 2)
+    )
     kv = _ref_apply_rotary(kv, cos, sin)
 
     sliding_mask = _ref_build_sliding_causal_mask(
@@ -336,18 +334,14 @@ def _ref_sliding_only_forward(
         dtype=hidden_states.dtype,
     )
 
-    scaling = head_dim ** -0.5
+    scaling = head_dim**-0.5
     key_states = kv.expand(B, num_heads, kv.shape[2], head_dim)
     value_states = key_states
     attn_weights = torch.matmul(q, key_states.transpose(2, 3)) * scaling
     attn_weights = attn_weights + sliding_mask
-    sinks = attn_sink.reshape(1, -1, 1, 1).expand(
-        q.shape[0], -1, q.shape[-2], -1
-    )
+    sinks = attn_sink.reshape(1, -1, 1, 1).expand(q.shape[0], -1, q.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-    combined_logits = combined_logits - combined_logits.max(
-        dim=-1, keepdim=True
-    ).values
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     probs = torch.nn.functional.softmax(
         combined_logits, dim=-1, dtype=combined_logits.dtype
     )
@@ -355,9 +349,9 @@ def _ref_sliding_only_forward(
     attn_output = torch.matmul(scores.to(value_states.dtype), value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
-    attn_output = _ref_apply_rotary(
-        attn_output.transpose(1, 2), cos, -sin
-    ).transpose(1, 2)
+    attn_output = _ref_apply_rotary(attn_output.transpose(1, 2), cos, -sin).transpose(
+        1, 2
+    )
 
     grouped = attn_output.reshape(*input_shape, o_groups, -1)
     n_groups = o_groups
@@ -415,9 +409,9 @@ def test_sliding_only_refuses_wrong_layer_type() -> None:
     cfg, _convert, nw = _import_library()
     src = cfg.DeepseekV4FlashInferenceConfig()
     with pytest.raises(ValueError, match="sliding_attention"):
-        nw._SlidingOnlyAttentionBlock(src, layer_idx=2)   # CSA
+        nw._SlidingOnlyAttentionBlock(src, layer_idx=2)  # CSA
     with pytest.raises(ValueError, match="sliding_attention"):
-        nw._SlidingOnlyAttentionBlock(src, layer_idx=3)   # HCA
+        nw._SlidingOnlyAttentionBlock(src, layer_idx=3)  # HCA
 
 
 def test_sliding_only_converter_refuses_wrong_layer_type() -> None:
@@ -478,7 +472,7 @@ def test_sliding_only_synthetic_shape_gate() -> None:
     cos, sin = nw.build_main_rope_cos_sin(
         positions,
         rope_dim=src.qk_rope_head_dim,
-        rope_theta=src.rope_theta,          # MAIN rope (theta=10000)
+        rope_theta=src.rope_theta,  # MAIN rope (theta=10000)
         dtype=dtype,
     )
     y = block(hidden, cos, sin, positions)
@@ -527,7 +521,9 @@ def test_sliding_only_wrapper_matches_hf_reference_on_real_layer0_tensors() -> N
                 obj = getattr(obj, p)
             param = getattr(obj, parts[-1])
             assert tuple(param.shape) == tuple(tensor.shape), (
-                pname, tuple(param.shape), tuple(tensor.shape),
+                pname,
+                tuple(param.shape),
+                tuple(tensor.shape),
             )
             param.copy_(tensor.to(dtype))
             load_report[f"mqa.{pname}"] = tuple(tensor.shape)
@@ -680,7 +676,7 @@ def test_sliding_mask_clips_beyond_window_on_real_forward() -> None:
             o_groups=src.o_groups,
             o_lora_rank=src.o_lora_rank,
             rms_eps=src.rms_norm_eps,
-            sliding_window=S,               # trivially-true window
+            sliding_window=S,  # trivially-true window
             position_ids=positions,
             cos=cos,
             sin=sin,
@@ -738,6 +734,7 @@ def _standalone_main() -> int:
             n_fail += 1
             print(f"FAIL  {name}: {exc!r}")
             import traceback
+
             traceback.print_exc()
             continue
         n_pass += 1

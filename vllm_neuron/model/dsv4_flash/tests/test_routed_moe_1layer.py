@@ -65,7 +65,6 @@ import importlib.util
 import json
 import math
 import os
-import struct
 import sys
 import types
 from pathlib import Path
@@ -73,7 +72,6 @@ from typing import Any
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Degeneracy guard — reuse the FP4 test's discovery convention.
@@ -103,12 +101,8 @@ except Exception as exc:  # pragma: no cover — surface discovery gaps
 
 _HF_REPO = "deepseek-ai/DeepSeek-V4-Flash-0731"
 _HF_SHA = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
-_INDEX_CACHE = (
-    Path(__file__).parent / ".hf_cache" / "dsv4_flash_index.json"
-)
-_EXPERT_CACHE = (
-    Path(__file__).parent / ".hf_cache" / "dsv4_expert0_w2.safetensors"
-)
+_INDEX_CACHE = Path(__file__).parent / ".hf_cache" / "dsv4_flash_index.json"
+_EXPERT_CACHE = Path(__file__).parent / ".hf_cache" / "dsv4_expert0_w2.safetensors"
 
 
 def _import_library():
@@ -120,9 +114,14 @@ def _import_library():
     is available for the router smoke without needing NxDI.
     """
     try:
+        from vllm_neuron.model.dsv4_flash import (
+            checkpoint_convert as conv_mod,  # type: ignore
+        )
         from vllm_neuron.model.dsv4_flash import config as cfg_mod  # type: ignore
-        from vllm_neuron.model.dsv4_flash import checkpoint_convert as conv_mod  # type: ignore
-        from vllm_neuron.model.dsv4_flash import neuron_wrapper as wrap_mod  # type: ignore
+        from vllm_neuron.model.dsv4_flash import (
+            neuron_wrapper as wrap_mod,  # type: ignore
+        )
+
         return cfg_mod, conv_mod, wrap_mod
     except Exception:
         pass
@@ -157,9 +156,7 @@ def _import_library():
     try:
         wrap_mod = _load("neuron_wrapper")
     except Exception as exc:
-        pytest.skip(
-            f"neuron_wrapper unimportable even on CPU-only path: {exc!r}"
-        )
+        pytest.skip(f"neuron_wrapper unimportable even on CPU-only path: {exc!r}")
     return cfg_mod, conv_mod, wrap_mod
 
 
@@ -180,12 +177,11 @@ def _fetch_index() -> dict[str, Any] | None:
             _INDEX_CACHE.unlink(missing_ok=True)  # corrupt, refetch
 
     try:
-        from huggingface_hub import hf_hub_url
         import urllib.request
 
-        url = hf_hub_url(
-            _HF_REPO, "model.safetensors.index.json", revision=_HF_SHA
-        )
+        from huggingface_hub import hf_hub_url
+
+        url = hf_hub_url(_HF_REPO, "model.safetensors.index.json", revision=_HF_SHA)
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "vllm_neuron.dsv4_flash.tests/1.0"},
@@ -246,9 +242,9 @@ def _synth_expert_layer_state_dict(
     # raw byte 127 (multiplier 2**0 = 1.0) — that keeps the dequant path
     # exercised without needing to hunt for a real FP8 scale distribution.
     def _synth_fp8(out: int, in_: int) -> tuple[torch.Tensor, torch.Tensor]:
-        values = (
-            torch.empty(out, in_, dtype=torch.float32).uniform_(-0.5, 0.5)
-        ).to(torch.float8_e4m3fn)
+        values = (torch.empty(out, in_, dtype=torch.float32).uniform_(-0.5, 0.5)).to(
+            torch.float8_e4m3fn
+        )
         scale = torch.full(
             (math.ceil(out / 128), math.ceil(in_ / 128)),
             127,
@@ -301,9 +297,9 @@ def _synth_expert_layer_state_dict(
                 122, 132, (out_dim, nblk), dtype=torch.uint8, generator=g
             ).contiguous()
 
-        w1_packed = _packed(inter, hidden // 2)      # [I, H/2]
-        w3_packed = _packed(inter, hidden // 2)      # [I, H/2]
-        w2_packed = _packed(hidden, inter // 2)      # [H, I/2]
+        w1_packed = _packed(inter, hidden // 2)  # [I, H/2]
+        w3_packed = _packed(inter, hidden // 2)  # [I, H/2]
+        w2_packed = _packed(hidden, inter // 2)  # [H, I/2]
         sd[f"{base_e}w1.weight"] = w1_packed
         sd[f"{base_e}w1.scale"] = _scale(inter, hidden)
         sd[f"{base_e}w3.weight"] = w3_packed
@@ -354,9 +350,7 @@ def test_router_topk_shape_and_range() -> None:
     for t in range(4):
         row = indices[t].tolist()
         assert len(set(row)) == top_k, (t, row)
-    require_comparable(
-        affinities.detach().cpu().numpy(), "router_affinities"
-    )
+    require_comparable(affinities.detach().cpu().numpy(), "router_affinities")
 
 
 def test_router_matches_hf_reference() -> None:
@@ -523,7 +517,7 @@ def test_synth_layer3_convert_and_stack_shapes() -> None:
         f"layers.{L}.mlp.expert_mlps.mlp_op.gate_up_proj.weight",
         f"layers.{L}.mlp.expert_mlps.mlp_op.down_proj.weight",
     }
-    tensor_keys = {k for k in converted.keys() if not k.startswith("_")}
+    tensor_keys = {k for k in converted if not k.startswith("_")}
     missing = expected_moe_keys - tensor_keys
     extra = tensor_keys - expected_moe_keys
     assert not missing, sorted(missing)
@@ -576,15 +570,13 @@ def test_synth_layer3_convert_and_stack_shapes() -> None:
         if gu_max <= 0.0 or gu_std <= 1e-5:
             n_gu_fail += 1
             raise AssertionError(
-                f"gate_up_proj expert {e} degenerate: "
-                f"max_abs={gu_max}, std={gu_std}"
+                f"gate_up_proj expert {e} degenerate: max_abs={gu_max}, std={gu_std}"
             )
         n_gu_pass += 1
         if d_max <= 0.0 or d_std <= 1e-5:
             n_d_fail += 1
             raise AssertionError(
-                f"down_proj expert {e} degenerate: "
-                f"max_abs={d_max}, std={d_std}"
+                f"down_proj expert {e} degenerate: max_abs={d_max}, std={d_std}"
             )
         n_d_pass += 1
     assert n_gu_fail == 0
@@ -709,11 +701,11 @@ def _standalone_main() -> int:
         name = fn.__name__
         try:
             fn()
-        except pytest.skip.Exception as skip_exc:  # noqa: F401
+        except pytest.skip.Exception as skip_exc:
             n_skip += 1
             print(f"SKIP  {name}: {skip_exc}")
             continue
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             n_fail += 1
             print(f"FAIL  {name}: {exc!r}")
             import traceback

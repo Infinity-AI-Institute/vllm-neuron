@@ -139,16 +139,14 @@ def main(argv: list[str] | None = None) -> int:
 
             store = load_file(args.hf_shard)
             fp8_key = None
-            for key in store.keys():
+            for key in store:
                 if key.endswith(".weight") and (key + SCALE_SUFFIX) in store:
                     weight = store[key]
                     if weight.dtype == torch.float8_e4m3fn:
                         fp8_key = key
                         break
             if fp8_key is None:
-                raise RuntimeError(
-                    f"no FP8-e4m3 weight+scale pair in {args.hf_shard}"
-                )
+                raise RuntimeError(f"no FP8-e4m3 weight+scale pair in {args.hf_shard}")
             weight = store[fp8_key]
             scale = store[fp8_key + SCALE_SUFFIX]
             receipt["hf_shard"] = args.hf_shard

@@ -42,8 +42,8 @@ from typing import Any
 import torch
 
 from .config import (
-    DeepseekV4FlashInferenceConfig,
     HF_SNAPSHOT_SHA,
+    DeepseekV4FlashInferenceConfig,
     ue8m0_scale_to_fp32_multiplier,
     validate_ue8m0_scale,
 )
@@ -85,8 +85,22 @@ _LAYER_RE = re.compile(r"^layers\.(\d+)\.(.*)$")
 # Positive codes 0..7 are the first half, negative codes 8..15 are the
 # second half (sign bit = MSB of the nibble).
 _FP4_E2M1_TABLE = (
-    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
-    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 # mHC parameters whose names contain "scale" but are NOT block scales.
@@ -185,9 +199,7 @@ def dequantize_block_fp8_ue8m0(
         )
     value = weight_fp8.to(torch.float32)
     scale_fp32 = ue8m0_scale_to_fp32_multiplier(scale_exp)
-    scale = _broadcast_block_scale(
-        scale_fp32, block_size, out_features, in_features
-    )
+    scale = _broadcast_block_scale(scale_fp32, block_size, out_features, in_features)
     return (value * scale).to(out_dtype)
 
 
@@ -327,9 +339,7 @@ def dequantize_block_fp4_ue8m0(
     scale_fp32 = ue8m0_scale_to_fp32_multiplier(scale_exp)
 
     # 3. Broadcast the block scale over its tile and multiply.
-    scale = _broadcast_block_scale(
-        scale_fp32, block_size, out_features, in_features
-    )
+    scale = _broadcast_block_scale(scale_fp32, block_size, out_features, in_features)
     result = fp4_fp32 * scale
 
     # 4. Cast to the requested output dtype.  For bf16 the cast is lossless
@@ -415,9 +425,7 @@ def _dequant_or_cast(
         return None
     if dtype_hint in ("bf16", "fp32"):
         if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise ValueError(
-                f"{key} is FP8 but declared bf16/fp32 in the layout map"
-            )
+            raise ValueError(f"{key} is FP8 but declared bf16/fp32 in the layout map")
         return weight.to(out_dtype)
     scale = state_dict.get(f"{key}{SCALE_SUFFIX}")
     if scale is None:
@@ -473,12 +481,8 @@ def _dequant_expert_fp4_weight(
     scale_key = _dsv4_scale_key_for(key)
     scale = state_dict.get(scale_key)
     if scale is None:
-        raise KeyError(
-            f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}"
-        )
-    return dequantize_block_fp4_ue8m0(
-        weight, scale, DSV4_FP4_BLOCK_SIZE, out_dtype
-    )
+        raise KeyError(f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}")
+    return dequantize_block_fp4_ue8m0(weight, scale, DSV4_FP4_BLOCK_SIZE, out_dtype)
 
 
 def _dequant_shared_fp8_weight(
@@ -500,9 +504,7 @@ def _dequant_shared_fp8_weight(
     scale_key = _dsv4_scale_key_for(key)
     scale = state_dict.get(scale_key)
     if scale is None:
-        raise KeyError(
-            f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}"
-        )
+        raise KeyError(f"missing paired UE8M0 block-scale {scale_key!r} for {key!r}")
     return dequantize_block_fp8_ue8m0(weight, scale, block_size, out_dtype)
 
 
@@ -531,12 +533,8 @@ def _convert_shared_expert(
     )
     for hf_name, wrapper_name in hf_map:
         key = f"{hf_base}{FFN_PREFIX}{SHARED_EXPERTS_SUBTREE}.{hf_name}.weight"
-        tensor = _dequant_shared_fp8_weight(
-            state_dict, key, block_size_fp8, dtype
-        )
-        converted[f"{wrapper_target}shared_expert.{wrapper_name}.weight"] = (
-            tensor
-        )
+        tensor = _dequant_shared_fp8_weight(state_dict, key, block_size_fp8, dtype)
+        converted[f"{wrapper_target}shared_expert.{wrapper_name}.weight"] = tensor
 
 
 def _convert_routed_moe_layer(
@@ -655,15 +653,9 @@ def _convert_routed_moe_layer(
     down_stack: list[torch.Tensor] = []
     for e in experts:
         base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
-        gate = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w1.weight", dtype
-        )
-        up = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w3.weight", dtype
-        )
-        down = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w2.weight", dtype
-        )
+        gate = _dequant_expert_fp4_weight(state_dict, f"{base_e}w1.weight", dtype)
+        up = _dequant_expert_fp4_weight(state_dict, f"{base_e}w3.weight", dtype)
+        down = _dequant_expert_fp4_weight(state_dict, f"{base_e}w2.weight", dtype)
         if tuple(gate.shape) != (inter, hidden):
             raise ValueError(
                 f"expert {e} w1 (gate) shape {tuple(gate.shape)} != "
@@ -684,17 +676,15 @@ def _convert_routed_moe_layer(
         down_stack.append(down)
 
     # Stack along the new leading expert axis.
-    gate_stacked = torch.stack(gate_stack, dim=0)      # [E, I, H]
-    up_stacked = torch.stack(up_stack, dim=0)          # [E, I, H]
-    down_stacked = torch.stack(down_stack, dim=0)      # [E, H, I]
+    gate_stacked = torch.stack(gate_stack, dim=0)  # [E, I, H]
+    up_stacked = torch.stack(up_stack, dim=0)  # [E, I, H]
+    down_stacked = torch.stack(down_stack, dim=0)  # [E, H, I]
     # Fuse gate|up on the intermediate axis, then transpose to [E, H, 2I].
     gate_up_stacked = torch.cat([gate_stacked, up_stacked], dim=1)  # [E, 2I, H]
     gate_up_stacked = gate_up_stacked.transpose(1, 2).contiguous()  # [E, H, 2I]
-    down_stacked = down_stacked.transpose(1, 2).contiguous()        # [E, I, H]
+    down_stacked = down_stacked.transpose(1, 2).contiguous()  # [E, I, H]
 
-    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = (
-        gate_up_stacked
-    )
+    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_stacked
     converted[f"{target}expert_mlps.mlp_op.down_proj.weight"] = down_stacked
 
     report = {
@@ -856,15 +846,9 @@ def _convert_hash_moe_block(
     down_stack: list[torch.Tensor] = []
     for e in experts:
         base_e = f"{hf_base}{FFN_PREFIX}{ROUTED_EXPERTS_SUBTREE}.{e}."
-        gate = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w1.weight", dtype
-        )
-        up = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w3.weight", dtype
-        )
-        down = _dequant_expert_fp4_weight(
-            state_dict, f"{base_e}w2.weight", dtype
-        )
+        gate = _dequant_expert_fp4_weight(state_dict, f"{base_e}w1.weight", dtype)
+        up = _dequant_expert_fp4_weight(state_dict, f"{base_e}w3.weight", dtype)
+        down = _dequant_expert_fp4_weight(state_dict, f"{base_e}w2.weight", dtype)
         if tuple(gate.shape) != (inter, hidden):
             raise ValueError(
                 f"expert {e} w1 (gate) shape {tuple(gate.shape)} != "
@@ -884,16 +868,14 @@ def _convert_hash_moe_block(
         up_stack.append(up)
         down_stack.append(down)
 
-    gate_stacked = torch.stack(gate_stack, dim=0)         # [E, I, H]
-    up_stacked = torch.stack(up_stack, dim=0)             # [E, I, H]
-    down_stacked = torch.stack(down_stack, dim=0)         # [E, H, I]
+    gate_stacked = torch.stack(gate_stack, dim=0)  # [E, I, H]
+    up_stacked = torch.stack(up_stack, dim=0)  # [E, I, H]
+    down_stacked = torch.stack(down_stack, dim=0)  # [E, H, I]
     gate_up_stacked = torch.cat([gate_stacked, up_stacked], dim=1)  # [E, 2I, H]
     gate_up_stacked = gate_up_stacked.transpose(1, 2).contiguous()  # [E, H, 2I]
-    down_stacked = down_stacked.transpose(1, 2).contiguous()        # [E, I, H]
+    down_stacked = down_stacked.transpose(1, 2).contiguous()  # [E, I, H]
 
-    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = (
-        gate_up_stacked
-    )
+    converted[f"{target}expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_stacked
     converted[f"{target}expert_mlps.mlp_op.down_proj.weight"] = down_stacked
 
     report = {
@@ -1169,12 +1151,8 @@ def _convert_hca_block(
     # on disk in the pinned snapshot (verified against shard 00005-of-00048
     # header — see source-cited layout comment above); we cast to the
     # wrapper's module dtype without dequant.
-    hf_base = (
-        f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
-    )
-    target = (
-        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
-    )
+    hf_base = f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    target = f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
     expected_compressor_shapes: dict[str, tuple[int, ...]] = {
         "wkv.weight": (head_dim, hidden),
         "wgate.weight": (head_dim, hidden),
@@ -1318,8 +1296,7 @@ def _convert_csa_block(
     ratio = int(src.compress_ratios[layer_idx])
     if ratio != 4:
         raise ValueError(
-            f"_convert_csa_block requires compress_ratios[{layer_idx}]=4; "
-            f"got {ratio}."
+            f"_convert_csa_block requires compress_ratios[{layer_idx}]=4; got {ratio}."
         )
     dtype = dtype if dtype is not None else src.torch_dtype
     hidden = int(src.hidden_size)
@@ -1341,12 +1318,8 @@ def _convert_csa_block(
     )
 
     # 2. CSA outer compressor subtree — 4 tensors, all dense on disk.
-    hf_comp = (
-        f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
-    )
-    tgt_comp = (
-        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
-    )
+    hf_comp = f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
+    tgt_comp = f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{COMPRESSOR_PREFIX}"
     csa_expected: dict[str, tuple[int, ...]] = {
         "wkv.weight": (2 * head_dim, hidden),
         "wgate.weight": (2 * head_dim, hidden),
@@ -1405,17 +1378,14 @@ def _convert_csa_block(
 
     # 4. Indexer's dense per-head weight projection — `weights_proj.weight`.
     hf_idx = f"{hf_prefix}layers.{layer_idx}.{ATTN_PREFIX}{INDEXER_PREFIX}"
-    tgt_idx = (
-        f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{INDEXER_PREFIX}"
-    )
+    tgt_idx = f"{wrapper_prefix}layers.{layer_idx}.{ATTN_PREFIX}{INDEXER_PREFIX}"
     wproj_shape = (index_n_heads, hidden)
     for name in _INDEXER_DENSE_NAMES:
         hf_key = f"{hf_idx}{name}"
         raw = state_dict.get(hf_key)
         if raw is None:
             raise KeyError(
-                f"missing indexer dense tensor {hf_key!r} for layer "
-                f"{layer_idx}"
+                f"missing indexer dense tensor {hf_key!r} for layer {layer_idx}"
             )
         if tuple(raw.shape) != wproj_shape:
             raise ValueError(
@@ -1582,14 +1552,10 @@ def _convert_dsv4_checkpoint(
             )
             attn_key_count = 8
         elif layer_type == "compressed_sparse_attention":
-            attn_converted = _convert_csa_block(
-                state_dict, layer_idx, src, dtype=dtype
-            )
+            attn_converted = _convert_csa_block(state_dict, layer_idx, src, dtype=dtype)
             attn_key_count = 18
         elif layer_type == "heavily_compressed_attention":
-            attn_converted = _convert_hca_block(
-                state_dict, layer_idx, src, dtype=dtype
-            )
+            attn_converted = _convert_hca_block(state_dict, layer_idx, src, dtype=dtype)
             attn_key_count = 12
         else:
             raise ValueError(
@@ -1611,19 +1577,14 @@ def _convert_dsv4_checkpoint(
             )
         if tuple(ffn_norm_raw.shape) != (hidden,):
             raise ValueError(
-                f"{ffn_norm_hf!r} shape {tuple(ffn_norm_raw.shape)} != "
-                f"({hidden},)"
+                f"{ffn_norm_hf!r} shape {tuple(ffn_norm_raw.shape)} != ({hidden},)"
             )
-        converted[f"layers.{layer_idx}.ffn_norm.weight"] = (
-            ffn_norm_raw.to(dtype)
-        )
+        converted[f"layers.{layer_idx}.ffn_norm.weight"] = ffn_norm_raw.to(dtype)
 
         # MLP subtree — hash-MoE for the bootstrap layers, routed-MoE
         # for the rest.  Both helpers emit 7 wrapper-tree keys.
         if mlp_type == "hash_moe":
-            _convert_hash_moe_block(
-                state_dict, converted, layer_idx, src, dtype=dtype
-            )
+            _convert_hash_moe_block(state_dict, converted, layer_idx, src, dtype=dtype)
             mlp_key_count = 7
         elif mlp_type == "moe":
             _convert_routed_moe_layer(
@@ -1649,7 +1610,7 @@ def _convert_dsv4_checkpoint(
         }
 
     # ---- dropped-tensor bookkeeping ----
-    for key in state_dict.keys():
+    for key in state_dict:
         if is_mtp_key(key):
             dropped_mtp.append(key)
         elif is_dspark_key(key):
@@ -1658,9 +1619,7 @@ def _convert_dsv4_checkpoint(
     # Sanity: converted keys should be exactly 1024 for the full-shape
     # frozen schedule (3 top-level + 1021 per-layer).  A caller running
     # on `allow_reduced_shapes=True` fixtures skips this check.
-    non_report_keys = [
-        k for k in converted.keys() if not k.startswith("_")
-    ]
+    non_report_keys = [k for k in converted if not k.startswith("_")]
     if not getattr(src, "allow_reduced_shapes", False):
         expected_total = 3 + sum(
             r["total_layer_key_count"] for r in per_layer_report.values()
@@ -1691,7 +1650,6 @@ __all__ = [
     "ATTN_NORM_KEY",
     "ATTN_PREFIX",
     "COMPRESSOR_PREFIX",
-    "INDEXER_PREFIX",
     "DSV4_FP4_BLOCK_SIZE",
     "EMBED_KEY",
     "EXPECTED_HF_TENSOR_COUNT",
@@ -1701,6 +1659,7 @@ __all__ = [
     "FINAL_NORM_KEY",
     "HASH_TID2EID_KEY",
     "HC_PARAM_SUFFIXES",
+    "INDEXER_PREFIX",
     "LM_HEAD_KEY",
     "ROUTED_EXPERTS_SUBTREE",
     "ROUTER_CORRECTION_BIAS_KEY",
@@ -1708,8 +1667,8 @@ __all__ = [
     "SCALE_SUFFIX",
     "SHARED_EXPERTS_SUBTREE",
     "TEXT_LAYER_PREFIX",
-    "_FP4_E2M1_TABLE",
     "_CSA_COMPRESSOR_DENSE_NAMES",
+    "_FP4_E2M1_TABLE",
     "_HCA_COMPRESSOR_DENSE_NAMES",
     "_INDEXER_COMPRESSOR_DENSE_NAMES",
     "_INDEXER_DENSE_NAMES",

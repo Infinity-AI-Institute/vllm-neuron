@@ -19,15 +19,12 @@ this port refuses to inherit.  See user memory
 
 from __future__ import annotations
 
-import os
-from typing import Any
-
-import torch.nn as nn
+from torch import nn
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
-from .config import DeepseekV4FlashInferenceConfig, HF_SNAPSHOT_SHA
+from .config import HF_SNAPSHOT_SHA, DeepseekV4FlashInferenceConfig
 
 DSV4_ARTIFACT_VERSION = "dsv4-flash-trn2-v0-scaffold"
 
@@ -97,9 +94,7 @@ class DeepseekV4FlashForCausalLM(nn.Module):
         except ImportError:  # pragma: no cover - CPU-only guard
             get_platform_target = None
         if get_platform_target is not None and get_platform_target() != "trn2":
-            raise ValueError(
-                "DeepSeek-V4-Flash is currently qualified only for Trn2"
-            )
+            raise ValueError("DeepSeek-V4-Flash is currently qualified only for Trn2")
 
         # Architecture identity — refuses out-of-band clones with different
         # constants.  Reads the same "frozen fields" the GLM-5.2 factory does.
@@ -221,11 +216,13 @@ class DeepseekV4FlashForCausalLM(nn.Module):
             "mlp_dp_size",
         ):
             if getattr(neuron_config, field_, 1) != 1:
-                raise ValueError(f"DeepSeek-V4-Flash does not yet support {field_} != 1")
+                raise ValueError(
+                    f"DeepSeek-V4-Flash does not yet support {field_} != 1"
+                )
 
 
 __all__ = [
     "DSV4_ARTIFACT_VERSION",
-    "DeepseekV4FlashForCausalLM",
     "FORBIDDEN_FP8_KV_KEYS",
+    "DeepseekV4FlashForCausalLM",
 ]

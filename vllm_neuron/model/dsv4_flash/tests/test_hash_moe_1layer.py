@@ -86,7 +86,6 @@ from typing import Any
 import pytest
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Degeneracy guard — same discovery convention as the other DSv4 tests.
 # ---------------------------------------------------------------------------
@@ -135,9 +134,14 @@ def _import_library():
     on CPU-only laptops without the ``vllm`` package.
     """
     try:
+        from vllm_neuron.model.dsv4_flash import (
+            checkpoint_convert as conv_mod,  # type: ignore
+        )
         from vllm_neuron.model.dsv4_flash import config as cfg_mod  # type: ignore
-        from vllm_neuron.model.dsv4_flash import checkpoint_convert as conv_mod  # type: ignore
-        from vllm_neuron.model.dsv4_flash import neuron_wrapper as wrap_mod  # type: ignore
+        from vllm_neuron.model.dsv4_flash import (
+            neuron_wrapper as wrap_mod,  # type: ignore
+        )
+
         return cfg_mod, conv_mod, wrap_mod
     except Exception:
         pass
@@ -167,9 +171,7 @@ def _import_library():
     try:
         wrap_mod = _load("neuron_wrapper")
     except Exception as exc:
-        pytest.skip(
-            f"neuron_wrapper unimportable even on CPU-only path: {exc!r}"
-        )
+        pytest.skip(f"neuron_wrapper unimportable even on CPU-only path: {exc!r}")
     return cfg_mod, conv_mod, wrap_mod
 
 
@@ -190,12 +192,11 @@ def _fetch_index() -> dict[str, Any] | None:
             _INDEX_CACHE.unlink(missing_ok=True)  # corrupt, refetch
 
     try:
-        from huggingface_hub import hf_hub_url
         import urllib.request
 
-        url = hf_hub_url(
-            _HF_REPO, "model.safetensors.index.json", revision=_HF_SHA
-        )
+        from huggingface_hub import hf_hub_url
+
+        url = hf_hub_url(_HF_REPO, "model.safetensors.index.json", revision=_HF_SHA)
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "vllm_neuron.dsv4_flash.tests.hash_moe/1.0"},
@@ -241,12 +242,10 @@ def _build_local_cache_router_and_tid2eid() -> Path:
     """
     try:
         from huggingface_hub import hf_hub_url
+
         url = hf_hub_url(_HF_REPO, _HF_SHARD, revision=_HF_SHA)
     except Exception:
-        url = (
-            f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/"
-            f"{_HF_SHARD}"
-        )
+        url = f"https://huggingface.co/{_HF_REPO}/resolve/{_HF_SHA}/{_HF_SHARD}"
 
     first = _fetch_range(url, (0, _HEADER_CHUNK_BYTES - 1))
     header_len = struct.unpack("<Q", first[:8])[0]
@@ -379,9 +378,9 @@ def _synth_hash_moe_state_dict(
 
     # Shared expert: 3 x FP8 e4m3 tensors with UE8M0 block-scale (128, 128).
     def _synth_fp8(out: int, in_: int) -> tuple[torch.Tensor, torch.Tensor]:
-        values = (
-            torch.empty(out, in_, dtype=torch.float32).uniform_(-0.5, 0.5)
-        ).to(torch.float8_e4m3fn)
+        values = (torch.empty(out, in_, dtype=torch.float32).uniform_(-0.5, 0.5)).to(
+            torch.float8_e4m3fn
+        )
         scale = torch.full(
             (math.ceil(out / 128), math.ceil(in_ / 128)),
             127,
@@ -470,9 +469,7 @@ def test_hash_route_affinities_shape_and_range() -> None:
     ref_indices = tid2eid.to(torch.long)[input_ids.reshape(-1)]
     assert torch.equal(indices, ref_indices), (indices, ref_indices)
 
-    require_comparable(
-        affinities.detach().cpu().numpy(), "hash_route_affinities"
-    )
+    require_comparable(affinities.detach().cpu().numpy(), "hash_route_affinities")
 
 
 def test_hash_route_refuses_wrong_scoring_func() -> None:
@@ -484,7 +481,9 @@ def test_hash_route_refuses_wrong_scoring_func() -> None:
     hidden = src.hidden_size
     router_weight = torch.randn(src.n_routed_experts, hidden)
     tid2eid = torch.randint(
-        0, src.n_routed_experts, (src.vocab_size, src.num_experts_per_tok),
+        0,
+        src.n_routed_experts,
+        (src.vocab_size, src.num_experts_per_tok),
         dtype=torch.int32,
     )
     with pytest.raises(NotImplementedError, match="sqrtsoftplus"):
@@ -505,7 +504,9 @@ def test_hash_route_refuses_out_of_range_input_ids() -> None:
     hidden = src.hidden_size
     router_weight = torch.randn(src.n_routed_experts, hidden)
     tid2eid = torch.randint(
-        0, src.n_routed_experts, (src.vocab_size, src.num_experts_per_tok),
+        0,
+        src.n_routed_experts,
+        (src.vocab_size, src.num_experts_per_tok),
         dtype=torch.int32,
     )
     hidden_states = torch.randn(1, 1, hidden)
@@ -513,14 +514,20 @@ def test_hash_route_refuses_out_of_range_input_ids() -> None:
     bad_ids = torch.tensor([[src.vocab_size]], dtype=torch.int64)
     with pytest.raises(ValueError, match="out of vocab range"):
         wrap.dsv4_hash_route_affinities(
-            hidden_states, router_weight, tid2eid, bad_ids,
+            hidden_states,
+            router_weight,
+            tid2eid,
+            bad_ids,
             scoring_func=src.scoring_func,
         )
     # Negative
     bad_ids2 = torch.tensor([[-1]], dtype=torch.int64)
     with pytest.raises(ValueError, match="out of vocab range"):
         wrap.dsv4_hash_route_affinities(
-            hidden_states, router_weight, tid2eid, bad_ids2,
+            hidden_states,
+            router_weight,
+            tid2eid,
+            bad_ids2,
             scoring_func=src.scoring_func,
         )
 
@@ -549,15 +556,11 @@ def test_hash_moe_wrapper_tree_key_set() -> None:
     assert len(nw._HashMoEBlock.PARAM_KEYS) == 7
     # tid2eid dtype and shape sanity.
     assert block.tid2eid.dtype == torch.int32
-    assert tuple(block.tid2eid.shape) == (
-        src.vocab_size, src.num_experts_per_tok
-    )
+    assert tuple(block.tid2eid.shape) == (src.vocab_size, src.num_experts_per_tok)
     # Router lives in fp32 (numerical rationale documented on the class).
     assert block.router.weight.dtype == torch.float32
     # No e_score_correction_bias in hash mode.
-    assert not any(
-        "e_score_correction_bias" in n for n, _ in block.named_parameters()
-    )
+    assert not any("e_score_correction_bias" in n for n, _ in block.named_parameters())
 
 
 def test_hash_moe_block_refuses_wrong_layer_type() -> None:
@@ -667,14 +670,14 @@ def test_synth_layer0_convert_shape_and_keys() -> None:
     dn = converted[f"{target}expert_mlps.mlp_op.down_proj.weight"]
     tid = converted[f"{target}tid2eid"]
     assert tuple(gu.shape) == (
-        n_experts, src.hidden_size, 2 * src.moe_intermediate_size
+        n_experts,
+        src.hidden_size,
+        2 * src.moe_intermediate_size,
     ), gu.shape
-    assert tuple(dn.shape) == (
-        n_experts, src.moe_intermediate_size, src.hidden_size
-    ), dn.shape
-    assert tuple(tid.shape) == (
-        src.vocab_size, src.num_experts_per_tok
-    ), tid.shape
+    assert tuple(dn.shape) == (n_experts, src.moe_intermediate_size, src.hidden_size), (
+        dn.shape
+    )
+    assert tuple(tid.shape) == (src.vocab_size, src.num_experts_per_tok), tid.shape
     assert tid.dtype == torch.int32, tid.dtype
 
     # Every expert's contribution to both stacked tensors is non-degenerate.
@@ -711,9 +714,7 @@ def test_converter_refuses_wrong_layer_type() -> None:
     src = cfg.DeepseekV4FlashInferenceConfig()
     sd: dict[str, Any] = {}
     with pytest.raises(ValueError, match="hash_moe"):
-        conv._convert_hash_moe_block(
-            sd, {}, layer_idx=3, src=src, dtype=torch.bfloat16
-        )
+        conv._convert_hash_moe_block(sd, {}, layer_idx=3, src=src, dtype=torch.bfloat16)
 
 
 def test_converter_refuses_router_bias_at_hash_layer() -> None:
@@ -734,11 +735,11 @@ def test_converter_refuses_router_bias_at_hash_layer() -> None:
     )
     sd = _synth_hash_moe_state_dict(0, src)
     # Inject the forbidden bias key.
-    sd["layers.0.ffn.gate.bias"] = torch.zeros(src.n_routed_experts, dtype=torch.float32)
+    sd["layers.0.ffn.gate.bias"] = torch.zeros(
+        src.n_routed_experts, dtype=torch.float32
+    )
     with pytest.raises(ValueError, match="Gate.bias=None"):
-        conv._convert_hash_moe_block(
-            sd, {}, layer_idx=0, src=src, dtype=torch.bfloat16
-        )
+        conv._convert_hash_moe_block(sd, {}, layer_idx=0, src=src, dtype=torch.bfloat16)
 
 
 def _reduced_config(cfg_mod):
@@ -774,9 +775,7 @@ def test_hash_moe_wrapper_matches_reference_synthetic() -> None:
     block = nw._HashMoEBlock(src, layer_idx=0)
     torch.manual_seed(0)
     with torch.no_grad():
-        block.router.weight.copy_(
-            torch.randn_like(block.router.weight) * 0.02
-        )
+        block.router.weight.copy_(torch.randn_like(block.router.weight) * 0.02)
         block.tid2eid.copy_(
             torch.randint(
                 0,
@@ -786,14 +785,10 @@ def test_hash_moe_wrapper_matches_reference_synthetic() -> None:
             )
         )
         block.expert_mlps.mlp_op.gate_up_proj.weight.copy_(
-            torch.randn_like(
-                block.expert_mlps.mlp_op.gate_up_proj.weight
-            ) * 0.02
+            torch.randn_like(block.expert_mlps.mlp_op.gate_up_proj.weight) * 0.02
         )
         block.expert_mlps.mlp_op.down_proj.weight.copy_(
-            torch.randn_like(
-                block.expert_mlps.mlp_op.down_proj.weight
-            ) * 0.02
+            torch.randn_like(block.expert_mlps.mlp_op.down_proj.weight) * 0.02
         )
         for lin in (
             block.shared_expert.gate_proj,
@@ -803,9 +798,7 @@ def test_hash_moe_wrapper_matches_reference_synthetic() -> None:
             lin.weight.copy_(torch.randn_like(lin.weight) * 0.02)
 
     hidden_states = torch.randn(2, 5, src.hidden_size, dtype=torch.bfloat16) * 0.1
-    input_ids = torch.randint(
-        0, src.vocab_size, (2, 5), dtype=torch.int32
-    )
+    input_ids = torch.randint(0, src.vocab_size, (2, 5), dtype=torch.int32)
     with torch.no_grad():
         y_wrap = block(hidden_states, input_ids)
         y_ref = nw.dsv4_reference_hash_moe_forward(
@@ -831,9 +824,7 @@ def test_hash_moe_wrapper_matches_reference_synthetic() -> None:
         y_ref.detach().to(torch.float32).cpu().numpy(),
         "hash_moe_reference_output_synth",
     )
-    diff = (
-        y_wrap.to(torch.float32) - y_ref.to(torch.float32)
-    ).abs()
+    diff = (y_wrap.to(torch.float32) - y_ref.to(torch.float32)).abs()
     max_abs = float(diff.max().item())
     mean_abs = float(diff.mean().item())
     print(
@@ -867,9 +858,7 @@ def test_input_ids_side_channel_actually_routes() -> None:
     block = nw._HashMoEBlock(src, layer_idx=0)
     torch.manual_seed(5)
     with torch.no_grad():
-        block.router.weight.copy_(
-            torch.randn_like(block.router.weight) * 0.02
-        )
+        block.router.weight.copy_(torch.randn_like(block.router.weight) * 0.02)
         # Deterministic tid2eid so we can predict what a flip does.
         block.tid2eid.copy_(
             torch.randint(
@@ -880,14 +869,10 @@ def test_input_ids_side_channel_actually_routes() -> None:
             )
         )
         block.expert_mlps.mlp_op.gate_up_proj.weight.copy_(
-            torch.randn_like(
-                block.expert_mlps.mlp_op.gate_up_proj.weight
-            ) * 0.02
+            torch.randn_like(block.expert_mlps.mlp_op.gate_up_proj.weight) * 0.02
         )
         block.expert_mlps.mlp_op.down_proj.weight.copy_(
-            torch.randn_like(
-                block.expert_mlps.mlp_op.down_proj.weight
-            ) * 0.02
+            torch.randn_like(block.expert_mlps.mlp_op.down_proj.weight) * 0.02
         )
         for lin in (
             block.shared_expert.gate_proj,
@@ -903,9 +888,7 @@ def test_input_ids_side_channel_actually_routes() -> None:
     for cand in range(src.vocab_size):
         if cand == 3:
             continue
-        if not torch.equal(
-            block.tid2eid[3], block.tid2eid[cand]
-        ):
+        if not torch.equal(block.tid2eid[3], block.tid2eid[cand]):
             changed_id = cand
             break
     assert changed_id != 3, "vocab too degenerate; every row of tid2eid identical"
@@ -915,11 +898,17 @@ def test_input_ids_side_channel_actually_routes() -> None:
     with torch.no_grad():
         # Direct router probe: indices from tid2eid must differ for token 0.
         _, idx_a = nw.dsv4_hash_route_affinities(
-            hidden_states, block.router.weight, block.tid2eid, ids_a,
+            hidden_states,
+            block.router.weight,
+            block.tid2eid,
+            ids_a,
             scoring_func=src.scoring_func,
         )
         _, idx_b = nw.dsv4_hash_route_affinities(
-            hidden_states, block.router.weight, block.tid2eid, ids_b,
+            hidden_states,
+            block.router.weight,
+            block.tid2eid,
+            ids_b,
             scoring_func=src.scoring_func,
         )
         # Indices for token 0 differ (side channel active).
@@ -980,10 +969,12 @@ def test_hash_moe_wrapper_matches_hf_reference_on_real_layer0_router() -> None:
     # Sanity: shapes must match the frozen config.
     src_full = cfg.DeepseekV4FlashInferenceConfig()
     assert tuple(real_router.shape) == (
-        src_full.n_routed_experts, src_full.hidden_size
+        src_full.n_routed_experts,
+        src_full.hidden_size,
     ), real_router.shape
     assert tuple(real_tid2eid.shape) == (
-        src_full.vocab_size, src_full.num_experts_per_tok
+        src_full.vocab_size,
+        src_full.num_experts_per_tok,
     ), real_tid2eid.shape
     assert real_tid2eid.dtype == torch.int32, real_tid2eid.dtype
 
@@ -1007,16 +998,14 @@ def test_hash_moe_wrapper_matches_hf_reference_on_real_layer0_router() -> None:
     # tid2eid selection PATTERN (each token still picks its own top_k
     # experts based on token id), just projected onto a reduced expert
     # bank.
-    n_experts_reduced = int(os.environ.get(
-        "DSV4_HASH_MOE_REAL_N_EXPERTS", "8"
-    ))
+    n_experts_reduced = int(os.environ.get("DSV4_HASH_MOE_REAL_N_EXPERTS", "8"))
     top_k = src_full.num_experts_per_tok
     # Remap tid2eid mod n_experts_reduced, but stay INJECTIVE per row
     # (top_k distinct experts per row) — HF's tid2eid rows are already
     # distinct, we just need the remap to preserve distinctness with
     # high probability.  Since n_experts_reduced >= top_k, take
     # `real_tid2eid % n_experts_reduced` and fix collisions by shifting.
-    tid_reduced = (real_tid2eid.to(torch.int64) % n_experts_reduced)
+    tid_reduced = real_tid2eid.to(torch.int64) % n_experts_reduced
     for row in range(tid_reduced.shape[0]):
         # Fix duplicates by incrementing until distinct.
         seen: set[int] = set()
@@ -1036,7 +1025,7 @@ def test_hash_moe_wrapper_matches_hf_reference_on_real_layer0_router() -> None:
         n_routed_experts=n_experts_reduced,
         num_experts_per_tok=top_k,
         vocab_size=src_full.vocab_size,
-        moe_intermediate_size=64,        # reduced
+        moe_intermediate_size=64,  # reduced
         hidden_size=src_full.hidden_size,
         compress_ratios=tuple([0] * 3),
     )
@@ -1177,6 +1166,7 @@ def _standalone_main() -> int:
             n_fail += 1
             print(f"FAIL  {name}: {exc!r}")
             import traceback
+
             traceback.print_exc()
             continue
         n_pass += 1

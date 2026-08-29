@@ -70,8 +70,6 @@ Anchors (absolute local paths)
 from __future__ import annotations
 
 import os
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Frozen slug identities (DSA only; DSv4 has no KDA)
@@ -89,16 +87,27 @@ Baremetal COMPILE PASS on r7i, 29.91s, per DSA-LIGHTNING-INDEXER-STATUS-
 
 DSA_KERNEL_IMPL_ENV: str = "DSA_KERNEL_IMPL"
 
-_DSA_CPU_ALIASES = frozenset({
-    "", "cpu", "cpu_golden", "reference", "v0", "dsa_cpu_golden",
-    DSA_CPU_GOLDEN_SLUG,
-})
-_DSA_NKI_V2_ALIASES = frozenset({
-    "nki_v2", "v2", DSA_NKI_V2_SLUG,
-})
+_DSA_CPU_ALIASES = frozenset(
+    {
+        "",
+        "cpu",
+        "cpu_golden",
+        "reference",
+        "v0",
+        "dsa_cpu_golden",
+        DSA_CPU_GOLDEN_SLUG,
+    }
+)
+_DSA_NKI_V2_ALIASES = frozenset(
+    {
+        "nki_v2",
+        "v2",
+        DSA_NKI_V2_SLUG,
+    }
+)
 
 
-def resolve_dsa_impl_slug(env_value: Optional[str] = None) -> str:
+def resolve_dsa_impl_slug(env_value: str | None = None) -> str:
     """Return the DSA slug the emitted config should advertise.
 
     Raises
@@ -149,9 +158,9 @@ def is_dsa_nki_v2_selected() -> bool:
 
 __all__ = [
     "DSA_CPU_GOLDEN_SLUG",
-    "DSA_NKI_V2_SLUG",
     "DSA_KERNEL_IMPL_ENV",
-    "resolve_dsa_impl_slug",
+    "DSA_NKI_V2_SLUG",
     "get_emitted_kernel_slugs",
     "is_dsa_nki_v2_selected",
+    "resolve_dsa_impl_slug",
 ]
