@@ -48,6 +48,14 @@
     "audit_tool": {
       "path": "audit_source_provenance.py",
       "sha256": "d7c6acf9ae3340ff01ef8aeac3b1ea2f93d53de456c310aab6b83c78ced6ab3a"
+    },
+    "tp32_rank_plan_audit": {
+      "path": "evidence/tp32-rank-plan-audit.json",
+      "sha256": "68952228ff0fd145544e84a276f5d61b35c07a360bd58b1a1bcaffc787589da1"
+    },
+    "tp32_rank_plan_validator": {
+      "path": "validate_tp32_rank_plan.py",
+      "sha256": "9cdf18db18ee2eac01862bd978b6ef555560ac3cd4113eaea97bab462ad42a27"
     }
   },
   "blockers": [
@@ -64,7 +72,7 @@
     {
       "id": "tp32_rank_inventory",
       "satisfied": false,
-      "machine_check": "rank-inventory.json plus 32 dsv4-streaming-rank-v1 manifests must cover ranks 0..31, bind unique inventory and checkpoint SHA-256 values, TP=32, BF16 outputs, and <=67108864 observed writer chunks"
+      "machine_check": "the bound symbolic receipt must first reach PASS with zero unmapped mHC tensors and an explicit reviewed I64 tid2eid conversion; only then may rank-inventory.json plus 32 dsv4-streaming-rank-v1 manifests cover ranks 0..31, bind unique inventory and checkpoint SHA-256 values, TP=32, BF16 outputs, and <=67108864 observed writer chunks"
     },
     {
       "id": "compiler_inventory",
