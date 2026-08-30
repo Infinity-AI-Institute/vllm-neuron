@@ -296,6 +296,32 @@ def build_neuron_config(
     return config
 
 
+def _dsa_pool_topk(
+    index_scores: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select DSA pools with the pinned Trn2 TopK/NKI frontend.
+
+    ``torch.topk`` is kept only as the CPU fallback.  On a Neuron/XLA tensor,
+    an out-of-envelope shape is an error rather than an implicit fallback:
+    the pinned compiler lowers that fallback to HLO ``sort``, which Trn2
+    rejects with ``NCC_EVRF029``.  Returning both tensors keeps the values and
+    indices contract explicit for the adversarial semantic gate even though
+    the DSA expansion currently consumes only the indices.
+    """
+    from vllm_neuron.functional.topk import _can_use_nki_topk
+    from vllm_neuron.functional.topk import topk as neuron_topk
+
+    if str(index_scores.device) != "cpu" and not _can_use_nki_topk(
+        index_scores, k, dim=-1
+    ):
+        raise RuntimeError(
+            "GLM-5.3-Flash DSA pool top-k shape is outside the pinned "
+            "Trn2 rotational-NKI envelope; refusing torch.topk fallback "
+            "because it lowers to unsupported HLO sort."
+        )
+    return neuron_topk(index_scores, k, dim=-1, gather_dim=-1)
+
+
 class Glm53FlashNeuronInferenceConfig(_NxdiInferenceConfig):
     """NxDI ``InferenceConfig`` wrapper that carries the Codex Alpha config.
 
@@ -1041,7 +1067,9 @@ if _NXDI_AVAILABLE:
             device = index_scores.device
             select_k = min(self.index_topk // self.index_kpool, pools)
 
-            selected = index_scores.topk(select_k, dim=-1).indices  # [B, Q, K]
+            # ``aten::topk`` lowers to an HLO ``sort`` in the pinned
+            # torch-neuronx stack; use the Trn2 TopK/NKI seam instead.
+            _selected_values, selected = _dsa_pool_topk(index_scores, select_k)
             batch_idx = torch.arange(batch, device=device)[:, None, None]
             selected_valid = valid_candidates.gather(-1, selected)
             selected_indices = pool_indices[batch_idx, selected]
