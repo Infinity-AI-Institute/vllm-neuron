@@ -77,7 +77,16 @@ def _required(root: Path, relative: str) -> Path:
 
 
 def _locate(root: Path, suffix: str) -> Path:
-    candidates = sorted(path for path in (root / "cache").rglob(suffix))
+    # Original compile roots put cache beside ``artifacts``; the immutable
+    # Trn staging bundle nests the same cache under ``artifacts``.  Accept both
+    # layouts, but still require exactly one non-symlink match.
+    cache_roots = (root / "cache", root / "artifacts" / "cache")
+    candidates = sorted(
+        path
+        for cache_root in cache_roots
+        if cache_root.is_dir()
+        for path in cache_root.rglob(suffix)
+    )
     _require(len(candidates) == 1, f"expected one {suffix} in artifact cache")
     _require(not candidates[0].is_symlink(), f"{suffix} must not be a symlink")
     return candidates[0]

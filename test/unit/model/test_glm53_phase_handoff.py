@@ -183,3 +183,28 @@ def test_phase_handoff_rejects_compose_hash_drift(tmp_path):
         MODULE.Glm53PhaseHandoffError, match="compose cte neff_sha256 drift"
     ):
         MODULE.inspect_phase_handoff(tkg, cte, compose_receipt_path=compose)
+
+
+def test_phase_handoff_accepts_immutable_staged_artifacts_cache_layout(tmp_path):
+    tkg = tmp_path / "tkg"
+    cte = tmp_path / "cte"
+    _write_artifact(tkg, "tkg")
+    _write_artifact(cte, "cte")
+    compose = _compose(tkg, cte)
+    for root in (tkg, cte):
+        source = root / "cache"
+        staged = root / "artifacts" / "cache"
+        staged.mkdir(parents=True)
+        for path in source.rglob("*"):
+            if path.is_file():
+                target = staged / path.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(path.read_bytes())
+        for path in sorted(source.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        source.rmdir()
+    receipt = MODULE.inspect_phase_handoff(tkg, cte, compose_receipt_path=compose)
+    assert receipt["handoff"]["shared_state_schema"] is True
