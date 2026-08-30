@@ -174,6 +174,17 @@ record native block-FP8/converted-BF16 semantics, or implement the required
 token-bound runner returning ten `(154880,)` rows per prompt.  It is therefore
 not an acceptable canonical provider or rescue reference.
 
+The primary model reference requires a more specific provider shape: the
+official GLM-5.3-Flash Transformers recipe uses `AutoProcessor` and
+`AutoModelForMultimodalLM`, then calls the processor's chat template before
+generation.  The upstream Transformers model documentation identifies the
+implementation as `Glm5NextForConditionalGeneration` and notes that its
+Transformers implementation omits MTP.  A future provider must therefore bind
+the exact processor/chat-template output (or prove an equivalent text-only
+encoding), the exact `Glm5Next` model class, and the pinned checkpoint and
+precision semantics.  The current repository contains none of those loaded
+provider objects; only the injected callable seam is available.
+
 The exact fail-fast entry point is
 `tools/glm53_reference_target_producer.py`.  Run `--dry-run` first with the
 real pinned checkpoint path, `--loader MODULE:CALLABLE`, `--runner
