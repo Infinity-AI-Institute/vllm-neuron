@@ -4,8 +4,8 @@
   "origin_claim": null,
   "note": "No external prototype commit is claimed. The reviewed bytes are bound to the resolvable source commit, tree, Git blob IDs, and raw SHA-256 values below.",
   "base_commit": "1b2e90d1f7fa5296aeaa57420794393958fe566e",
-  "reviewed_source_commit": "d82f4f2d8c8a2b4a71965d3b401ecae060df46a8",
-  "reviewed_source_tree": "0da3326192d16ed70a9eff1a92d133cd49fab4e4",
+  "reviewed_source_commit": "05bb76c66bd54bf6cf19ff1db1d2d67547e8807e",
+  "reviewed_source_tree": "6c8ae912522b78affd80f93c8b92b72139bf4a08",
   "hash_algorithm": {
     "git_blob": "sha1",
     "raw_bytes": "sha256"
@@ -29,7 +29,7 @@
     {"path": "vllm_neuron/model/glm53_flash/mla.py", "mode": "100644", "git_blob_sha1": "e4cb833236936c7d31e6c2232aa648d3b574a5c0", "raw_sha256": "6c3f3b6a756587e0813bf35a1ea0d34113e08c7ba0c67713b89b5b852a619022"},
     {"path": "vllm_neuron/model/glm53_flash/model.py", "mode": "100644", "git_blob_sha1": "4364d6803d26cd2883d4e25ce18bb88d6227bafe", "raw_sha256": "52de67688f2b4bb55d635c2ef6a5a7d665d3a868eede60434c97c6f93592e68a"},
     {"path": "vllm_neuron/model/glm53_flash/moe.py", "mode": "100644", "git_blob_sha1": "37f34c9e21f9d1bcbdeac7c319d587f81d7f47ff", "raw_sha256": "7fd2fdcf140391c5452d4756d9cf771e3213d7ce89af4b7b39c92a2708126057"},
-    {"path": "vllm_neuron/model/glm53_flash/neuron_wrapper.py", "mode": "100644", "git_blob_sha1": "71e65828dc32fdd0490c77f2e86dee47fe0e2e8e", "raw_sha256": "2ad6825aaf2f054262b203ac90a62ff6e0340db5ea7d89f5795affda8767b1b3"},
+    {"path": "vllm_neuron/model/glm53_flash/neuron_wrapper.py", "mode": "100644", "git_blob_sha1": "cd8c4b48ee6d62d355adb58dc1f24801ae729c79", "raw_sha256": "5c680b8a56ab84e12e98bd35f1baf27acb21f190bb00e9bed1502ead6bac5598"},
     {"path": "vllm_neuron/model/glm53_flash/nki_bindings.py", "mode": "100644", "git_blob_sha1": "bd9c43d376b785d6078bef515e3fa1df54a0f7b7", "raw_sha256": "f330e77a1b5f1c13c6bfd80ecef38b69e22e978c960512661bb28f5643c1c6da"},
     {"path": "vllm_neuron/model/glm53_flash/registry.py", "mode": "100644", "git_blob_sha1": "56721bea2b59e9843609cd8428342a833b2c5ee6", "raw_sha256": "625e4cf0bc85482651bd1ca872c277ff7ed3eb43f09bc5c42474147fa1d7cffa"},
     {"path": "vllm_neuron/model/glm53_flash/telemetry.py", "mode": "100644", "git_blob_sha1": "62ba59c6f70a28311b339751aa1ed951b7dbdc9e", "raw_sha256": "1a4298d66572de45948f99bdae32ee59226f28dcefb3501d30b17c114d212320"},
