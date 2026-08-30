@@ -36,6 +36,10 @@ from .rank_plan import (
     build_glm53_rank_plan,
     stream_glm53_rank_checkpoint,
 )
+from .reference_target import (
+    Glm53ReferenceTarget,
+    Glm53ReferenceTargetError,
+)
 from .registry import _GLM53_GRAPH_ID, GLM53_SOURCE_CACHE_ABI
 from .runtime_config import (
     GLM53_ARCHITECTURE,
@@ -85,6 +89,8 @@ __all__ = [
     "Glm53PhaseRuntimeError",
     "Glm53PhaseState",
     "Glm53RankPlan",
+    "Glm53ReferenceTarget",
+    "Glm53ReferenceTargetError",
     "Glm53RuntimeArtifactBundle",
     "Glm53RuntimeConfig",
     "Glm53RuntimeConfigError",

@@ -79,6 +79,9 @@ def test_paired_adapter_calls_resident_api_and_binds_state_schema():
     assert pair.cte.loader_api == "torch.ops.neuron._parallel_load(checkpoint)"
     assert "LayoutTransformation" in pair.tkg.loader_api
     assert pair.cte.state_keys == pair.tkg.state_keys
+    assert pair.cte.weight_layout == MODULE._EXPECTED_LOADER["cte"]
+    assert pair.tkg.weight_layout == MODULE._EXPECTED_LOADER["tkg"]
+    assert pair.to_mapping()["weight_layout_contract"]["phase_local"] is True
     pair.assert_continuation_state(_state())
     assert pair.to_mapping()["claims"]["runtime_permitted"] is False
 
@@ -164,3 +167,17 @@ def test_handoff_rejects_bare_logits_and_layout_drift_before_copy():
     ]
     with pytest.raises(MODULE.Glm53PhaseRuntimeError, match="dtype"):
         pair.handoff_cte_outputs(owner, bad)
+
+
+def test_weight_layout_contract_rejects_cross_phase_loader_substitution():
+    from dataclasses import replace
+
+    pair = MODULE.Glm53PairedPhaseRuntime.initialize(
+        cte_model=_Traced(_state()),
+        tkg_model=_Traced(_state()),
+        cte_checkpoint=object(),
+        tkg_checkpoint=object(),
+    )
+    broken = replace(pair, cte=replace(pair.cte, weight_layout=pair.tkg.weight_layout))
+    with pytest.raises(MODULE.Glm53PhaseRuntimeError, match="weight layouts"):
+        broken.assert_weight_layout_contract()

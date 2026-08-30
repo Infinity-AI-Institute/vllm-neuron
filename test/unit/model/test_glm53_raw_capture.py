@@ -131,3 +131,81 @@ def test_q4_reference_cannot_be_bound_as_the_glm_canonical_bank():
 def test_plan_rejects_target_identity_drift(field, value):
     with pytest.raises(MODULE.Glm53RawCaptureError):
         _plan(**{field: value})
+
+
+def test_reference_comparison_is_full_vocab_and_non_authorizing(tmp_path):
+    import hashlib
+    import json
+
+    reference_module_path = ROOT / "vllm_neuron/model/glm53_flash/reference_target.py"
+    spec = importlib.util.spec_from_file_location(
+        "glm53_reference_target_for_raw", reference_module_path
+    )
+    assert spec is not None and spec.loader is not None
+    reference_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = reference_module
+    spec.loader.exec_module(reference_module)
+    reference = torch.zeros(154_880, dtype=torch.float32)
+    reference[1234] = 10.0
+    row_path = tmp_path / "row.bin"
+    raw = reference.numpy().tobytes()
+    row_path.write_bytes(raw)
+    manifest = {
+        "schema": reference_module.GLM53_REFERENCE_TARGET_SCHEMA,
+        "reference_id": "original-target",
+        "checkpoint_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+        "config_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+        "index_sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05",
+        "semantics": "original-checkpoint-cpu-fp32",
+        "dtype": "torch.float32",
+        "vocab_size": 154_880,
+        "rows": [
+            {
+                "slot": 0,
+                "prompt_id": "p",
+                "position": 0,
+                "dtype": "torch.float32",
+                "shape": [154_880],
+                "relative_path": "row.bin",
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    }
+    manifest_path = tmp_path / "reference.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    target = reference_module.Glm53ReferenceTarget.from_manifest(manifest_path)
+    capture = MODULE.Glm53RawCapture(
+        _plan(
+            slot_count=1,
+            prompt_ids=("p",),
+            positions=(0,),
+            canonical_reference_id="original-target",
+            canonical_reference_semantics="original-checkpoint-cpu-fp32",
+        )
+    )
+    result = capture.compare_against_reference(
+        slot=0,
+        prompt_id="p",
+        position=0,
+        logits=reference.to(torch.bfloat16),
+        reference_target=target,
+    )
+    assert result["argmax_equal"] is True
+    assert result["correctness_authorized"] is False
+
+    class _WrongSemantics:
+        reference_id = "original-target"
+        semantics = "native-block-fp8"
+
+        @staticmethod
+        def load_row(**_kwargs):
+            return reference
+
+    with pytest.raises(MODULE.Glm53RawCaptureError, match="semantics"):
+        capture.compare_against_reference(
+            slot=0,
+            prompt_id="p",
+            position=0,
+            logits=reference.to(torch.bfloat16),
+            reference_target=_WrongSemantics(),
+        )

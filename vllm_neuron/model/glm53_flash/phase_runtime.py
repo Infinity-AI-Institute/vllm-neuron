@@ -74,6 +74,7 @@ class Glm53PhaseState:
     rank_count: int
     state_keys: tuple[str, ...]
     state_keys_sha256: str
+    weight_layout: str
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -82,6 +83,7 @@ class Glm53PhaseState:
             "rank_count": self.rank_count,
             "state_key_count": len(self.state_keys),
             "state_keys_sha256": self.state_keys_sha256,
+            "weight_layout": self.weight_layout,
         }
 
 
@@ -117,6 +119,7 @@ def initialize_phase(
         rank_count=len(state),
         state_keys=keys,
         state_keys_sha256=_signature_sha256(keys),
+        weight_layout=_EXPECTED_LOADER[phase],
     )
 
 
@@ -126,6 +129,15 @@ class Glm53PairedPhaseRuntime:
 
     cte: Glm53PhaseState
     tkg: Glm53PhaseState
+
+    def assert_weight_layout_contract(self) -> None:
+        """Require each phase to retain its own serialized weight loader."""
+
+        _require(
+            self.cte.weight_layout == _EXPECTED_LOADER["cte"]
+            and self.tkg.weight_layout == _EXPECTED_LOADER["tkg"],
+            "CTE/TKG phase-local weight layouts differ from their serialized loaders",
+        )
 
     @classmethod
     def initialize(
@@ -146,7 +158,9 @@ class Glm53PairedPhaseRuntime:
             cte.state_keys == tkg.state_keys,
             "CTE/TKG resident KV-state keys differ",
         )
-        return cls(cte=cte, tkg=tkg)
+        pair = cls(cte=cte, tkg=tkg)
+        pair.assert_weight_layout_contract()
+        return pair
 
     def assert_continuation_state(self, state: Any) -> None:
         """Fail closed unless a device runner presents the retained schema."""
@@ -244,6 +258,7 @@ class Glm53PairedPhaseRuntime:
         }
 
     def to_mapping(self) -> dict[str, Any]:
+        self.assert_weight_layout_contract()
         return {
             "schema": PHASE_RUNTIME_SCHEMA,
             "state_contract": {
@@ -251,6 +266,12 @@ class Glm53PairedPhaseRuntime:
                 "state_key_count": len(self.cte.state_keys),
                 "state_keys_sha256": self.cte.state_keys_sha256,
                 "equal_cte_tkg": self.cte.state_keys == self.tkg.state_keys,
+            },
+            "weight_layout_contract": {
+                "cte": self.cte.weight_layout,
+                "tkg": self.tkg.weight_layout,
+                "phase_local": True,
+                "cross_phase_weight_copy": False,
             },
             "cte": self.cte.to_mapping(),
             "tkg": self.tkg.to_mapping(),

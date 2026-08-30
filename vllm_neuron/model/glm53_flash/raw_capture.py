@@ -249,6 +249,83 @@ class Glm53RawCapture:
             },
         }
 
+    def compare_against_reference(
+        self,
+        *,
+        slot: int,
+        prompt_id: str,
+        position: int,
+        logits: torch.Tensor,
+        reference_target: Any,
+    ) -> dict[str, Any]:
+        """Compare one candidate row with the already-selected target bank.
+
+        ``reference_target`` is intentionally duck-typed so this capture seam
+        does not import or construct a reference model.  The target must expose
+        the immutable ``reference_id`` and bounded ``load_row`` API supplied by
+        ``reference_target.Glm53ReferenceTarget``.  Metrics are evidence only;
+        this method never turns a row comparison into a 40/40 claim.
+        """
+
+        _require(
+            getattr(reference_target, "reference_id", None)
+            == self.plan.canonical_reference_id,
+            "reference target identity does not match the selected canonical reference",
+        )
+        _require(
+            getattr(reference_target, "semantics", None)
+            == self.plan.canonical_reference_semantics,
+            "reference target semantics do not match the selected canonical reference",
+        )
+        _require(
+            callable(getattr(reference_target, "load_row", None)),
+            "reference target lacks the bounded load_row API",
+        )
+        _require(
+            isinstance(logits, torch.Tensor), "candidate logits must be a torch.Tensor"
+        )
+        _require(
+            tuple(logits.shape) == (self.plan.vocab_size,),
+            "candidate comparison row must be full vocabulary",
+        )
+        _require(
+            bool(torch.isfinite(logits).all().item()), "candidate row is non-finite"
+        )
+        target = reference_target.load_row(
+            slot=slot, prompt_id=prompt_id, position=position
+        )
+        _require(
+            tuple(target.shape) == (self.plan.vocab_size,),
+            "reference comparison row must be full vocabulary",
+        )
+        candidate_f32 = logits.detach().to(torch.float32)
+        target_f32 = target.detach().to(torch.float32)
+        denominator = torch.linalg.vector_norm(
+            candidate_f32
+        ) * torch.linalg.vector_norm(target_f32)
+        _require(
+            bool(torch.isfinite(denominator).item()) and denominator.item() > 0,
+            "reference comparison cosine denominator is zero or non-finite",
+        )
+        return {
+            "reference_id": reference_target.reference_id,
+            "slot": slot,
+            "prompt_id": prompt_id,
+            "position": position,
+            "candidate_argmax": int(torch.argmax(candidate_f32).item()),
+            "reference_argmax": int(torch.argmax(target_f32).item()),
+            "argmax_equal": bool(
+                torch.argmax(candidate_f32).item() == torch.argmax(target_f32).item()
+            ),
+            "max_abs_error": float(
+                torch.max(torch.abs(candidate_f32 - target_f32)).item()
+            ),
+            "cosine": float(
+                torch.dot(candidate_f32, target_f32).div(denominator).item()
+            ),
+            "correctness_authorized": False,
+        }
+
 
 __all__ = [
     "GLM53_CANDIDATE_WEIGHT_SEMANTICS",
