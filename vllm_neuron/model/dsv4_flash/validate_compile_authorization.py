@@ -693,6 +693,14 @@ def _validate_ranks(
         )
         checkpoint = item["checkpoint"]
         manifest_ref = item["manifest"]
+        _require(
+            checkpoint.get("path") == f"ranks/tp{item['rank']}.safetensors",
+            "rank checkpoint path must bind to rank",
+        )
+        _require(
+            manifest_ref.get("path") == f"ranks/tp{item['rank']}.manifest.json",
+            "rank manifest path must bind to rank",
+        )
         checkpoint_path = _safe_artifact(
             root, checkpoint.get("path"), "rank checkpoint"
         )
