@@ -108,6 +108,7 @@ class Glm53ReferenceTarget:
     vocab_size: int
     manifest_path: Path
     rows: dict[tuple[int, str, int], dict[str, Any]]
+    loader_versions: dict[str, str] | None = None
 
     @classmethod
     def from_manifest(cls, manifest_path: str | Path) -> Glm53ReferenceTarget:
@@ -173,6 +174,17 @@ class Glm53ReferenceTarget:
                 f"reference row path is unsafe: {key!r}",
             )
             rows[key] = dict(row)
+        raw_loader_versions = manifest.get("loader_versions")
+        loader_versions = None
+        if raw_loader_versions is not None:
+            _require(
+                isinstance(raw_loader_versions, dict) and raw_loader_versions,
+                "loader_versions must be a non-empty object",
+            )
+            loader_versions = {}
+            for key, value in raw_loader_versions.items():
+                _text(key, "loader version key")
+                loader_versions[key] = _text(value, f"loader version {key}")
         return cls(
             reference_id,
             GLM53_CHECKPOINT_REVISION,
@@ -183,6 +195,7 @@ class Glm53ReferenceTarget:
             GLM53_RAW_CAPTURE_VOCAB_SIZE,
             path,
             rows,
+            loader_versions,
         )
 
     def load_row(self, *, slot: int, prompt_id: str, position: int) -> torch.Tensor:

@@ -36,6 +36,12 @@ from .rank_plan import (
     build_glm53_rank_plan,
     stream_glm53_rank_checkpoint,
 )
+from .reference_producer import (
+    GLM53_REFERENCE_PRODUCER_SCHEMA,
+    Glm53OriginalTargetProducer,
+    Glm53OriginalTargetProducerSpec,
+    Glm53ReferenceProducerError,
+)
 from .reference_target import (
     Glm53ReferenceTarget,
     Glm53ReferenceTargetError,
@@ -73,6 +79,7 @@ __all__ = [
     "GLM53_BLOCKWISE_MATMUL_WORKAROUND",
     "GLM53_CHECKPOINT_REVISION",
     "GLM53_COMPILE_ADAPTER_SCHEMA",
+    "GLM53_REFERENCE_PRODUCER_SCHEMA",
     "GLM53_RUNTIME_ADAPTER",
     "GLM53_RUNTIME_BUNDLE_SCHEMA",
     "GLM53_RUNTIME_CONFIG_SCHEMA",
@@ -85,10 +92,13 @@ __all__ = [
     "Glm53CompileLaunchPolicy",
     "Glm53FlashInferenceConfig",
     "Glm53FlashNeuronInferenceConfig",
+    "Glm53OriginalTargetProducer",
+    "Glm53OriginalTargetProducerSpec",
     "Glm53PairedPhaseRuntime",
     "Glm53PhaseRuntimeError",
     "Glm53PhaseState",
     "Glm53RankPlan",
+    "Glm53ReferenceProducerError",
     "Glm53ReferenceTarget",
     "Glm53ReferenceTargetError",
     "Glm53RuntimeArtifactBundle",

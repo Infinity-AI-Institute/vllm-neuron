@@ -45,6 +45,24 @@ currently bound, so strict correctness remains unproven.  Q4 is diagnostic
 only.  The native checkpoint is dynamic block-FP8 converted to BF16; FP32
 storage is not evidence of FP32 execution.
 
+`reference_producer.py` now provides the producer-side contract.  A qualified
+loader and runner must supply exact loader-version identities and emit four
+unique feedback prompts at positions 0 through 9.  The producer writes 40
+full-vocabulary rows transactionally and publishes no manifest on any shape,
+dtype, non-finite, or identity failure.  The CPU test uses a tiny injected
+original implementation; it is not evidence that the full released
+checkpoint loader exists.
+
+The full original-target run is not sized for the current 128 GiB rank lane:
+the pinned source is 328,366,172,315 bytes (~305.8 GiB) and the BF16 rank
+payload is 635,510,529,792 bytes (~591.9 GiB).  With source and converted
+weights resident, reserve at least 1.1 TiB RAM and 1.1 TiB scratch, 32-64 CPU
+threads, and no devices.  The 40-row FP32 bank itself is only 24,780,800
+bytes (~23.6 MiB).  Conversion/load and row generation estimates are
+unmeasured planning ranges: 2-8 hours for materialization/load, then 10-30
+minutes for the 4x10 rows.  The actual missing capability remains a
+qualified full-checkpoint CPU loader/runner, not row storage.
+
 ## Throughput and tokenomics sequence
 
 Only after one canonical target is selected and strict full-vocabulary 40/40
