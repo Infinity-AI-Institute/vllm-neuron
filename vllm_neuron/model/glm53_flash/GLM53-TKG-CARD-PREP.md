@@ -41,6 +41,22 @@ bytes and compiler result, rejects `%sort.` and `aten__topk`, and checks the
 TP32/LNC2/B1/S128/BF16/no-quant/no-spec emitted contract.  Without that
 environment variable it skips rather than claiming compiler evidence.
 
+When the retained packet and compiled files are supplied from an immutable
+external artifact mount, pass the packet explicitly; the packet's relative
+paths are resolved against `--artifact-root` and every referenced byte is
+rehashed:
+
+```bash
+tools/glm53_tkg_card_prep.py \
+  --artifact-root /artifact \
+  --retained-packet /evidence/RETAINED-TKG-ARTIFACT-PACKET.json \
+  --checkpoint-dir /hf/snapshots/04c4e9e95c5da8862dced7e5056455116f83a7e0
+```
+
+Omitting `--retained-packet` preserves the checked-in packet default.  The
+option only selects the evidence manifest; it never authorizes compile,
+runtime, card load, correctness, or performance claims.
+
 Readiness remains false unless the optional inputs are independently bound:
 the CTE companion must carry the exact TP32/LNC2/B1/S128 context-encoding
 contract, matching source/config/checkpoint identities, and its own BF16,

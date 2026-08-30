@@ -21,6 +21,14 @@ def main() -> int:
     parser.add_argument("--checkpoint-dir", type=Path)
     parser.add_argument("--rank-dir", type=Path)
     parser.add_argument("--cte-artifact-root", type=Path)
+    parser.add_argument(
+        "--retained-packet",
+        type=Path,
+        help=(
+            "external immutable retained-artifact packet; defaults to the "
+            "checked-in packet"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     receipt = inspect_tkg_artifact(
@@ -28,6 +36,7 @@ def main() -> int:
         checkpoint_dir=args.checkpoint_dir,
         rank_dir=args.rank_dir,
         cte_artifact_root=args.cte_artifact_root,
+        retained_packet_path=args.retained_packet,
     )
     payload = receipt.to_mapping()
     payload["receipt_sha256"] = receipt.sha256()
