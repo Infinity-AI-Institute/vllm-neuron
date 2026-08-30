@@ -498,6 +498,24 @@ def test_incomplete_mutated_or_duplicate_evidence_fails(
         AUTH.validate_evidence(_packet(), evidence, repo)
 
 
+@pytest.mark.parametrize(
+    "extra_name",
+    [
+        "tp32.safetensors",
+        "tp31.manifest.json.partial-test",
+        "unrelated.txt",
+    ],
+)
+def test_rank_evidence_rejects_extra_or_partial_artifacts(
+    tmp_path: Path, extra_name: str
+) -> None:
+    evidence, repo = _complete_evidence(tmp_path)
+    (evidence / "ranks" / extra_name).write_bytes(b"unexpected")
+
+    with pytest.raises(AUTH.AuthorizationError, match="extra files"):
+        AUTH.validate_evidence(_packet(), evidence, repo)
+
+
 def test_missing_evidence_is_a_bounded_hold(tmp_path: Path) -> None:
     holds = AUTH.validate_evidence(_packet(), tmp_path, tmp_path)
     assert len(holds) == 5
