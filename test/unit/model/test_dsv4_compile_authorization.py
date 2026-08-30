@@ -498,6 +498,27 @@ def test_incomplete_mutated_or_duplicate_evidence_fails(
         AUTH.validate_evidence(_packet(), evidence, repo)
 
 
+def test_rank_evidence_binds_paths_to_rank_identity(tmp_path: Path) -> None:
+    evidence, repo = _complete_evidence(tmp_path)
+    rank0 = evidence / "ranks/tp0.safetensors"
+    rank1 = evidence / "ranks/tp1.safetensors"
+    rank0_bytes = rank0.read_bytes()
+    rank0.write_bytes(rank1.read_bytes())
+    rank1.write_bytes(rank0_bytes)
+
+    inventory_path = evidence / "rank-inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    inventory["ranks"][0]["checkpoint"]["path"] = "ranks/tp1.safetensors"
+    inventory["ranks"][1]["checkpoint"]["path"] = "ranks/tp0.safetensors"
+    inventory["canonical_rank_inventory_sha256"] = AUTH._canonical_sha256(
+        inventory["ranks"]
+    )
+    _write_json(inventory_path, inventory)
+
+    with pytest.raises(AUTH.AuthorizationError, match="path must bind"):
+        AUTH.validate_evidence(_packet(), evidence, repo)
+
+
 def test_missing_evidence_is_a_bounded_hold(tmp_path: Path) -> None:
     holds = AUTH.validate_evidence(_packet(), tmp_path, tmp_path)
     assert len(holds) == 5
