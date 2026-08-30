@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import sys
 import types
@@ -95,6 +96,29 @@ def _prompt_token_ids(tokenizer: Callable[..., Any], prompt_ids: tuple[str, ...]
     return result
 
 
+def _validate_provider_signatures(
+    loader: Callable[..., Any],
+    tokenizer: Callable[..., Any],
+    runner: Callable[..., Any],
+) -> None:
+    probes = (
+        (loader, (object(),), "--loader"),
+        (tokenizer, (GLM53_PROMPTS[0],), "--tokenizer"),
+        (
+            runner,
+            (object(), GLM53_PROMPTS[0], GLM53_POSITIONS, (0,)),
+            "--runner",
+        ),
+    )
+    for provider, args, name in probes:
+        try:
+            inspect.signature(provider).bind(*args)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} provider must accept its bound producer arguments"
+            ) from exc
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
@@ -137,8 +161,12 @@ def main(
         )
     tokenizer_versions = {}
     prompt_token_ids = {}
+    loader = tokenizer = runner = None
     if args.tokenizer:
+        loader = _callable(args.loader, "--loader")
         tokenizer = _callable(args.tokenizer, "--tokenizer")
+        runner = _callable(args.runner, "--runner")
+        _validate_provider_signatures(loader, tokenizer, runner)
         tokenizer_versions = _loader_versions(args.tokenizer_version)
         prompt_token_ids = _prompt_token_ids(tokenizer, GLM53_PROMPTS)
     spec = spec_type(
@@ -171,6 +199,7 @@ def main(
                     if bound_prompt_token_ids
                     else {},
                     "tokenizer_bound": bool(bound_prompt_token_ids),
+                    "provider_bound": bool(bound_prompt_token_ids and loader),
                     "vocab_size": spec.vocab_size,
                     "prompt_ids": list(spec.prompt_ids),
                     "positions": list(spec.positions),
@@ -188,8 +217,9 @@ def main(
         raise ValueError(
             "non-dry production requires --tokenizer and --tokenizer-version"
         )
-    loader = _callable(args.loader, "--loader")
-    runner = _callable(args.runner, "--runner")
+    if loader is None or runner is None:
+        loader = _callable(args.loader, "--loader")
+        runner = _callable(args.runner, "--runner")
     manifest = producer_type(spec).produce(
         loader=loader,
         run_prompt=runner,
