@@ -148,6 +148,35 @@ def test_two_pass_rank_inventory_and_transactional_bounded_publish(
     assert not list((out / "weights").glob("*.partial-*"))
 
 
+def test_full_shape_inventory_is_static_and_rank_shape_exact() -> None:
+    source = SHARDER.DeepseekV4FlashInferenceConfig()
+    inventories = SHARDER._static_rank_inventories(
+        source,
+        ranks=[0, 31],
+        tp_degree=32,
+    )
+
+    assert set(inventories) == {0, 31}
+    assert all(len(inventory.tensors) == 1285 for inventory in inventories.values())
+    rank0 = {spec.name: spec for spec in inventories[0].tensors}
+    rank31 = {spec.name: spec for spec in inventories[31].tensors}
+    assert rank0 == rank31
+    assert rank0["embed_tokens.weight"].shape == (4040, 4096)
+    assert rank0["layers.0.mlp.tid2eid"].dtype == torch.int32
+    assert rank0["layers.3.mlp.e_score_correction_bias"].dtype == torch.float32
+    assert rank0["layers.2.attn.indexer.wq_b.weight"].shape == (8192, 1024)
+    assert rank0["layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight"].shape == (
+        256,
+        4096,
+        128,
+    )
+    assert rank0["layers.0.mlp.expert_mlps.mlp_op.down_proj.weight"].shape == (
+        256,
+        64,
+        4096,
+    )
+
+
 def test_layer_major_outputs_are_rank_set_invariant_and_conversion_is_o_layers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -655,6 +655,191 @@ def _layer_major_rank_inventories(
     return inventories, layer_visits
 
 
+def _static_rank_inventories(
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    ranks: list[int],
+    tp_degree: int,
+) -> dict[int, RankInventory]:
+    """Build the frozen full-shape inventory without loading tensor payloads.
+
+    The full production adapter has a closed architecture contract: every
+    converted tensor's output shape and dtype are determined by ``src`` and
+    its layer schedule.  The writer still checks every emitted payload against
+    this inventory, so using the contract here removes the old conversion-only
+    inventory pass without weakening shape, dtype, or coverage validation.
+
+    Reduced-shape fixtures intentionally keep the payload-derived inventory
+    path because they are allowed to replace the frozen DSv4 geometry.
+    """
+    dtype = src.torch_dtype
+    hidden = int(src.hidden_size)
+    vocab = int(src.vocab_size)
+    heads = int(src.num_attention_heads)
+    head_dim = int(src.head_dim)
+    q_lora = int(src.q_lora_rank)
+    o_groups = int(src.o_groups)
+    o_lora = int(src.o_lora_rank)
+    experts = int(src.n_routed_experts)
+    top_k = int(src.num_experts_per_tok)
+    inter = int(src.moe_intermediate_size)
+    index_heads = int(src.index_n_heads)
+    index_head_dim = int(src.index_head_dim)
+    hc = int(src.hc_mult)
+    mhc_mix = (2 + hc) * hc
+    num_layers = int(src.num_hidden_layers)
+
+    if num_layers != 43:
+        raise ValueError(
+            "static DSv4 inventory requires the frozen 43-layer production shape"
+        )
+    if any(
+        size % tp_degree
+        for size in (vocab, q_lora, heads * head_dim, o_groups * o_lora, inter)
+    ):
+        raise ValueError(
+            "static DSv4 inventory requires TP-divisible vocabulary, query, "
+            "output, and intermediate dimensions"
+        )
+    if (heads * head_dim) % o_groups:
+        raise ValueError("static DSv4 inventory requires grouped output divisibility")
+
+    def build_specs() -> list[TensorSpec]:
+        specs: list[TensorSpec] = []
+
+        def add(name: str, item_dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+            specs.append(TensorSpec(name, item_dtype, shape))
+
+        add("embed_tokens.weight", dtype, (vocab // tp_degree, hidden))
+        add("final_norm_weight", dtype, (hidden,))
+        add("lm_head.weight", dtype, (vocab // tp_degree, hidden))
+        add("hc_head_fn", torch.float32, (hc, hc * hidden))
+        add("hc_head_base", torch.float32, (hc,))
+        add("hc_head_scale", torch.float32, (1,))
+
+        for layer_idx in range(num_layers):
+            prefix = f"layers.{layer_idx}."
+            add(f"{prefix}attn.mqa.wq_a.weight", dtype, (q_lora // tp_degree, hidden))
+            add(
+                f"{prefix}attn.mqa.wq_b.weight",
+                dtype,
+                (heads * head_dim // tp_degree, q_lora),
+            )
+            add(f"{prefix}attn.mqa.wkv.weight", dtype, (head_dim, hidden))
+            add(
+                f"{prefix}attn.mqa.wo_a.weight",
+                dtype,
+                (o_groups * o_lora // tp_degree, (heads * head_dim) // o_groups),
+            )
+            add(
+                f"{prefix}attn.mqa.wo_b.weight",
+                dtype,
+                (hidden, o_groups * o_lora // tp_degree),
+            )
+            add(f"{prefix}attn.mqa.q_norm.weight", dtype, (q_lora,))
+            add(f"{prefix}attn.mqa.kv_norm.weight", dtype, (head_dim,))
+            add(f"{prefix}attn.mqa.attn_sink", dtype, (heads,))
+            add(f"{prefix}attn_norm.weight", dtype, (hidden,))
+
+            layer_type = src.layer_types[layer_idx]
+            if layer_type == "compressed_sparse_attention":
+                ratio = 4
+                for name, shape in (
+                    ("wkv.weight", (2 * head_dim, hidden)),
+                    ("wgate.weight", (2 * head_dim, hidden)),
+                    ("ape", (ratio, 2 * head_dim)),
+                    ("norm.weight", (head_dim,)),
+                ):
+                    add(f"{prefix}attn.compressor.{name}", dtype, shape)
+                for name, shape in (
+                    ("wkv.weight", (2 * index_head_dim, hidden)),
+                    ("wgate.weight", (2 * index_head_dim, hidden)),
+                    ("ape", (ratio, 2 * index_head_dim)),
+                    ("norm.weight", (index_head_dim,)),
+                ):
+                    add(f"{prefix}attn.indexer.compressor.{name}", dtype, shape)
+                add(
+                    f"{prefix}attn.indexer.weights_proj.weight",
+                    dtype,
+                    (index_heads, hidden),
+                )
+                add(
+                    f"{prefix}attn.indexer.wq_b.weight",
+                    dtype,
+                    (index_heads * index_head_dim, q_lora),
+                )
+            elif layer_type == "heavily_compressed_attention":
+                ratio = 128
+                for name, shape in (
+                    ("wkv.weight", (head_dim, hidden)),
+                    ("wgate.weight", (head_dim, hidden)),
+                    ("ape", (ratio, head_dim)),
+                    ("norm.weight", (head_dim,)),
+                ):
+                    add(f"{prefix}attn.compressor.{name}", dtype, shape)
+            elif layer_type != "sliding_attention":
+                raise ValueError(
+                    f"unsupported DSv4 attention layer type {layer_type!r} "
+                    f"at {layer_idx}"
+                )
+
+            add(f"{prefix}ffn_norm.weight", dtype, (hidden,))
+            add(f"{prefix}hc_attn_fn", torch.float32, (mhc_mix, hc * hidden))
+            add(f"{prefix}hc_attn_base", torch.float32, (mhc_mix,))
+            add(f"{prefix}hc_attn_scale", torch.float32, (3,))
+            add(f"{prefix}hc_ffn_fn", torch.float32, (mhc_mix, hc * hidden))
+            add(f"{prefix}hc_ffn_base", torch.float32, (mhc_mix,))
+            add(f"{prefix}hc_ffn_scale", torch.float32, (3,))
+            add(f"{prefix}mlp.router.weight", torch.float32, (experts, hidden))
+            mlp_type = src.mlp_layer_types[layer_idx]
+            if mlp_type == "hash_moe":
+                add(f"{prefix}mlp.tid2eid", torch.int32, (vocab, top_k))
+            elif mlp_type == "moe":
+                add(
+                    f"{prefix}mlp.e_score_correction_bias",
+                    torch.float32,
+                    (experts,),
+                )
+            else:
+                raise ValueError(
+                    f"unsupported DSv4 MLP layer type {mlp_type!r} at {layer_idx}"
+                )
+            add(
+                f"{prefix}mlp.shared_expert.gate_proj.weight",
+                dtype,
+                (inter // tp_degree, hidden),
+            )
+            add(
+                f"{prefix}mlp.shared_expert.up_proj.weight",
+                dtype,
+                (inter // tp_degree, hidden),
+            )
+            add(
+                f"{prefix}mlp.shared_expert.down_proj.weight",
+                dtype,
+                (hidden, inter // tp_degree),
+            )
+            add(
+                f"{prefix}mlp.expert_mlps.mlp_op.gate_up_proj.weight",
+                dtype,
+                (experts, hidden, 2 * inter // tp_degree),
+            )
+            add(
+                f"{prefix}mlp.expert_mlps.mlp_op.down_proj.weight",
+                dtype,
+                (experts, inter // tp_degree, hidden),
+            )
+        return specs
+
+    specs = tuple(build_specs())
+    if len(specs) != 1285:
+        raise RuntimeError(f"static DSv4 inventory key count drift: {len(specs)}")
+    return {
+        rank: RankInventory(rank=rank, tp_degree=tp_degree, tensors=specs)
+        for rank in ranks
+    }
+
+
 def _write_bounded_tensor(
     writer: StreamingRankWriter,
     key: str,
@@ -755,19 +940,31 @@ def stream_shard_dsv4_checkpoint(
         "rank_inventory_sha256": {},
         "rank_manifest": {},
         "max_chunk_bytes": max_chunk_bytes,
-        "layer_conversion_strategy": "layer-major-multi-rank-two-pass",
-        "layer_conversion_passes": 2,
+        "layer_conversion_strategy": "layer-major-multi-rank-static-inventory",
+        "layer_conversion_passes": 1,
         "layer_conversion_visits": 0,
         "start_unix": int(time.time()),
     }
     try:
-        inventories, inventory_visits = _layer_major_rank_inventories(
-            weight_map,
-            handles,
-            src,
-            ranks=ranks_iter,
-            tp_degree=tp_degree,
-        )
+        if src.allow_reduced_shapes:
+            # Reduced fixtures replace the frozen production geometry, so the
+            # payload-derived inventory remains the correct test-only path.
+            inventories, inventory_visits = _layer_major_rank_inventories(
+                weight_map,
+                handles,
+                src,
+                ranks=ranks_iter,
+                tp_degree=tp_degree,
+            )
+            report["layer_conversion_strategy"] = "layer-major-multi-rank-two-pass"
+            report["layer_conversion_passes"] = 2
+        else:
+            inventories = _static_rank_inventories(
+                src,
+                ranks=ranks_iter,
+                tp_degree=tp_degree,
+            )
+            inventory_visits = 0
         write_started = time.time()
         writers: dict[int, StreamingRankWriter] = {}
         output_paths: dict[int, str] = {}
@@ -802,7 +999,11 @@ def stream_shard_dsv4_checkpoint(
                 consume=partial(_write_layer_major_tensor, writers),
             )
             report["layer_conversion_visits"] = inventory_visits + write_visits
-            expected_visits = 2 * src.num_hidden_layers
+            expected_visits = (
+                2 * src.num_hidden_layers
+                if src.allow_reduced_shapes
+                else src.num_hidden_layers
+            )
             if report["layer_conversion_visits"] != expected_visits:
                 raise RuntimeError(
                     "layer-major conversion count drift: expected "
