@@ -71,6 +71,16 @@ def test_dsa_pool_topk_preserves_values_indices_and_ties_on_cpu(
     assert indices.dtype == torch.int64
 
 
+def test_dsa_pool_topk_all_pools_avoids_topk_and_preserves_pool_order() -> None:
+    """S128's k==pools case must not lower to a full-vocabulary sort."""
+    scores = torch.tensor([[[4.0, 4.0, 1.0, 4.0]]], dtype=torch.float32)
+
+    values, indices = _dsa_pool_topk(scores, k=scores.shape[-1])
+
+    torch.testing.assert_close(values, scores, rtol=0.0, atol=0.0)
+    assert torch.equal(indices, torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int64))
+
+
 def test_dsa_pool_topk_hardware_path_fails_closed_when_nki_shape_is_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -80,6 +90,7 @@ def test_dsa_pool_topk_hardware_path_fails_closed_when_nki_shape_is_unsupported(
 
     class _FakeXlaScores:
         device = "xla:0"
+        shape = (1, 1, 32)
 
     monkeypatch.setattr(topk_module, "_can_use_nki_topk", lambda *args, **kwargs: False)
     with pytest.raises(RuntimeError, match="refusing torch.topk fallback"):

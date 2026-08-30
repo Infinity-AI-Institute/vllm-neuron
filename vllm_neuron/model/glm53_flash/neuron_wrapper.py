@@ -308,6 +308,18 @@ def _dsa_pool_topk(
     indices contract explicit for the adversarial semantic gate even though
     the DSA expansion currently consumes only the indices.
     """
+    # At S128 the GLM config has 32 pools and asks for all 32 (2048 // 4).
+    # Rotational TopK intentionally rejects k == vocab_size.  No reduction is
+    # needed in this case: preserve the complete candidate set in pool order.
+    # DSA consumes the indices as a set; keeping the original order also makes
+    # ties deterministic without introducing a sort.
+    if k == index_scores.shape[-1]:
+        indices = torch.arange(
+            index_scores.shape[-1], device=index_scores.device, dtype=torch.int64
+        )
+        indices = indices.expand(*index_scores.shape[:-1], -1)
+        return index_scores, indices
+
     from vllm_neuron.functional.topk import _can_use_nki_topk
     from vllm_neuron.functional.topk import topk as neuron_topk
 
