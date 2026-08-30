@@ -1,0 +1,48 @@
+{
+  "schema": "glm53-retained-tkg-artifact-v1",
+  "artifact_role": "retained compiler evidence; not a fresh compile",
+  "artifact_source": {
+    "source_commit": "93c3d8773d268612bc93307eb7a68ca70b8b9b23",
+    "source_tree": "61d5b9ad0b42672762839ae1b4e388a115cb8aa2",
+    "nxdi_commit": "e05466c657dda846f860083493dc18436788d969",
+    "checkpoint_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+  },
+  "source_identity": {
+    "relative_path": "artifacts/source-identity.json",
+    "sha256": "2a2fd20fe12275b0ad28b3abf2092f14c1f4c5822a7e11a0550980e73c94175b"
+  },
+  "effective_shape": {
+    "relative_path": "artifacts/effective-shape.json",
+    "sha256": "906b9a98853a12b555a9997f4375be555dfa0005aa975e958f2eae76968f038f"
+  },
+  "emitted_config": {
+    "relative_path": "artifacts/model/neuron_config.json",
+    "sha256": "38c9d7992e40b0c050589f2efb102daa9672c9fd1a20562cd73add16567aeba8"
+  },
+  "compile_result": {
+    "relative_path": "artifacts/compile-result.json",
+    "sha256": "a210d1785982716fda94a39eac6509f7ae12c2c41f8bb31ff206da2461785fab"
+  },
+  "compiler_evidence": {
+    "hlo_relative_path": "cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_77ae55b47e004249f8ec+8f34053f/model.hlo_module.pb",
+    "hlo_sha256": "cf1d196cc892aae712217fb945437a2cb5979cca2ad08976c57eebda41fa2fc5",
+    "neff_relative_path": "cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_77ae55b47e004249f8ec+8f34053f/model.neff",
+    "neff_sha256": "b6f12210459ce13deb4b0be24d6f79d896df8e8c6425135723c6538bb4bdb41d",
+    "neff_bytes": 9674760,
+    "compiler_version": "neuronxcc-2.26.6360.0+6f180f47"
+  },
+  "topology": {
+    "tp": 32,
+    "lnc": 2,
+    "batch": 1,
+    "sequence": 128,
+    "dtype": "bfloat16",
+    "kv_cache_quant": false,
+    "quantized": false,
+    "speculation": false,
+    "emit_phases": "TKG",
+    "models_compiled": [
+      "token_generation_model"
+    ]
+  }
+}
