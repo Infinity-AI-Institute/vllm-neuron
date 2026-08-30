@@ -1,4 +1,4 @@
-"""Host-only GLM-5.3-Flash checkpoint conversion contracts."""
+"""GLM-5.3-Flash conversion, artifact, and compile adapter surfaces."""
 
 from .checkpoint_converter import (
     GLM53_CHECKPOINT_REVISION,
@@ -8,6 +8,20 @@ from .checkpoint_converter import (
     kda_conv1d_per_head_layout,
     preflight_checkpoint_metadata,
 )
+from .compile_adapter import (
+    GLM53_COMPILE_ADAPTER_SCHEMA,
+    Glm53CompileAdapterError,
+    assert_emitted_neuron_config,
+    compile_kwargs,
+)
+from .config import Glm53FlashInferenceConfig
+from .model import NeuronGlm53FlashForCausalLMImpl
+from .neuron_wrapper import (
+    GLM53_BLOCKWISE_MATMUL_WORKAROUND,
+    Glm53FlashNeuronInferenceConfig,
+    NeuronGlm53FlashForCausalLM,
+    build_neuron_config,
+)
 from .rank_plan import (
     Glm53RankPlan,
     PlannedSourceSpec,
@@ -15,6 +29,7 @@ from .rank_plan import (
     build_glm53_rank_plan,
     stream_glm53_rank_checkpoint,
 )
+from .registry import _GLM53_GRAPH_ID, GLM53_SOURCE_CACHE_ABI
 from .runtime_config import (
     GLM53_ARCHITECTURE,
     GLM53_RUNTIME_CONFIG_SCHEMA,
@@ -44,13 +59,20 @@ from .streaming_rank_writer import (
 
 __all__ = [
     "GLM53_ARCHITECTURE",
+    "GLM53_BLOCKWISE_MATMUL_WORKAROUND",
     "GLM53_CHECKPOINT_REVISION",
+    "GLM53_COMPILE_ADAPTER_SCHEMA",
     "GLM53_RUNTIME_ADAPTER",
     "GLM53_RUNTIME_BUNDLE_SCHEMA",
     "GLM53_RUNTIME_CONFIG_SCHEMA",
     "GLM53_RUNTIME_FACTORY_ABI",
+    "GLM53_SOURCE_CACHE_ABI",
+    "_GLM53_GRAPH_ID",
     "Glm53CheckpointReport",
     "Glm53CompileLaunchPolicy",
+    "Glm53CompileAdapterError",
+    "Glm53FlashInferenceConfig",
+    "Glm53FlashNeuronInferenceConfig",
     "Glm53RankPlan",
     "Glm53RuntimeArtifactBundle",
     "Glm53RuntimeConfig",
@@ -60,6 +82,8 @@ __all__ = [
     "Glm53RuntimeRank",
     "Glm53StreamingError",
     "IndexedTensorReader",
+    "NeuronGlm53FlashForCausalLM",
+    "NeuronGlm53FlashForCausalLMImpl",
     "PlannedSourceSpec",
     "RankInventory",
     "StreamingRankWriter",
@@ -67,7 +91,10 @@ __all__ = [
     "TensorChunk",
     "TensorSpec",
     "build_glm53_rank_plan",
+    "build_neuron_config",
+    "assert_emitted_neuron_config",
     "classify_tensor",
+    "compile_kwargs",
     "dequantize_block_fp8",
     "get_runtime_factories",
     "kda_conv1d_per_head_layout",
