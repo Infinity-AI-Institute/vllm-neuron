@@ -36,6 +36,7 @@ for package_name in (
 PREP = _load_module(
     "vllm_neuron.model.glm53_flash.card_prep", PACKAGE_PATH / "card_prep.py"
 )
+TOOL = _load_module("glm53_tkg_card_prep", ROOT / "tools" / "glm53_tkg_card_prep.py")
 
 
 def _write_artifact(
@@ -285,6 +286,66 @@ def test_zero_byte_rank_bundle_cannot_publish_continuation_readiness(
     )
     assert receipt.rank_bundle_present is False
     assert receipt.continuation_tkg_ready is False
+
+
+def test_cli_forwards_external_retained_packet_without_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "artifact"
+    packet = tmp_path / "external" / "RETAINED-TKG-ARTIFACT-PACKET.json"
+    output = tmp_path / "receipt.json"
+    calls: dict[str, object] = {}
+
+    def fake_inspect(*args, **kwargs):
+        calls["args"] = args
+        calls.update(kwargs)
+        return SimpleNamespace(
+            to_mapping=lambda: {"schema": "test"}, sha256=lambda: "a" * 64
+        )
+
+    monkeypatch.setattr(TOOL, "inspect_tkg_artifact", fake_inspect)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "glm53_tkg_card_prep.py",
+            "--artifact-root",
+            str(artifact),
+            "--retained-packet",
+            str(packet),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert TOOL.main() == 0
+    assert calls["args"] == (artifact,)
+    assert calls["retained_packet_path"] == packet
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "receipt_sha256": "a" * 64,
+        "schema": "test",
+    }
+
+
+def test_cli_omitted_retained_packet_preserves_checked_in_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_inspect(*args, **kwargs):
+        calls["args"] = args
+        calls.update(kwargs)
+        return SimpleNamespace(to_mapping=dict, sha256=lambda: "b" * 64)
+
+    monkeypatch.setattr(TOOL, "inspect_tkg_artifact", fake_inspect)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["glm53_tkg_card_prep.py", "--artifact-root", str(tmp_path / "artifact")],
+    )
+
+    assert TOOL.main() == 0
+    assert calls["retained_packet_path"] is None
 
 
 def test_retained_artifact_gate_verifies_actual_hlo_neff_and_packet() -> None:
