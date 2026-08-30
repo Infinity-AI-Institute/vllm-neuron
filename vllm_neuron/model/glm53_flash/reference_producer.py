@@ -15,7 +15,7 @@ import json
 import shutil
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +93,8 @@ class Glm53OriginalTargetProducerSpec:
     checkpoint_revision: str = GLM53_CHECKPOINT_REVISION
     config_sha256: str = GLM53_CONFIG_SHA256
     index_sha256: str = GLM53_INDEX_SHA256
+    tokenizer_versions: Mapping[str, str] = field(default_factory=dict)
+    prompt_token_ids: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.reference_id, "reference_id")
@@ -136,6 +138,31 @@ class Glm53OriginalTargetProducerSpec:
         for key, value in self.loader_versions.items():
             _text(key, "loader version key")
             _text(value, f"loader version {key}")
+        has_tokenizer_versions = bool(self.tokenizer_versions)
+        has_prompt_token_ids = bool(self.prompt_token_ids)
+        _require(
+            has_tokenizer_versions == has_prompt_token_ids,
+            "tokenizer versions and prompt token ids must be bound together",
+        )
+        if has_tokenizer_versions:
+            for key, value in self.tokenizer_versions.items():
+                _text(key, "tokenizer version key")
+                _text(value, f"tokenizer version {key}")
+            _require(
+                set(self.prompt_token_ids) == set(self.prompt_ids),
+                "prompt token ids must bind exactly the four feedback prompts",
+            )
+            for prompt_id in self.prompt_ids:
+                token_ids = self.prompt_token_ids[prompt_id]
+                _require(
+                    isinstance(token_ids, tuple)
+                    and token_ids
+                    and all(
+                        type(token_id) is int and token_id >= 0
+                        for token_id in token_ids
+                    ),
+                    f"prompt token ids are invalid for {prompt_id}",
+                )
 
     @property
     def expected_rows(self) -> tuple[tuple[int, str, int], ...]:
@@ -156,7 +183,7 @@ class Glm53OriginalTargetProducer:
         self,
         *,
         loader: Callable[[Path], Any],
-        run_prompt: Callable[[Any, str, tuple[int, ...]], Sequence[torch.Tensor]],
+        run_prompt: Callable[..., Sequence[torch.Tensor]],
         output_dir: str | Path,
     ) -> Path:
         """Emit a verified manifest and row files, or nothing publishable."""
@@ -179,7 +206,15 @@ class Glm53OriginalTargetProducer:
         try:
             model = loader(checkpoint_dir)
             for prompt_id in self.spec.prompt_ids:
-                values = run_prompt(model, prompt_id, self.spec.positions)
+                if self.spec.prompt_token_ids:
+                    values = run_prompt(
+                        model,
+                        prompt_id,
+                        self.spec.positions,
+                        self.spec.prompt_token_ids[prompt_id],
+                    )
+                else:
+                    values = run_prompt(model, prompt_id, self.spec.positions)
                 _require(
                     len(values) == len(self.spec.positions),
                     f"runner returned wrong position count for {prompt_id}",
@@ -238,6 +273,12 @@ class Glm53OriginalTargetProducer:
                 "loader_versions": dict(self.spec.loader_versions),
                 "rows": rows,
             }
+            if self.spec.prompt_token_ids:
+                manifest["tokenizer_versions"] = dict(self.spec.tokenizer_versions)
+                manifest["prompt_token_ids"] = {
+                    prompt_id: list(self.spec.prompt_token_ids[prompt_id])
+                    for prompt_id in self.spec.prompt_ids
+                }
             (partial / "reference.json").write_text(
                 json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n",
                 encoding="utf-8",

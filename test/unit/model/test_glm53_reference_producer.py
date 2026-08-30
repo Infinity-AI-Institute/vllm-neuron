@@ -73,6 +73,34 @@ def test_tiny_original_producer_emits_verified_4x10_full_vocab_bank(tmp_path: Pa
     )
 
 
+def test_producer_passes_and_serializes_bound_prompt_tokens(tmp_path: Path):
+    prompt_token_ids = {
+        f"feedback-{index}": (101 + index, 201 + index) for index in range(4)
+    }
+    spec = _spec(
+        tmp_path,
+        tokenizer_versions={"tokenizer": "tiny-tokenizer-v1"},
+        prompt_token_ids=prompt_token_ids,
+    )
+    seen = {}
+
+    def run_prompt(_model, prompt_id, positions, token_ids):
+        seen[prompt_id] = token_ids
+        return [torch.zeros(154_880, dtype=torch.float32) for _ in positions]
+
+    manifest_path = MODULE.Glm53OriginalTargetProducer(spec).produce(
+        loader=lambda _path: object(),
+        run_prompt=run_prompt,
+        output_dir=tmp_path / "bound-bank",
+    )
+    manifest = __import__("json").loads(manifest_path.read_text())
+    assert seen == prompt_token_ids
+    assert manifest["tokenizer_versions"] == {"tokenizer": "tiny-tokenizer-v1"}
+    assert manifest["prompt_token_ids"] == {
+        prompt_id: list(token_ids) for prompt_id, token_ids in prompt_token_ids.items()
+    }
+
+
 def test_producer_rejects_wrong_shape_and_publishes_nothing(tmp_path: Path):
     spec = _spec(tmp_path)
     producer = MODULE.Glm53OriginalTargetProducer(spec)
@@ -96,6 +124,8 @@ def test_producer_rejects_wrong_shape_and_publishes_nothing(tmp_path: Path):
         ({"positions": (0, 1)}, "positions 0 through 9"),
         ({"loader_versions": {}}, "loader versions"),
         ({"semantics": "Q4_K_M"}, "semantics"),
+        ({"tokenizer_versions": {"tokenizer": "v1"}}, "together"),
+        ({"prompt_token_ids": {"feedback-0": (1,)}}, "together"),
     ],
 )
 def test_producer_spec_rejects_feedback_or_identity_drift(tmp_path, changes, match):

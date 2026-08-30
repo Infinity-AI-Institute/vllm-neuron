@@ -15,7 +15,7 @@ import importlib
 import json
 import sys
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,23 @@ def _loader_versions(values: list[str]) -> dict[str, str]:
     return result
 
 
+def _prompt_token_ids(tokenizer: Callable[..., Any], prompt_ids: tuple[str, ...]):
+    result: dict[str, tuple[int, ...]] = {}
+    for prompt_id in prompt_ids:
+        encoded = tokenizer(prompt_id)
+        if isinstance(encoded, Mapping):
+            encoded = encoded.get("input_ids")
+        if isinstance(encoded, (str, bytes)) or not isinstance(encoded, Sequence):
+            raise TypeError(f"tokenizer returned invalid input_ids for {prompt_id}")
+        token_ids = tuple(encoded)
+        if not token_ids or not all(
+            type(token_id) is int and token_id >= 0 for token_id in token_ids
+        ):
+            raise ValueError(f"tokenizer returned invalid input_ids for {prompt_id}")
+        result[prompt_id] = token_ids
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
@@ -86,7 +103,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantics", required=True)
     parser.add_argument("--loader", required=True, help="MODULE:CALLABLE")
     parser.add_argument("--runner", required=True, help="MODULE:CALLABLE")
+    parser.add_argument("--tokenizer", help="MODULE:CALLABLE returning input_ids")
     parser.add_argument("--loader-version", action="append", default=[])
+    parser.add_argument("--tokenizer-version", action="append", default=[])
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -112,6 +131,16 @@ def main(
         raise ValueError("--checkpoint-dir must be a directory")
     preflight_fn(checkpoint_dir)
     versions = _loader_versions(args.loader_version)
+    if bool(args.tokenizer) != bool(args.tokenizer_version):
+        raise ValueError(
+            "--tokenizer and --tokenizer-version must be supplied together"
+        )
+    tokenizer_versions = {}
+    prompt_token_ids = {}
+    if args.tokenizer:
+        tokenizer = _callable(args.tokenizer, "--tokenizer")
+        tokenizer_versions = _loader_versions(args.tokenizer_version)
+        prompt_token_ids = _prompt_token_ids(tokenizer, GLM53_PROMPTS)
     spec = spec_type(
         reference_id=args.reference_id,
         checkpoint_dir=checkpoint_dir,
@@ -120,7 +149,11 @@ def main(
         prompt_ids=GLM53_PROMPTS,
         positions=GLM53_POSITIONS,
         vocab_size=GLM53_VOCAB_SIZE,
+        tokenizer_versions=tokenizer_versions,
+        prompt_token_ids=prompt_token_ids,
     )
+    bound_prompt_token_ids = getattr(spec, "prompt_token_ids", {})
+    bound_tokenizer_versions = getattr(spec, "tokenizer_versions", {})
     if args.dry_run:
         print(
             json.dumps(
@@ -130,6 +163,14 @@ def main(
                     "reference_id": spec.reference_id,
                     "semantics": spec.semantics,
                     "loader_versions": dict(spec.loader_versions),
+                    "tokenizer_versions": dict(bound_tokenizer_versions),
+                    "prompt_token_ids": {
+                        prompt_id: list(bound_prompt_token_ids[prompt_id])
+                        for prompt_id in spec.prompt_ids
+                    }
+                    if bound_prompt_token_ids
+                    else {},
+                    "tokenizer_bound": bool(bound_prompt_token_ids),
                     "vocab_size": spec.vocab_size,
                     "prompt_ids": list(spec.prompt_ids),
                     "positions": list(spec.positions),
@@ -143,6 +184,10 @@ def main(
             )
         )
         return 0
+    if not bound_prompt_token_ids:
+        raise ValueError(
+            "non-dry production requires --tokenizer and --tokenizer-version"
+        )
     loader = _callable(args.loader, "--loader")
     runner = _callable(args.runner, "--runner")
     manifest = producer_type(spec).produce(

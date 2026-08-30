@@ -28,6 +28,10 @@ class _Producer:
         pass
 
 
+def _tokenize(prompt_id):
+    return {"input_ids": [11, len(prompt_id)]}
+
+
 def test_cli_dry_run_emits_exact_4x10_contract(tmp_path, capsys):
     checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
     checkpoint.mkdir()
@@ -85,6 +89,68 @@ def test_cli_rejects_duplicate_loader_version_before_provider_load(tmp_path):
                 "--loader-version",
                 "torch=2.9.1-other",
                 "--dry-run",
+            ],
+            preflight=lambda _path: object(),
+            producer_cls=_Producer,
+            spec_cls=_Spec,
+        )
+
+
+def test_cli_dry_run_records_tokenizer_binding(tmp_path, capsys):
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    MODULE.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--output-dir",
+            str(tmp_path / "bank"),
+            "--reference-id",
+            "original-test",
+            "--semantics",
+            "native-block-fp8-dequantized-bfloat16",
+            "--loader",
+            "test_loader:load",
+            "--runner",
+            "test_runner:run",
+            "--tokenizer",
+            f"{__name__}:_tokenize",
+            "--loader-version",
+            "torch=2.9.1-test",
+            "--tokenizer-version",
+            "tokenizer=tiny-v1",
+            "--dry-run",
+        ],
+        preflight=lambda _path: object(),
+        producer_cls=_Producer,
+        spec_cls=_Spec,
+    )
+    output = capsys.readouterr().out
+    assert '"tokenizer_bound": true' in output
+    assert '"tokenizer_versions": {\n    "tokenizer": "tiny-v1"' in output
+    assert '"prompt_token_ids": {\n    "feedback-0": [\n      11,' in output
+
+
+def test_cli_rejects_non_dry_run_without_tokenizer_binding(tmp_path):
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    with pytest.raises(ValueError, match="requires --tokenizer"):
+        MODULE.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--output-dir",
+                str(tmp_path / "bank"),
+                "--reference-id",
+                "original-test",
+                "--semantics",
+                "native-block-fp8-dequantized-bfloat16",
+                "--loader",
+                "test_loader:load",
+                "--runner",
+                "test_runner:run",
+                "--loader-version",
+                "torch=2.9.1-test",
             ],
             preflight=lambda _path: object(),
             producer_cls=_Producer,

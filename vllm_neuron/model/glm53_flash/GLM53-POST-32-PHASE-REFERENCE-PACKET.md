@@ -167,11 +167,15 @@ The producer's successful receipt still does not authorize correctness.
 The exact fail-fast entry point is
 `tools/glm53_reference_target_producer.py`.  Run `--dry-run` first with the
 real pinned checkpoint path, `--loader MODULE:CALLABLE`, `--runner
-MODULE:CALLABLE`, and one or more `--loader-version KEY=VERSION` values.  The
-dry run validates checkpoint metadata and emits the 4x10 contract without
-loading weights.  Remove `--dry-run` only when the provider is a real
-CPU-only original-target loader/runner; it then writes 40 rows transactionally
-and publishes `reference.json` only after all checks pass.
+MODULE:CALLABLE`, `--tokenizer MODULE:CALLABLE`, one or more
+`--loader-version KEY=VERSION` values, and one or more
+`--tokenizer-version KEY=VERSION` values.  The dry run validates checkpoint
+metadata and the tokenizer's four non-empty integer `input_ids` sequences,
+then emits the 4x10 contract without loading weights.  Remove `--dry-run` only
+when the provider is a real CPU-only original-target loader/runner; the runner
+then receives the bound prompt IDs and writes 40 rows transactionally, and
+`reference.json` is published only after all checks pass.  Non-dry mode rejects
+an absent tokenizer binding.
 
 Admission is fail-closed at >=1.1 TiB available RAM and >=1.1 TiB free scratch,
 with 32-64 physical CPU cores isolated from active lanes.  Prefer one SMT
