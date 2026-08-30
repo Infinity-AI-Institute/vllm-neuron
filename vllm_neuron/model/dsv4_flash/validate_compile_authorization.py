@@ -669,6 +669,20 @@ def _validate_ranks(
         and [item.get("rank") for item in ranks] == list(range(32)),
         "rank inventory must cover 0..31",
     )
+    rank_artifact_dir = root / "ranks"
+    _require(rank_artifact_dir.is_dir(), "rank artifact directory missing")
+    expected_artifacts = {
+        name
+        for rank in range(32)
+        for name in (f"tp{rank}.safetensors", f"tp{rank}.manifest.json")
+    }
+    actual_artifacts = {
+        path.name for path in rank_artifact_dir.iterdir() if path.is_file()
+    }
+    _require(
+        actual_artifacts == expected_artifacts,
+        "rank artifact inventory contains missing or extra files",
+    )
     inventory_hashes: set[str] = set()
     checkpoint_hashes: set[str] = set()
     for item in ranks:
