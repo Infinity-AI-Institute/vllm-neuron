@@ -44,6 +44,13 @@ python "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py"
   --rank-source "$RANK_SOURCE_DIR" \
   --source-dir "$SRC_DIR" \
   --require-compile-permitted
+
+# A compile run must be a fresh transaction.  Reusing any of these output
+# directories could mix stale compiler cache, NEFF, logs, or model artifacts
+# into an otherwise valid input-evidence run.
+for output_dir in cache work artifacts logs; do
+  test ! -e "$COMPILE_RUN_ROOT/$output_dir"
+done
 mkdir -p "$COMPILE_RUN_ROOT"/{cache,work/tmp,work/nxd,artifacts/model,logs}
 
 # The stream sharder writes the rank files before this driver is queued.  Do
