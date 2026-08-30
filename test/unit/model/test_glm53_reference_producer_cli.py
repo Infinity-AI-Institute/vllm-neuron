@@ -76,6 +76,7 @@ def test_cli_dry_run_emits_exact_4x10_contract(tmp_path, capsys):
     assert '"vocab_size": 154880' in output
     assert '"device_used": false' in output
     assert '"weights_loaded": false' in output
+    assert '"provider_bound": false' in output
 
 
 def test_cli_rejects_duplicate_loader_version_before_provider_load(tmp_path):
