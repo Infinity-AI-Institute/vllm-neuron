@@ -28,6 +28,24 @@ correctness, performance, or tokenomics claim.
 - Required runtime: TP32/LNC2/B1/S128, BF16, no quantization, greedy, no
   speculation.
 
+## Observed post-32 terminal
+
+The existing producer completed naturally with 32/32 rank files and 32/32
+manifests in
+`/mnt/instance-scratch/glm53-rank-bundle-2669054.partial`.  Every rank file
+was verified against its manifest at exactly `19,859,842,320` bytes and its
+declared SHA-256.  The producer's directory was not renamed or modified.
+
+The first phase-handoff attempt against the retained staged artifacts exposed
+one exact metadata blocker after the staged-cache lookup was corrected in
+memory: CTE `artifacts/launch-receipt.json` contains null `source_commit` and
+`source_tree`, while the compose/TKG identity is
+`source_commit=93c3d8773d268612bc93307eb7a68ca70b8b9b23` and
+`source_tree=61d5b9ad0b42672762839ae1b4e388a115cb8aa2`.  The phase receipt is
+therefore not emitted.  Repair or replace that immutable CTE launch
+provenance before rerunning Gate 2; do not weaken the verifier or infer source
+identity from the checkpoint.
+
 ## Gate 1: completed-rank verification
 
 Use the exact checkpoint directory already bound in the producer's immutable
@@ -36,7 +54,7 @@ variables from that receipt and the producer's final output directory:
 
 ```bash
 export GLM53_CHECKPOINT_DIR=/exact/pinned/04c4e9e95c5da8862dced7e5056455116f83a7e0
-export GLM53_RANK_DIR=/mnt/instance-scratch/glm53-rank-bundle-2669054
+export GLM53_RANK_DIR=/mnt/instance-scratch/glm53-rank-bundle-2669054.partial
 export GLM53_REQUESTED_CONFIG=/exact/emitted/requested-runtime-config.json
 export GLM53_EMITTED_CONFIG=/exact/emitted/neuron_config.json
 ```
