@@ -164,6 +164,16 @@ identities.  A missing full-checkpoint CPU loader/runner is a capability gap;
 do not substitute Q4, a generic FP32 bank, or a confidence-only reference.
 The producer's successful receipt still does not authorize correctness.
 
+The source-only provider inventory was rechecked after PR28.  No module under
+`vllm_neuron/model/glm53_flash` implements an original-target tokenizer,
+checkpoint loader, or logits runner.  The generic example
+`examples/vllm_neuron/accuracy/compare_hf_vs_vllm_neuron.py` is only a near
+match: its `AutoModelForCausalLM.from_pretrained` and
+`AutoTokenizer.from_pretrained` calls do not pin this checkpoint revision,
+record native block-FP8/converted-BF16 semantics, or implement the required
+token-bound runner returning ten `(154880,)` rows per prompt.  It is therefore
+not an acceptable canonical provider or rescue reference.
+
 The exact fail-fast entry point is
 `tools/glm53_reference_target_producer.py`.  Run `--dry-run` first with the
 real pinned checkpoint path, `--loader MODULE:CALLABLE`, `--runner
