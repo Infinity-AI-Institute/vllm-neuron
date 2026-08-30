@@ -12,10 +12,13 @@ import argparse
 import gc
 import hashlib
 import json
+import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +62,20 @@ class Dsv4SourceReport:
             "tensor_count": self.tensor_count,
             "payload_bytes_loaded_during_audit": self.payload_bytes_loaded_during_audit,
         }
+
+
+@dataclass(frozen=True)
+class _ConvertedTensorPart:
+    """One bounded piece of a converted target tensor.
+
+    Expert tensors are emitted a source expert-chunk at a time. ``expert_start``
+    locates that chunk in the final tensor; non-expert tensors are complete.
+    """
+
+    key: str
+    tensor: torch.Tensor
+    expert_start: int | None = None
+    full_experts: int | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -306,15 +323,14 @@ def _wrapper_key(key: str) -> str:
     return key
 
 
-def _convert_one_layer(
+def _iter_converted_layer_parts(
     state: Mapping[str, torch.Tensor],
     layer_idx: int,
     src: DeepseekV4FlashInferenceConfig,
     *,
     expert_chunk_size: int = 8,
-    rank: int | None = None,
-    tp_degree: int | None = None,
-) -> dict[str, torch.Tensor]:
+) -> Iterator[_ConvertedTensorPart]:
+    """Yield one converted layer without concatenating its expert chunks."""
     layer_state = dict(state)
     layer_type = src.layer_types[layer_idx]
     if layer_type == "sliding_attention":
@@ -340,14 +356,15 @@ def _convert_one_layer(
     if expert_chunk_size <= 0:
         raise ValueError(f"expert_chunk_size must be positive; got {expert_chunk_size}")
 
-    # Dequantize only a small expert group at a time.  The converter's normal
-    # full-layer path is retained for CPU correctness tests; this path keeps
-    # peak host memory bounded while producing the same fused [E,H,2I] and
-    # [E,I,H] tensors for the selected rank.
+    for key, value in converted.items():
+        if not key.startswith("_"):
+            yield _ConvertedTensorPart(_wrapper_key(key), value)
+
+    # Dequantize only a small expert group at a time, and expose each piece to
+    # the layer-major fan-out before converting the next piece. This bounds
+    # peak host memory independently of TP degree and requested rank count.
     expert_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
     down_key = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"
-    gate_chunks: list[torch.Tensor] = []
-    down_chunks: list[torch.Tensor] = []
     for start in range(0, src.n_routed_experts, expert_chunk_size):
         indices = list(
             range(start, min(start + expert_chunk_size, src.n_routed_experts))
@@ -373,29 +390,62 @@ def _convert_one_layer(
             )
         gate_chunk = partial.pop(expert_key)
         down_chunk = partial.pop(down_key)
-        if rank is not None or tp_degree is not None:
-            if rank is None or tp_degree is None:
-                raise ValueError("rank and tp_degree must be provided together")
-            gate_chunk = _target_shard(expert_key, gate_chunk, rank, tp_degree)
-            down_chunk = _target_shard(down_key, down_chunk, rank, tp_degree)
-        gate_chunks.append(gate_chunk)
-        down_chunks.append(down_chunk)
         if start == 0:
-            converted.update(partial)
+            for key, value in partial.items():
+                if not key.startswith("_"):
+                    yield _ConvertedTensorPart(_wrapper_key(key), value)
         elif partial:
             raise RuntimeError(
                 "chunked DSv4 expert conversion emitted unexpected duplicate "
                 f"keys at layer {layer_idx}: {sorted(partial)}"
             )
+        yield _ConvertedTensorPart(
+            _wrapper_key(expert_key),
+            gate_chunk,
+            expert_start=start,
+            full_experts=src.n_routed_experts,
+        )
+        yield _ConvertedTensorPart(
+            _wrapper_key(down_key),
+            down_chunk,
+            expert_start=start,
+            full_experts=src.n_routed_experts,
+        )
         del partial
         gc.collect()
-    converted[expert_key] = torch.cat(gate_chunks, dim=0).contiguous()
-    converted[down_key] = torch.cat(down_chunks, dim=0).contiguous()
-    return {
-        _wrapper_key(key): value
-        for key, value in converted.items()
-        if not key.startswith("_")
-    }
+
+
+def _convert_one_layer(
+    state: Mapping[str, torch.Tensor],
+    layer_idx: int,
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    expert_chunk_size: int = 8,
+    rank: int | None = None,
+    tp_degree: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compatibility collector for tests and the legacy rank iterator."""
+    if (rank is None) != (tp_degree is None):
+        raise ValueError("rank and tp_degree must be provided together")
+    converted: dict[str, torch.Tensor] = {}
+    expert_chunks: dict[str, list[torch.Tensor]] = {}
+    for part in _iter_converted_layer_parts(
+        state, layer_idx, src, expert_chunk_size=expert_chunk_size
+    ):
+        tensor = part.tensor
+        # Preserve the legacy contract: expert chunks are TP-sliced before
+        # concatenation to bound memory; the caller shards all other tensors.
+        if part.expert_start is not None and rank is not None and tp_degree is not None:
+            tensor = _target_shard(part.key, tensor, rank, tp_degree)
+        if part.expert_start is None:
+            if part.key in converted:
+                raise RuntimeError(f"duplicate converted layer key: {part.key}")
+            converted[part.key] = tensor
+        else:
+            expert_chunks.setdefault(part.key, []).append(tensor)
+    for key, chunks in expert_chunks.items():
+        converted[key] = torch.cat(chunks, dim=0).contiguous()
+    return converted
 
 
 def _iter_rank_tensors(
@@ -472,17 +522,353 @@ def _rank_inventory(
     return RankInventory(rank=rank, tp_degree=tp_degree, tensors=tuple(specs))
 
 
+def _walk_layer_major_rank_tensors(
+    weight_map: dict[str, str],
+    handles: dict[str, Any],
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    ranks: list[int],
+    tp_degree: int,
+    consume: Callable[[int, str, torch.Tensor, int, tuple[int, ...]], None],
+) -> int:
+    """Convert each source layer once, then fan each bounded piece to ranks."""
+    top_state = _MmapState(
+        weight_map,
+        handles,
+        {key for key in weight_map if not key.startswith("layers.")},
+    )
+    embed = top_state.get("embed.weight")
+    final_norm = top_state.get("norm.weight")
+    lm_head = top_state.get("head.weight")
+    if embed is None or final_norm is None:
+        raise KeyError("embed.weight and norm.weight are required")
+    if lm_head is None:
+        if not src.tie_word_embeddings:
+            raise KeyError("head.weight is required when tie_word_embeddings=False")
+        lm_head = embed
+    top_tensors = {
+        "embed_tokens.weight": embed.to(src.torch_dtype),
+        "final_norm_weight": final_norm.to(src.torch_dtype).contiguous(),
+        "lm_head.weight": lm_head.to(src.torch_dtype),
+        **_convert_mhc_head(top_state, src),
+    }
+    for key, tensor in top_tensors.items():
+        for rank in ranks:
+            rank_tensor = _target_shard(key, tensor, rank, tp_degree)
+            consume(rank, key, rank_tensor, 0, tuple(rank_tensor.shape))
+            del rank_tensor
+        del tensor
+    del top_tensors, top_state
+    gc.collect()
+
+    layer_visits = 0
+    for layer_idx in range(src.num_hidden_layers):
+        layer_keys = {
+            key for key in weight_map if key.startswith(f"layers.{layer_idx}.")
+        }
+        state = _MmapState(weight_map, handles, layer_keys)
+        layer_visits += 1
+        for part in _iter_converted_layer_parts(state, layer_idx, src):
+            for rank in ranks:
+                rank_tensor = _target_shard(part.key, part.tensor, rank, tp_degree)
+                if part.expert_start is None:
+                    start_element = 0
+                    full_shape = tuple(rank_tensor.shape)
+                else:
+                    if part.full_experts is None:
+                        raise RuntimeError(
+                            "expert tensor part has no full expert count"
+                        )
+                    trailing_elements = math.prod(rank_tensor.shape[1:])
+                    start_element = part.expert_start * trailing_elements
+                    full_shape = (part.full_experts, *rank_tensor.shape[1:])
+                consume(rank, part.key, rank_tensor, start_element, full_shape)
+                del rank_tensor
+            del part
+            gc.collect()
+        del state
+        gc.collect()
+    return layer_visits
+
+
+def _layer_major_rank_inventories(
+    weight_map: dict[str, str],
+    handles: dict[str, Any],
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    ranks: list[int],
+    tp_degree: int,
+) -> tuple[dict[int, RankInventory], int]:
+    specs: dict[int, dict[str, TensorSpec]] = {rank: {} for rank in ranks}
+    next_elements: dict[tuple[int, str], int] = {}
+
+    def collect(
+        rank: int,
+        key: str,
+        tensor: torch.Tensor,
+        start_element: int,
+        full_shape: tuple[int, ...],
+    ) -> None:
+        candidate = TensorSpec(key, tensor.dtype, full_shape)
+        existing = specs[rank].get(key)
+        if existing is None:
+            if start_element != 0:
+                raise RuntimeError(
+                    f"first inventory part for rank {rank} {key} starts at "
+                    f"{start_element}, not zero"
+                )
+            specs[rank][key] = candidate
+        elif existing != candidate:
+            raise RuntimeError(
+                f"inventory drift across pieces for rank {rank} {key}: "
+                f"{existing} != {candidate}"
+            )
+        expected = next_elements.get((rank, key), 0)
+        if start_element != expected:
+            raise RuntimeError(
+                f"non-contiguous inventory parts for rank {rank} {key}: "
+                f"expected {expected}, got {start_element}"
+            )
+        next_elements[(rank, key)] = start_element + tensor.numel()
+
+    layer_visits = _walk_layer_major_rank_tensors(
+        weight_map,
+        handles,
+        src,
+        ranks=ranks,
+        tp_degree=tp_degree,
+        consume=collect,
+    )
+    inventories: dict[int, RankInventory] = {}
+    for rank in ranks:
+        for key, spec in specs[rank].items():
+            if next_elements[(rank, key)] != spec.numel:
+                raise RuntimeError(
+                    f"inventory for rank {rank} {key} covers "
+                    f"{next_elements[(rank, key)]}/{spec.numel} elements"
+                )
+        inventories[rank] = RankInventory(
+            rank=rank,
+            tp_degree=tp_degree,
+            tensors=tuple(specs[rank].values()),
+        )
+    return inventories, layer_visits
+
+
+def _static_rank_inventories(
+    src: DeepseekV4FlashInferenceConfig,
+    *,
+    ranks: list[int],
+    tp_degree: int,
+) -> dict[int, RankInventory]:
+    """Build the frozen full-shape inventory without loading tensor payloads.
+
+    The full production adapter has a closed architecture contract: every
+    converted tensor's output shape and dtype are determined by ``src`` and
+    its layer schedule.  The writer still checks every emitted payload against
+    this inventory, so using the contract here removes the old conversion-only
+    inventory pass without weakening shape, dtype, or coverage validation.
+
+    Reduced-shape fixtures intentionally keep the payload-derived inventory
+    path because they are allowed to replace the frozen DSv4 geometry.
+    """
+    dtype = src.torch_dtype
+    hidden = int(src.hidden_size)
+    vocab = int(src.vocab_size)
+    heads = int(src.num_attention_heads)
+    head_dim = int(src.head_dim)
+    q_lora = int(src.q_lora_rank)
+    o_groups = int(src.o_groups)
+    o_lora = int(src.o_lora_rank)
+    experts = int(src.n_routed_experts)
+    top_k = int(src.num_experts_per_tok)
+    inter = int(src.moe_intermediate_size)
+    index_heads = int(src.index_n_heads)
+    index_head_dim = int(src.index_head_dim)
+    hc = int(src.hc_mult)
+    mhc_mix = (2 + hc) * hc
+    num_layers = int(src.num_hidden_layers)
+
+    if num_layers != 43:
+        raise ValueError(
+            "static DSv4 inventory requires the frozen 43-layer production shape"
+        )
+    if any(
+        size % tp_degree
+        for size in (vocab, q_lora, heads * head_dim, o_groups * o_lora, inter)
+    ):
+        raise ValueError(
+            "static DSv4 inventory requires TP-divisible vocabulary, query, "
+            "output, and intermediate dimensions"
+        )
+    if (heads * head_dim) % o_groups:
+        raise ValueError("static DSv4 inventory requires grouped output divisibility")
+
+    def build_specs() -> list[TensorSpec]:
+        specs: list[TensorSpec] = []
+
+        def add(name: str, item_dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+            specs.append(TensorSpec(name, item_dtype, shape))
+
+        add("embed_tokens.weight", dtype, (vocab // tp_degree, hidden))
+        add("final_norm_weight", dtype, (hidden,))
+        add("lm_head.weight", dtype, (vocab // tp_degree, hidden))
+        add("hc_head_fn", torch.float32, (hc, hc * hidden))
+        add("hc_head_base", torch.float32, (hc,))
+        add("hc_head_scale", torch.float32, (1,))
+
+        for layer_idx in range(num_layers):
+            prefix = f"layers.{layer_idx}."
+            add(f"{prefix}attn.mqa.wq_a.weight", dtype, (q_lora // tp_degree, hidden))
+            add(
+                f"{prefix}attn.mqa.wq_b.weight",
+                dtype,
+                (heads * head_dim // tp_degree, q_lora),
+            )
+            add(f"{prefix}attn.mqa.wkv.weight", dtype, (head_dim, hidden))
+            add(
+                f"{prefix}attn.mqa.wo_a.weight",
+                dtype,
+                (o_groups * o_lora // tp_degree, (heads * head_dim) // o_groups),
+            )
+            add(
+                f"{prefix}attn.mqa.wo_b.weight",
+                dtype,
+                (hidden, o_groups * o_lora // tp_degree),
+            )
+            add(f"{prefix}attn.mqa.q_norm.weight", dtype, (q_lora,))
+            add(f"{prefix}attn.mqa.kv_norm.weight", dtype, (head_dim,))
+            add(f"{prefix}attn.mqa.attn_sink", dtype, (heads,))
+            add(f"{prefix}attn_norm.weight", dtype, (hidden,))
+
+            layer_type = src.layer_types[layer_idx]
+            if layer_type == "compressed_sparse_attention":
+                ratio = 4
+                for name, shape in (
+                    ("wkv.weight", (2 * head_dim, hidden)),
+                    ("wgate.weight", (2 * head_dim, hidden)),
+                    ("ape", (ratio, 2 * head_dim)),
+                    ("norm.weight", (head_dim,)),
+                ):
+                    add(f"{prefix}attn.compressor.{name}", dtype, shape)
+                for name, shape in (
+                    ("wkv.weight", (2 * index_head_dim, hidden)),
+                    ("wgate.weight", (2 * index_head_dim, hidden)),
+                    ("ape", (ratio, 2 * index_head_dim)),
+                    ("norm.weight", (index_head_dim,)),
+                ):
+                    add(f"{prefix}attn.indexer.compressor.{name}", dtype, shape)
+                add(
+                    f"{prefix}attn.indexer.weights_proj.weight",
+                    dtype,
+                    (index_heads, hidden),
+                )
+                add(
+                    f"{prefix}attn.indexer.wq_b.weight",
+                    dtype,
+                    (index_heads * index_head_dim, q_lora),
+                )
+            elif layer_type == "heavily_compressed_attention":
+                ratio = 128
+                for name, shape in (
+                    ("wkv.weight", (head_dim, hidden)),
+                    ("wgate.weight", (head_dim, hidden)),
+                    ("ape", (ratio, head_dim)),
+                    ("norm.weight", (head_dim,)),
+                ):
+                    add(f"{prefix}attn.compressor.{name}", dtype, shape)
+            elif layer_type != "sliding_attention":
+                raise ValueError(
+                    f"unsupported DSv4 attention layer type {layer_type!r} "
+                    f"at {layer_idx}"
+                )
+
+            add(f"{prefix}ffn_norm.weight", dtype, (hidden,))
+            add(f"{prefix}hc_attn_fn", torch.float32, (mhc_mix, hc * hidden))
+            add(f"{prefix}hc_attn_base", torch.float32, (mhc_mix,))
+            add(f"{prefix}hc_attn_scale", torch.float32, (3,))
+            add(f"{prefix}hc_ffn_fn", torch.float32, (mhc_mix, hc * hidden))
+            add(f"{prefix}hc_ffn_base", torch.float32, (mhc_mix,))
+            add(f"{prefix}hc_ffn_scale", torch.float32, (3,))
+            add(f"{prefix}mlp.router.weight", torch.float32, (experts, hidden))
+            mlp_type = src.mlp_layer_types[layer_idx]
+            if mlp_type == "hash_moe":
+                add(f"{prefix}mlp.tid2eid", torch.int32, (vocab, top_k))
+            elif mlp_type == "moe":
+                add(
+                    f"{prefix}mlp.e_score_correction_bias",
+                    torch.float32,
+                    (experts,),
+                )
+            else:
+                raise ValueError(
+                    f"unsupported DSv4 MLP layer type {mlp_type!r} at {layer_idx}"
+                )
+            add(
+                f"{prefix}mlp.shared_expert.gate_proj.weight",
+                dtype,
+                (inter // tp_degree, hidden),
+            )
+            add(
+                f"{prefix}mlp.shared_expert.up_proj.weight",
+                dtype,
+                (inter // tp_degree, hidden),
+            )
+            add(
+                f"{prefix}mlp.shared_expert.down_proj.weight",
+                dtype,
+                (hidden, inter // tp_degree),
+            )
+            add(
+                f"{prefix}mlp.expert_mlps.mlp_op.gate_up_proj.weight",
+                dtype,
+                (experts, hidden, 2 * inter // tp_degree),
+            )
+            add(
+                f"{prefix}mlp.expert_mlps.mlp_op.down_proj.weight",
+                dtype,
+                (experts, inter // tp_degree, hidden),
+            )
+        return specs
+
+    specs = tuple(build_specs())
+    if len(specs) != 1285:
+        raise RuntimeError(f"static DSv4 inventory key count drift: {len(specs)}")
+    return {
+        rank: RankInventory(rank=rank, tp_degree=tp_degree, tensors=specs)
+        for rank in ranks
+    }
+
+
 def _write_bounded_tensor(
     writer: StreamingRankWriter,
     key: str,
     tensor: torch.Tensor,
+    *,
+    start_element: int = 0,
 ) -> None:
     flat = tensor.contiguous().view(-1)
     elements_per_chunk = max(1, writer.max_chunk_bytes // flat.element_size())
     for start in range(0, flat.numel(), elements_per_chunk):
         writer.write_chunk(
-            TensorChunk(key, start, flat[start : start + elements_per_chunk])
+            TensorChunk(
+                key,
+                start_element + start,
+                flat[start : start + elements_per_chunk],
+            )
         )
+
+
+def _write_layer_major_tensor(
+    writers: Mapping[int, StreamingRankWriter],
+    rank: int,
+    key: str,
+    tensor: torch.Tensor,
+    start_element: int,
+    full_shape: tuple[int, ...],
+) -> None:
+    del full_shape
+    _write_bounded_tensor(writers[rank], key, tensor, start_element=start_element)
 
 
 def stream_shard_dsv4_checkpoint(
@@ -554,51 +940,95 @@ def stream_shard_dsv4_checkpoint(
         "rank_inventory_sha256": {},
         "rank_manifest": {},
         "max_chunk_bytes": max_chunk_bytes,
+        "layer_conversion_strategy": "layer-major-multi-rank-static-inventory",
+        "layer_conversion_passes": 1,
+        "layer_conversion_visits": 0,
         "start_unix": int(time.time()),
     }
     try:
-        for rank in ranks_iter:
-            started = time.time()
-            inventory = _rank_inventory(
-                weight_map, handles, src, rank=rank, tp_degree=tp_degree
+        if src.allow_reduced_shapes:
+            # Reduced fixtures replace the frozen production geometry, so the
+            # payload-derived inventory remains the correct test-only path.
+            inventories, inventory_visits = _layer_major_rank_inventories(
+                weight_map,
+                handles,
+                src,
+                ranks=ranks_iter,
+                tp_degree=tp_degree,
             )
-            output_path = os.path.join(
-                weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"
+            report["layer_conversion_strategy"] = "layer-major-multi-rank-two-pass"
+            report["layer_conversion_passes"] = 2
+        else:
+            inventories = _static_rank_inventories(
+                src,
+                ranks=ranks_iter,
+                tp_degree=tp_degree,
             )
-            with StreamingRankWriter(
-                output_path,
-                inventory,
-                source_report=source_report,
-                max_chunk_bytes=max_chunk_bytes,
-                source_metadata={
-                    "model": "DeepSeek-V4-Flash-0731",
-                    "revision": DSV4_CHECKPOINT_REVISION,
-                    "config_sha256": DSV4_CONFIG_SHA256,
-                    "index_sha256": DSV4_INDEX_SHA256,
-                },
-                manifest_schema="dsv4-streaming-rank-v1",
-            ) as writer:
-                for key, tensor in _iter_rank_tensors(
-                    weight_map, handles, src, rank=rank, tp_degree=tp_degree
-                ):
-                    _write_bounded_tensor(writer, key, tensor)
-                    del tensor
-                    gc.collect()
+            inventory_visits = 0
+        write_started = time.time()
+        writers: dict[int, StreamingRankWriter] = {}
+        output_paths: dict[int, str] = {}
+        with ExitStack() as stack:
+            for rank in ranks_iter:
+                output_path = os.path.join(
+                    weights_dir, f"tp{rank}_sharded_checkpoint.safetensors"
+                )
+                output_paths[rank] = output_path
+                writers[rank] = stack.enter_context(
+                    StreamingRankWriter(
+                        output_path,
+                        inventories[rank],
+                        source_report=source_report,
+                        max_chunk_bytes=max_chunk_bytes,
+                        source_metadata={
+                            "model": "DeepSeek-V4-Flash-0731",
+                            "revision": DSV4_CHECKPOINT_REVISION,
+                            "config_sha256": DSV4_CONFIG_SHA256,
+                            "index_sha256": DSV4_INDEX_SHA256,
+                        },
+                        manifest_schema="dsv4-streaming-rank-v1",
+                    )
+                )
+
+            write_visits = _walk_layer_major_rank_tensors(
+                weight_map,
+                handles,
+                src,
+                ranks=ranks_iter,
+                tp_degree=tp_degree,
+                consume=partial(_write_layer_major_tensor, writers),
+            )
+            report["layer_conversion_visits"] = inventory_visits + write_visits
+            expected_visits = (
+                2 * src.num_hidden_layers
+                if src.allow_reduced_shapes
+                else src.num_hidden_layers
+            )
+            if report["layer_conversion_visits"] != expected_visits:
+                raise RuntimeError(
+                    "layer-major conversion count drift: expected "
+                    f"{expected_visits}, got {report['layer_conversion_visits']}"
+                )
+
+            for rank in ranks_iter:
+                writer = writers[rank]
                 manifest = writer.finalize()
-            report["ranks_written"].append(rank)
-            report["rank_bytes"][str(rank)] = os.path.getsize(output_path)
-            report["rank_wall_s"][str(rank)] = round(time.time() - started, 2)
-            report["rank_inventory_sha256"][str(rank)] = inventory.contract_sha256
-            report["rank_manifest"][str(rank)] = {
-                "path": os.path.basename(writer.manifest_path),
-                "checkpoint_sha256": manifest["checkpoint"]["sha256"],
-                "chunks_written": manifest["resource_bound"]["chunks_written"],
-                "observed_max_chunk_bytes": manifest["resource_bound"][
-                    "observed_max_chunk_bytes"
-                ],
-            }
-            del inventory, manifest
-            gc.collect()
+                report["ranks_written"].append(rank)
+                report["rank_bytes"][str(rank)] = os.path.getsize(output_paths[rank])
+                report["rank_wall_s"][str(rank)] = round(time.time() - write_started, 2)
+                inventory = inventories[rank]
+                report["rank_inventory_sha256"][str(rank)] = inventory.contract_sha256
+                report["rank_manifest"][str(rank)] = {
+                    "path": os.path.basename(writer.manifest_path),
+                    "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+                    "chunks_written": manifest["resource_bound"]["chunks_written"],
+                    "observed_max_chunk_bytes": manifest["resource_bound"][
+                        "observed_max_chunk_bytes"
+                    ],
+                }
+                del manifest
+        del inventories, writers
+        gc.collect()
     finally:
         _close_shards(handles)
     report["end_unix"] = int(time.time())

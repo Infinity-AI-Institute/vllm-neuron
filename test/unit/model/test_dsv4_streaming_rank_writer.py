@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -97,11 +98,14 @@ def test_two_pass_rank_inventory_and_transactional_bounded_publish(
 ) -> None:
     root = _fixture(tmp_path)
 
-    def convert(state, layer_idx, src, **kwargs):
+    def convert_parts(state, layer_idx, src, **kwargs):
         del layer_idx, src, kwargs
-        return {"layers.0.attn.mqa.wq_a.weight": state["layers.0.attn.wq_a.weight"]}
+        yield SHARDER._ConvertedTensorPart(
+            "layers.0.attn.mqa.wq_a.weight",
+            state["layers.0.attn.wq_a.weight"],
+        )
 
-    monkeypatch.setattr(SHARDER, "_convert_one_layer", convert)
+    monkeypatch.setattr(SHARDER, "_iter_converted_layer_parts", convert_parts)
     out = tmp_path / "compiled"
     report = SHARDER.stream_shard_dsv4_checkpoint(
         str(root),
@@ -141,6 +145,172 @@ def test_two_pass_rank_inventory_and_transactional_bounded_publish(
     )
     assert manifest["schema"] == "dsv4-streaming-rank-v1"
     assert manifest["rank_inventory_sha256"] == report["rank_inventory_sha256"]["0"]
+    assert not list((out / "weights").glob("*.partial-*"))
+
+
+def test_full_shape_inventory_is_static_and_rank_shape_exact() -> None:
+    source = SHARDER.DeepseekV4FlashInferenceConfig()
+    inventories = SHARDER._static_rank_inventories(
+        source,
+        ranks=[0, 31],
+        tp_degree=32,
+    )
+
+    assert set(inventories) == {0, 31}
+    assert all(len(inventory.tensors) == 1285 for inventory in inventories.values())
+    rank0 = {spec.name: spec for spec in inventories[0].tensors}
+    rank31 = {spec.name: spec for spec in inventories[31].tensors}
+    assert rank0 == rank31
+    assert rank0["embed_tokens.weight"].shape == (4040, 4096)
+    assert rank0["layers.0.mlp.tid2eid"].dtype == torch.int32
+    assert rank0["layers.3.mlp.e_score_correction_bias"].dtype == torch.float32
+    assert rank0["layers.2.attn.indexer.wq_b.weight"].shape == (8192, 1024)
+    assert rank0["layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight"].shape == (
+        256,
+        4096,
+        128,
+    )
+    assert rank0["layers.0.mlp.expert_mlps.mlp_op.down_proj.weight"].shape == (
+        256,
+        64,
+        4096,
+    )
+
+
+def test_layer_major_outputs_are_rank_set_invariant_and_conversion_is_o_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path)
+    calls = 0
+    gate_key = "layers.0.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+    down_key = "layers.0.mlp.expert_mlps.mlp_op.down_proj.weight"
+    full_gate = torch.arange(4 * 4 * 8).reshape(4, 4, 8)
+    full_down = torch.arange(4 * 8 * 4).reshape(4, 8, 4)
+
+    def convert_parts(state, layer_idx, src, **kwargs):
+        nonlocal calls
+        del layer_idx, src, kwargs
+        calls += 1
+        yield SHARDER._ConvertedTensorPart(
+            "layers.0.attn.mqa.wq_a.weight",
+            state["layers.0.attn.wq_a.weight"],
+        )
+        yield SHARDER._ConvertedTensorPart(
+            "layers.0.mlp.router.weight", torch.arange(8).reshape(2, 4)
+        )
+        for start in (0, 2):
+            yield SHARDER._ConvertedTensorPart(
+                gate_key,
+                full_gate[start : start + 2],
+                expert_start=start,
+                full_experts=4,
+            )
+            yield SHARDER._ConvertedTensorPart(
+                down_key,
+                full_down[start : start + 2],
+                expert_start=start,
+                full_experts=4,
+            )
+
+    monkeypatch.setattr(SHARDER, "_iter_converted_layer_parts", convert_parts)
+    multi = tmp_path / "multi"
+    multi_report = SHARDER.stream_shard_dsv4_checkpoint(
+        str(root),
+        str(multi),
+        _source(),
+        tp_degree=2,
+        ranks=[0, 1],
+        max_chunk_bytes=17,
+        _test_only_allow_unpinned_source=True,
+    )
+    assert calls == 2  # one inventory pass + one write pass, not 2 ranks * 2 passes
+    assert multi_report["layer_conversion_strategy"] == (
+        "layer-major-multi-rank-two-pass"
+    )
+    assert multi_report["layer_conversion_visits"] == 2
+
+    calls = 0
+    single = tmp_path / "single"
+    SHARDER.stream_shard_dsv4_checkpoint(
+        str(root),
+        str(single),
+        _source(),
+        tp_degree=2,
+        ranks=[0],
+        max_chunk_bytes=17,
+        _test_only_allow_unpinned_source=True,
+    )
+    assert calls == 2
+
+    multi_rank0 = multi / "weights/tp0_sharded_checkpoint.safetensors"
+    single_rank0 = single / "weights/tp0_sharded_checkpoint.safetensors"
+    assert (
+        hashlib.sha256(multi_rank0.read_bytes()).hexdigest()
+        == hashlib.sha256(single_rank0.read_bytes()).hexdigest()
+    )
+    weight_map = SHARDER._load_hf_index(str(root))
+    handles = SHARDER._open_shards(str(root), set(weight_map.values()))
+    try:
+        legacy = {
+            rank: dict(
+                SHARDER._iter_rank_tensors(
+                    weight_map, handles, _source(), rank=rank, tp_degree=2
+                )
+            )
+            for rank in (0, 1)
+        }
+    finally:
+        SHARDER._close_shards(handles)
+    for rank in (0, 1):
+        emitted = load_file(multi / f"weights/tp{rank}_sharded_checkpoint.safetensors")
+        assert emitted.keys() == legacy[rank].keys()
+        for key in emitted:
+            torch.testing.assert_close(emitted[key], legacy[rank][key], rtol=0, atol=0)
+        assert torch.equal(
+            emitted[gate_key], SHARDER._shard_expert_gate_up(full_gate, rank, 2)
+        )
+        assert torch.equal(emitted[down_key], SHARDER._row_shard(full_down, rank, 2, 1))
+        assert torch.equal(
+            emitted["layers.0.mlp.router.weight"], torch.arange(8).reshape(2, 4)
+        )
+
+
+def test_layer_major_failure_aborts_every_rank_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path)
+
+    def convert_parts(state, layer_idx, src, **kwargs):
+        del layer_idx, src, kwargs
+        yield SHARDER._ConvertedTensorPart(
+            "layers.0.attn.mqa.wq_a.weight",
+            state["layers.0.attn.wq_a.weight"],
+        )
+
+    monkeypatch.setattr(SHARDER, "_iter_converted_layer_parts", convert_parts)
+    original = SHARDER._write_bounded_tensor
+    writes = 0
+
+    def fail_mid_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 4:
+            raise RuntimeError("injected multi-rank write failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(SHARDER, "_write_bounded_tensor", fail_mid_write)
+    out = tmp_path / "failed"
+    with pytest.raises(RuntimeError, match="injected multi-rank write failure"):
+        SHARDER.stream_shard_dsv4_checkpoint(
+            str(root),
+            str(out),
+            _source(),
+            tp_degree=2,
+            ranks=[0, 1],
+            max_chunk_bytes=16,
+            _test_only_allow_unpinned_source=True,
+        )
+    assert not list((out / "weights").glob("*.safetensors"))
     assert not list((out / "weights").glob("*.partial-*"))
 
 
