@@ -164,6 +164,21 @@ identities.  A missing full-checkpoint CPU loader/runner is a capability gap;
 do not substitute Q4, a generic FP32 bank, or a confidence-only reference.
 The producer's successful receipt still does not authorize correctness.
 
+The exact fail-fast entry point is
+`tools/glm53_reference_target_producer.py`.  Run `--dry-run` first with the
+real pinned checkpoint path, `--loader MODULE:CALLABLE`, `--runner
+MODULE:CALLABLE`, and one or more `--loader-version KEY=VERSION` values.  The
+dry run validates checkpoint metadata and emits the 4x10 contract without
+loading weights.  Remove `--dry-run` only when the provider is a real
+CPU-only original-target loader/runner; it then writes 40 rows transactionally
+and publishes `reference.json` only after all checks pass.
+
+Admission is fail-closed at >=1.1 TiB available RAM and >=1.1 TiB free scratch,
+with 32-64 physical CPU cores isolated from active lanes.  Prefer one SMT
+thread per physical core for the memory-bound load; use sibling SMT threads
+only after measured conversion utilization justifies it.  The source plus
+BF16 converted working set, not the ~23.6 MiB 40-row bank, determines capacity.
+
 ## Gate 4: device handoff and correctness
 
 Only after Gates 1–3 pass may the parent schedule the existing paired TKG/CTE
