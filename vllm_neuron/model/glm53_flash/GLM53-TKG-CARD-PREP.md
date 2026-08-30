@@ -76,6 +76,14 @@ compose-receipt hashes.  CTE may omit `artifacts/source-identity.json` only
 when the immutable compose/launch receipt supplies the same identity.  Its
 receipt is evidence only and keeps runtime/card/correctness claims false.
 
+The paired runtime seam is
+`vllm_neuron.model.glm53_flash.phase_runtime.Glm53PairedPhaseRuntime`.  It
+calls each resident serialized model's `nxd_model.initialize(sharded_checkpoint)`
+and reads the resulting `nxd_model.state` schema; the SDK-owned layout/load
+operation remains phase-local.  `initialize_with_saved_weights()` is available
+only through its explicit opt-in.  The adapter refuses rank/state-key drift and
+emits `runtime_permitted=false`; it does not transfer state or launch cards.
+
 Readiness remains false unless the optional inputs are independently bound:
 the CTE companion must carry the exact TP32/LNC2/B1/S128 context-encoding
 contract, matching source/config/checkpoint identities, and its own BF16,
