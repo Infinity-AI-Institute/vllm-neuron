@@ -157,6 +157,92 @@ class Glm53PairedPhaseRuntime:
             "continuation state schema differs from CTE/TKG",
         )
 
+    def handoff_cte_outputs(
+        self,
+        runtime_owner: Any,
+        outputs: Any,
+        *,
+        state_offset: int = 1,
+    ) -> dict[str, Any]:
+        """Copy CTE state through the wrapper's resident NxDI hook.
+
+        The GLM wrapper already implements the supported CPU-simulation seam,
+        ``_copy_past_key_values``.  This method makes the paired runner use
+        that exact hook and verifies the destination phase-local cache layouts
+        after the copy.  It deliberately does not assign ``nxd_model.state``:
+        that object is the SDK's loader state, not the hybrid KDA/DSA runtime
+        cache.  On device, input/output aliases perform this handoff in-place.
+        """
+
+        _require(
+            type(state_offset) is int and state_offset >= 0,
+            "state_offset must be a non-negative integer",
+        )
+        _require(
+            isinstance(outputs, Sequence) and not isinstance(outputs, (str, bytes)),
+            "CTE outputs must be a logits-plus-state sequence",
+        )
+        copier = getattr(runtime_owner, "_copy_past_key_values", None)
+        _require(
+            callable(copier),
+            "paired runtime owner lacks the resident _copy_past_key_values hook",
+        )
+
+        targets: list[tuple[str, list[Any]]] = []
+        for phase_name in ("context_encoding_model", "token_generation_model"):
+            phase_model = getattr(runtime_owner, phase_name, None)
+            inner = getattr(phase_model, "model", None)
+            cache = getattr(inner, "past_key_values", None)
+            if cache is not None:
+                targets.append((phase_name, list(cache)))
+        _require(targets, "paired runtime owner exposes no phase-local KV cache")
+        expected_count = len(targets[0][1])
+        _require(expected_count > 0, "phase-local KV cache is empty")
+        _require(
+            all(len(cache) == expected_count for _, cache in targets),
+            "CTE/TKG phase-local KV cache lengths differ",
+        )
+        new_state = list(outputs[state_offset:])
+        _require(
+            len(new_state) == expected_count,
+            "CTE output state count does not match the phase-local KV cache",
+        )
+        for index, value in enumerate(new_state):
+            _require(value is not None, f"CTE output state {index} is None")
+            for phase_name, cache in targets:
+                target = cache[index]
+                _require(
+                    getattr(target, "shape", None) == getattr(value, "shape", None),
+                    f"{phase_name} state {index} shape differs from CTE output",
+                )
+                _require(
+                    getattr(target, "dtype", None) == getattr(value, "dtype", None),
+                    f"{phase_name} state {index} dtype differs from CTE output",
+                )
+
+        # The wrapper owns the actual SDK-compatible assignment and output
+        # slicing (including captured-tensor and sampler offsets).
+        copier(outputs)
+        for index, value in enumerate(new_state):
+            for phase_name, cache in targets:
+                target = cache[index]
+                target_data = getattr(target, "data", target)
+                data_ptr = getattr(target_data, "data_ptr", None)
+                value_ptr = getattr(value, "data_ptr", None)
+                if callable(data_ptr) and callable(value_ptr):
+                    _require(
+                        data_ptr() == value_ptr(),
+                        f"{phase_name} state {index} was not transferred by the resident hook",
+                    )
+        return {
+            "state_offset": state_offset,
+            "state_count": expected_count,
+            "destination_phases": [name for name, _ in targets],
+            "layout_verified": True,
+            "continuation_state_transferred": True,
+            "runtime_permitted": False,
+        }
+
     def to_mapping(self) -> dict[str, Any]:
         return {
             "schema": PHASE_RUNTIME_SCHEMA,
