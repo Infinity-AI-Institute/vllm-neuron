@@ -185,6 +185,29 @@ def test_phase_handoff_rejects_compose_hash_drift(tmp_path):
         MODULE.inspect_phase_handoff(tkg, cte, compose_receipt_path=compose)
 
 
+@pytest.mark.parametrize("missing_mode", ["null", "absent"])
+def test_phase_handoff_rejects_absent_cte_launch_source_provenance(
+    tmp_path, missing_mode
+):
+    tkg = tmp_path / "tkg"
+    cte = tmp_path / "cte"
+    _write_artifact(tkg, "tkg")
+    _write_artifact(cte, "cte")
+    compose = _compose(tkg, cte)
+    launch = cte / "artifacts/launch-receipt.json"
+    source = {
+        "nxdi_commit": SHARED["nxdi_commit"],
+        "checkpoint_revision": SHARED["checkpoint_revision"],
+    }
+    if missing_mode == "null":
+        source.update({"source_commit": None, "source_tree": None})
+    launch.write_text(json.dumps({"source": source}), encoding="utf-8")
+    with pytest.raises(
+        MODULE.Glm53PhaseHandoffError, match="CTE launch source disagrees"
+    ):
+        MODULE.inspect_phase_handoff(tkg, cte, compose_receipt_path=compose)
+
+
 def test_phase_handoff_accepts_immutable_staged_artifacts_cache_layout(tmp_path):
     tkg = tmp_path / "tkg"
     cte = tmp_path / "cte"

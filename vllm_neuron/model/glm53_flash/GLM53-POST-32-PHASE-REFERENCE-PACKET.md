@@ -46,6 +46,17 @@ therefore not emitted.  Repair or replace that immutable CTE launch
 provenance before rerunning Gate 2; do not weaken the verifier or infer source
 identity from the checkpoint.
 
+The authorized metadata-only repair has now added those two fields to the
+existing CTE launch receipt.  The repaired receipt SHA is
+`f8be30850c8a15e0e388cb563ff1e8bc66394e5ef245e44ee953dd08ef4c14be`; no
+compiled or rank artifact was changed.  The nested-cache verifier then passed
+and emitted
+`/mnt/instance-scratch/glm53-phase-handoff-9f800ee/phase-handoff-receipt.json`
+with SHA
+`b07694ddc28af0be8ea3dcbc80b24432da19377da25d31420c4f2ba96eee0478`.
+Its receipt records shared state schema/config and both model bindings true,
+phase-local loader difference true, and card/runtime/correctness claims false.
+
 ## Gate 1: completed-rank verification
 
 Use the exact checkpoint directory already bound in the producer's immutable
