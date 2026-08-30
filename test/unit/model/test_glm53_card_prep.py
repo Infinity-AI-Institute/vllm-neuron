@@ -38,7 +38,9 @@ PREP = _load_module(
 )
 
 
-def _write_artifact(tmp_path: Path, *, shape_overrides: dict | None = None) -> Path:
+def _write_artifact(
+    tmp_path: Path, *, shape_overrides: dict | None = None
+) -> tuple[Path, Path]:
     root = tmp_path / "glm53-artifact"
     model = root / "artifacts" / "model"
     cache = root / "cache" / "compiler" / "MODULE_test"
@@ -66,7 +68,8 @@ def _write_artifact(tmp_path: Path, *, shape_overrides: dict | None = None) -> P
     (model / "neuron_config.json").write_text(
         json.dumps({"neuron_config": emitted}), encoding="utf-8"
     )
-    (root / "artifacts" / "effective-shape.json").write_text(
+    effective_shape_path = root / "artifacts" / "effective-shape.json"
+    effective_shape_path.write_text(
         json.dumps(
             {
                 "tp": 32,
@@ -79,18 +82,79 @@ def _write_artifact(tmp_path: Path, *, shape_overrides: dict | None = None) -> P
         ),
         encoding="utf-8",
     )
-    (root / "artifacts" / "compile-result.json").write_text(
+    compile_result_path = root / "artifacts" / "compile-result.json"
+    compile_result_path.write_text(
         json.dumps(
             {
-                "neffs": [{"path": "/runroot/cache/MODULE_test/model.neff", "bytes": 4}],
+                "neffs": [
+                    {"path": "/runroot/cache/MODULE_test/model.neff", "bytes": 4}
+                ],
                 "neff_count": 1,
+                "neuron_config_has_float8_e4m3fn": False,
+                "neuron_config_has_bfloat16": True,
             }
         ),
         encoding="utf-8",
     )
-    (cache / "model.hlo_module.pb").write_bytes(b"HLO no sort")
-    (cache / "model.neff").write_bytes(b"NEFF")
-    return root
+    hlo_path = cache / "model.hlo_module.pb"
+    neff_path = cache / "model.neff"
+    hlo_path.write_bytes(b"HLO no sort")
+    neff_path.write_bytes(b"NEFF")
+    source_identity_path = root / "artifacts" / "source-identity.json"
+    source_identity = {
+        "source_commit": "source-commit",
+        "source_tree": "source-tree",
+        "nxdi_commit": "nxdi-commit",
+        "checkpoint_revision": "checkpoint-revision",
+    }
+    source_identity_path.write_text(json.dumps(source_identity), encoding="utf-8")
+
+    def sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    packet = {
+        "schema": "glm53-retained-tkg-artifact-v1",
+        "artifact_role": "retained compiler evidence; not a fresh compile",
+        "artifact_source": source_identity,
+        "source_identity": {
+            "relative_path": "artifacts/source-identity.json",
+            "sha256": sha256(source_identity_path),
+        },
+        "effective_shape": {
+            "relative_path": "artifacts/effective-shape.json",
+            "sha256": sha256(effective_shape_path),
+        },
+        "emitted_config": {
+            "relative_path": "artifacts/model/neuron_config.json",
+            "sha256": sha256(model / "neuron_config.json"),
+        },
+        "compile_result": {
+            "relative_path": "artifacts/compile-result.json",
+            "sha256": sha256(compile_result_path),
+        },
+        "compiler_evidence": {
+            "hlo_relative_path": "cache/compiler/MODULE_test/model.hlo_module.pb",
+            "hlo_sha256": sha256(hlo_path),
+            "neff_relative_path": "cache/compiler/MODULE_test/model.neff",
+            "neff_sha256": sha256(neff_path),
+            "neff_bytes": neff_path.stat().st_size,
+        },
+        "topology": {
+            "tp": 32,
+            "lnc": 2,
+            "batch": 1,
+            "sequence": 128,
+            "dtype": "bfloat16",
+            "kv_cache_quant": False,
+            "quantized": False,
+            "speculation": False,
+            "emit_phases": "TKG",
+            "models_compiled": ["token_generation_model"],
+        },
+    }
+    packet_path = tmp_path / "RETAINED-TKG-ARTIFACT-PACKET.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    return root, packet_path
 
 
 def _fake_memory_inputs():
@@ -116,8 +180,8 @@ def _fake_memory_inputs():
 
 
 def test_tkg_artifact_is_explicitly_not_fresh_prompt_ready(tmp_path: Path) -> None:
-    root = _write_artifact(tmp_path)
-    receipt = PREP.inspect_tkg_artifact(root)
+    root, packet = _write_artifact(tmp_path)
+    receipt = PREP.inspect_tkg_artifact(root, retained_packet_path=packet)
     assert receipt.models_compiled == ("token_generation_model",)
     assert receipt.cte_artifact_present is False
     assert receipt.rank_bundle_present is False
@@ -155,14 +219,80 @@ def test_memory_measurement_is_exact_and_audit_loads_no_payload() -> None:
     ],
 )
 def test_emitted_config_drift_fails_closed(tmp_path: Path, overrides: dict) -> None:
+    root, packet = _write_artifact(tmp_path, shape_overrides=overrides)
     with pytest.raises(PREP.Glm53CardPreparationError, match="emitted config drift"):
-        PREP.inspect_tkg_artifact(_write_artifact(tmp_path, shape_overrides=overrides))
+        PREP.inspect_tkg_artifact(root, retained_packet_path=packet)
+
+
+def test_shape_only_cte_cannot_publish_fresh_prompt_readiness(tmp_path: Path) -> None:
+    root, packet = _write_artifact(tmp_path)
+    cte_root = tmp_path / "shape-only-cte"
+    (cte_root / "artifacts").mkdir(parents=True)
+    (cte_root / "artifacts" / "effective-shape.json").write_text(
+        json.dumps({"models_compiled": ["context_encoding_model"]}), encoding="utf-8"
+    )
+    receipt = PREP.inspect_tkg_artifact(
+        root, cte_artifact_root=cte_root, retained_packet_path=packet
+    )
+    assert receipt.cte_artifact_present is False
+    assert receipt.fresh_prompt_ready is False
+
+
+def test_retained_hlo_sort_marker_is_rejected_even_when_packet_is_rehashed(
+    tmp_path: Path,
+) -> None:
+    root, packet_path = _write_artifact(tmp_path)
+    hlo_path = root / "cache" / "compiler" / "MODULE_test" / "model.hlo_module.pb"
+    hlo_path.write_bytes(b"HLO %sort. op_type=aten__topk")
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    packet["compiler_evidence"]["hlo_sha256"] = hashlib.sha256(
+        hlo_path.read_bytes()
+    ).hexdigest()
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    with pytest.raises(PREP.Glm53CardPreparationError, match="unsupported"):
+        PREP.inspect_tkg_artifact(root, retained_packet_path=packet_path)
+
+
+def test_zero_byte_rank_bundle_cannot_publish_continuation_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, packet = _write_artifact(tmp_path)
+    rank_dir = tmp_path / "ranks"
+    rank_dir.mkdir()
+    for rank in range(32):
+        filename = f"tp{rank}_sharded_checkpoint.safetensors"
+        (rank_dir / filename).write_bytes(b"")
+        (rank_dir / f"{filename}.manifest.json").write_text("{}", encoding="utf-8")
+    fake_memory = PREP.Glm53CheckpointMemory(
+        source_shard_count=1,
+        source_tensor_count=1,
+        source_indexed_payload_bytes=1,
+        source_payload_bytes_loaded_during_audit=0,
+        rank_tensor_bytes=(1,) * 32,
+        rank_bfloat16_bytes=(1,) * 32,
+        rank_non_bfloat16_bytes=(0,) * 32,
+        rank_inventory_sha256=("a" * 64,) * 32,
+        rank_plan_sha256=("b" * 64,) * 32,
+    )
+    monkeypatch.setattr(PREP, "measure_checkpoint_memory", lambda _: fake_memory)
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    receipt = PREP.inspect_tkg_artifact(
+        root,
+        checkpoint_dir=checkpoint_dir,
+        rank_dir=rank_dir,
+        retained_packet_path=packet,
+    )
+    assert receipt.rank_bundle_present is False
+    assert receipt.continuation_tkg_ready is False
 
 
 def test_retained_artifact_gate_verifies_actual_hlo_neff_and_packet() -> None:
     artifact_value = os.environ.get("GLM53_RETAINED_ARTIFACT_ROOT")
     if not artifact_value:
-        pytest.skip("set GLM53_RETAINED_ARTIFACT_ROOT to run the retained artifact gate")
+        pytest.skip(
+            "set GLM53_RETAINED_ARTIFACT_ROOT to run the retained artifact gate"
+        )
     root = Path(artifact_value)
     packet = json.loads(
         (PACKAGE_PATH / "RETAINED-TKG-ARTIFACT-PACKET.json").read_text(encoding="utf-8")
@@ -181,13 +311,19 @@ def test_retained_artifact_gate_verifies_actual_hlo_neff_and_packet() -> None:
         == packet["compiler_evidence"]["neff_relative_path"]
     )
     source_identity_path = root / packet["source_identity"]["relative_path"]
-    assert hashlib.sha256(source_identity_path.read_bytes()).hexdigest() == packet[
-        "source_identity"
-    ]["sha256"]
+    assert (
+        hashlib.sha256(source_identity_path.read_bytes()).hexdigest()
+        == packet["source_identity"]["sha256"]
+    )
     source_identity = json.loads(source_identity_path.read_text(encoding="utf-8"))
     assert {
         key: source_identity[key]
-        for key in ("source_commit", "source_tree", "nxdi_commit", "checkpoint_revision")
+        for key in (
+            "source_commit",
+            "source_tree",
+            "nxdi_commit",
+            "checkpoint_revision",
+        )
     } == packet["artifact_source"]
     assert Path(receipt.hlo_path).read_bytes().find(b"%sort.") < 0
     assert Path(receipt.hlo_path).read_bytes().find(b"aten__topk") < 0
@@ -195,6 +331,8 @@ def test_retained_artifact_gate_verifies_actual_hlo_neff_and_packet() -> None:
         (root / "artifacts" / "compile-result.json").read_text(encoding="utf-8")
     )
     assert compile_result["neff_count"] == 1
-    assert compile_result["neffs"][0]["bytes"] == packet["compiler_evidence"]["neff_bytes"]
+    assert (
+        compile_result["neffs"][0]["bytes"] == packet["compiler_evidence"]["neff_bytes"]
+    )
     assert compile_result["neuron_config_has_float8_e4m3fn"] is False
     assert compile_result["neuron_config_has_bfloat16"] is True

@@ -40,3 +40,14 @@ The retained-artifact gate is enabled with
 bytes and compiler result, rejects `%sort.` and `aten__topk`, and checks the
 TP32/LNC2/B1/S128/BF16/no-quant/no-spec emitted contract.  Without that
 environment variable it skips rather than claiming compiler evidence.
+
+Readiness remains false unless the optional inputs are independently bound:
+the CTE companion must carry the exact TP32/LNC2/B1/S128 context-encoding
+contract, matching source/config/checkpoint identities, and its own BF16,
+no-sort compiler evidence; the rank directory must contain all 32 non-empty
+transactional outputs whose manifests match the pinned checkpoint, rank
+inventory/plan hashes, resource bound, tensor dtypes, and exact byte totals.
+Shape-only CTE metadata and empty or placeholder rank files never publish
+fresh-prompt or continuation readiness.  Even a passing receipt keeps
+`card_launch_authorized=false`; hardware correctness, performance, and
+tokenomics require separate evidence.
