@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
 ROOT = Path(__file__).parents[3]
 PROVIDER_PATH = ROOT / "vllm_neuron/model/glm53_flash/original_target_provider.py"
@@ -149,3 +150,42 @@ def test_cpu_fp8_scaled_mm_is_available_but_native_provider_is_fail_closed(
     if not torch.cuda.is_available() and not PROVIDER._torch_xpu_available():
         with pytest.raises(PROVIDER.Glm53OriginalProviderError, match="requires CUDA"):
             PROVIDER.load(checkpoint)
+
+
+def test_serialized_fp8_block_edges_dequantize_then_forward_on_cpu(tmp_path):
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+    from transformers.quantizers.quantizer_finegrained_fp8 import (
+        FineGrainedFP8HfQuantizer,
+    )
+    from transformers.utils.quantization_config import FineGrainedFP8Config
+
+    quantizer = FineGrainedFP8HfQuantizer(
+        FineGrainedFP8Config(weight_block_size=(128, 128), dequantize=True),
+        pre_quantized=True,
+    )
+    weight = torch.ones((256, 256), dtype=torch.float32).to(torch.float8_e4m3fn)
+    scales = torch.tensor([[1.0, 2.0], [4.0, 8.0]], dtype=torch.float32)
+    serialized = tmp_path / "one-linear.safetensors"
+    save_file({"weight": weight, "weight_scale_inv": scales}, str(serialized))
+    loaded = load_file(str(serialized), device="cpu")
+
+    target = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
+    converted = Fp8Dequantize(quantizer).convert(
+        {
+            "weight$": [loaded["weight"]],
+            "weight_scale_inv": [loaded["weight_scale_inv"]],
+        },
+        full_layer_name="weight",
+        model=target,
+    )["weight"]
+    assert converted.dtype is torch.bfloat16
+    assert torch.all(converted[:128, :128] == 1)
+    assert torch.all(converted[:128, 128:] == 2)
+    assert torch.all(converted[128:, :128] == 4)
+    assert torch.all(converted[128:, 128:] == 8)
+
+    target.weight.data.copy_(converted)
+    output = target(torch.ones((1, 256), dtype=torch.bfloat16))
+    assert output.shape == (1, 256)
+    assert torch.all(output[0, :128] == 384)
+    assert torch.all(output[0, 128:] == 1536)
