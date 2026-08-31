@@ -45,12 +45,10 @@ def test_tiny_original_producer_emits_verified_4x10_full_vocab_bank(tmp_path: Pa
         return object()
 
     def run_prompt(_model, prompt_id, positions):
-        return [
-            torch.nn.functional.one_hot(
+        for position in positions:
+            yield torch.nn.functional.one_hot(
                 torch.tensor((len(prompt_id) + position) % 154_880), 154_880
             ).to(torch.float32)
-            for position in positions
-        ]
 
     manifest_path = producer.produce(
         loader=loader, run_prompt=run_prompt, output_dir=tmp_path / "bank"
@@ -115,6 +113,38 @@ def test_producer_rejects_wrong_shape_and_publishes_nothing(tmp_path: Path):
         )
     assert not output.exists()
     assert not list(tmp_path.glob(".bank.partial-*"))
+
+
+@pytest.mark.parametrize(
+    "failure,match",
+    [
+        ("short", "wrong position count"),
+        ("extra", "wrong position count"),
+        ("error", "runner exploded"),
+    ],
+)
+def test_bounded_generator_failures_publish_nothing(tmp_path: Path, failure, match):
+    spec = _spec(tmp_path)
+
+    def run_prompt(_model, _prompt_id, positions):
+        for index, _position in enumerate(positions):
+            if failure == "short" and index == 9:
+                break
+            if failure == "error" and index == 1:
+                raise RuntimeError("runner exploded")
+            yield torch.zeros(154_880, dtype=torch.float32)
+        if failure == "extra":
+            yield torch.zeros(154_880, dtype=torch.float32)
+
+    output = tmp_path / f"{failure}-bank"
+    with pytest.raises((MODULE.Glm53ReferenceProducerError, RuntimeError), match=match):
+        MODULE.Glm53OriginalTargetProducer(spec).produce(
+            loader=lambda _path: object(),
+            run_prompt=run_prompt,
+            output_dir=output,
+        )
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{failure}-bank.partial-*"))
 
 
 @pytest.mark.parametrize(

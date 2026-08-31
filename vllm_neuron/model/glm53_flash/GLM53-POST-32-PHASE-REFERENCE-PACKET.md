@@ -227,7 +227,10 @@ The dry run validates pinned checkpoint metadata and the tokenizer's four
 non-empty integer `input_ids` sequences, then emits the 4x10 contract without
 loading weights.  Remove `--dry-run` only when the exact full checkpoint is
 resident and capacity gates pass; the provider then loads with `dtype="auto"`
-to preserve serialized precision and writes 40 rows transactionally.
+to preserve serialized precision and writes 40 rows transactionally.  The
+producer materializes at most 11 runner values per prompt (the required 10
+plus one overflow probe), so a generator cannot publish short or extra
+coverage and cannot cause unbounded host-side materialization.
 
 Admission is fail-closed at >=1.1 TiB available RAM and >=1.1 TiB free scratch,
 with 32-64 physical CPU cores isolated from active lanes.  Prefer one SMT

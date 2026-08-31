@@ -14,8 +14,9 @@ import hashlib
 import json
 import shutil
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,17 @@ def _text(value: Any, name: str) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _bounded_rows(values: Iterable[torch.Tensor], expected: int) -> list[torch.Tensor]:
+    """Materialize exactly ``expected`` rows, detecting overflow without hanging."""
+
+    rows = list(islice(iter(values), expected + 1))
+    _require(
+        len(rows) == expected,
+        f"runner returned wrong position count: expected {expected}, got {len(rows)}",
+    )
+    return rows
 
 
 @dataclass(frozen=True)
@@ -183,7 +195,7 @@ class Glm53OriginalTargetProducer:
         self,
         *,
         loader: Callable[[Path], Any],
-        run_prompt: Callable[..., Sequence[torch.Tensor]],
+        run_prompt: Callable[..., Iterable[torch.Tensor]],
         output_dir: str | Path,
     ) -> Path:
         """Emit a verified manifest and row files, or nothing publishable."""
@@ -215,10 +227,7 @@ class Glm53OriginalTargetProducer:
                     )
                 else:
                     values = run_prompt(model, prompt_id, self.spec.positions)
-                _require(
-                    len(values) == len(self.spec.positions),
-                    f"runner returned wrong position count for {prompt_id}",
-                )
+                values = _bounded_rows(values, len(self.spec.positions))
                 for position, logits in zip(self.spec.positions, values, strict=True):
                     _require(
                         isinstance(logits, torch.Tensor),

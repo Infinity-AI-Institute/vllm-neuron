@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 ROOT = Path(__file__).parents[3]
 MODULE_PATH = ROOT / "tools/glm53_reference_target_producer.py"
@@ -38,6 +39,11 @@ def _load(_checkpoint):
 
 def _run(_model, _prompt_id, _positions, _token_ids):
     return []
+
+
+def _generator_run(_model, _prompt_id, positions, _token_ids):
+    for _position in positions:
+        yield torch.zeros(154_880, dtype=torch.float32)
 
 
 _configured = []
@@ -216,6 +222,39 @@ def test_cli_rejects_configure_without_tokenizer(tmp_path):
             producer_cls=_Producer,
             spec_cls=_Spec,
         )
+
+
+def test_documented_cli_path_publishes_generator_runner_rows(tmp_path):
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    output = tmp_path / "bank"
+    MODULE.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--output-dir",
+            str(output),
+            "--reference-id",
+            "generator-integration",
+            "--semantics",
+            "original-checkpoint-cpu-fp32",
+            "--configure",
+            f"{__name__}:_configure",
+            "--loader",
+            f"{__name__}:_load",
+            "--runner",
+            f"{__name__}:_generator_run",
+            "--tokenizer",
+            f"{__name__}:_tokenize",
+            "--loader-version",
+            "producer=generator-test",
+            "--tokenizer-version",
+            "tokenizer=tiny-v1",
+        ],
+        preflight=lambda _path: object(),
+    )
+    assert (output / "reference.json").is_file()
+    assert len(list((output / "rows").glob("*.bin"))) == 40
 
 
 def test_cli_rejects_non_dry_run_without_tokenizer_binding(tmp_path):
