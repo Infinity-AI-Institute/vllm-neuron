@@ -164,39 +164,70 @@ identities.  A missing full-checkpoint CPU loader/runner is a capability gap;
 do not substitute Q4, a generic FP32 bank, or a confidence-only reference.
 The producer's successful receipt still does not authorize correctness.
 
-The source-only provider inventory was rechecked after PR28.  No module under
-`vllm_neuron/model/glm53_flash` implements an original-target tokenizer,
-checkpoint loader, or logits runner.  The generic example
-`examples/vllm_neuron/accuracy/compare_hf_vs_vllm_neuron.py` is only a near
-match: its `AutoModelForCausalLM.from_pretrained` and
-`AutoTokenizer.from_pretrained` calls do not pin this checkpoint revision,
-record native block-FP8/converted-BF16 semantics, or implement the required
-token-bound runner returning ten `(154880,)` rows per prompt.  It is therefore
-not an acceptable canonical provider or rescue reference.
+The concrete provider is now
+`vllm_neuron/model/glm53_flash/original_target_provider.py`.  It binds
+`transformers==5.16.1`'s `Glm5NextProcessor` and exact
+`Glm5NextForConditionalGeneration` class, loads only from the pinned snapshot,
+and passes the processor's official chat-template IDs into an own-greedy
+runner.  The runner calls the model ten times with `use_cache=False`, takes
+the final-position logits, and emits FP32 comparison rows only after the
+  native forward.  It does not enable MTP/speculation or replace the
+  checkpoint with Q4.  Native execution is admitted only when CUDA/XPU is
+  present because the upstream FP8 quantizer rejects CPU-native execution.  A
+  CPU reference may explicitly pass
+  `native-block-fp8-dequantized-bfloat16`; the provider then supplies
+  `FineGrainedFP8Config(dequantize=True, weight_block_size=(128, 128))`.  It
+  rejects undeclared conversion and original-CPU-FP32 labels.
 
-The primary model reference requires a more specific provider shape: the
-official GLM-5.3-Flash Transformers recipe uses `AutoProcessor` and
-`AutoModelForMultimodalLM`, then calls the processor's chat template before
-generation.  The upstream Transformers model documentation identifies the
-implementation as `Glm5NextForConditionalGeneration` and notes that its
-Transformers implementation omits MTP.  A future provider must therefore bind
-the exact processor/chat-template output (or prove an equivalent text-only
-encoding), the exact `Glm5Next` model class, and the pinned checkpoint and
-precision semantics.  The current repository contains none of those loaded
-provider objects; only the injected callable seam is available.
+The generic example
+`examples/vllm_neuron/accuracy/compare_hf_vs_vllm_neuron.py` remains only a
+near match: its `AutoModelForCausalLM.from_pretrained` and
+`AutoTokenizer.from_pretrained` calls do not pin this revision, record native
+block-FP8 semantics, or implement the required token-bound ten-row runner.
+
+The provider's metadata-only dry run was executed against the exact revision
+with the seven non-weight files `config.json`,
+`model.safetensors.index.json`, `processor_config.json`, `tokenizer.json`,
+`tokenizer_config.json`, `chat_template.jinja`, and `generation_config.json`.
+It returned four non-empty integer ID sequences, including the expected
+15-token feedback prompts, while reporting `weights_loaded=false` and
+`device_used=false`.
+
+The bounded CPU FP8 audit under `torch==2.9.1+cpu` is not a native full-model
+execution authorization: `torch._scaled_mm` accepts tiny FP8 operands and
+returns FP32 when explicitly requested, while ordinary `F.linear` rejects
+mixed FP32/FP8 operands.  More importantly, the real Transformers
+`FineGrainedFP8HfQuantizer` changes a pre-quantized CPU load to
+`dequantize=True`; the provider therefore refuses native-block-FP8 loading on
+CPU rather than inheriting that silent conversion.  A CPU bank must use the
+explicit converted-BF16 semantics and its declared 128x128 conversion path.
 
 The exact fail-fast entry point is
-`tools/glm53_reference_target_producer.py`.  Run `--dry-run` first with the
-real pinned checkpoint path, `--loader MODULE:CALLABLE`, `--runner
-MODULE:CALLABLE`, `--tokenizer MODULE:CALLABLE`, one or more
-`--loader-version KEY=VERSION` values, and one or more
-`--tokenizer-version KEY=VERSION` values.  The dry run validates checkpoint
-metadata and the tokenizer's four non-empty integer `input_ids` sequences,
-then emits the 4x10 contract without loading weights.  Remove `--dry-run` only
-when the provider is a real CPU-only original-target loader/runner; the runner
-then receives the bound prompt IDs and writes 40 rows transactionally, and
-`reference.json` is published only after all checks pass.  Non-dry mode rejects
-an absent tokenizer binding.
+`tools/glm53_reference_target_producer.py`.  Its new `--configure
+MODULE:CALLABLE` seam is called before tokenization and receives
+`(checkpoint_dir, semantics)`.  The actual metadata-only binding command is:
+
+```bash
+python tools/glm53_reference_target_producer.py \
+  --checkpoint-dir /exact/pinned/04c4e9e95c5da8862dced7e5056455116f83a7e0 \
+  --output-dir /not-created-on-dry-run \
+  --reference-id glm53-original-native-20260830 \
+  --semantics native-block-fp8 \
+  --configure vllm_neuron.model.glm53_flash.original_target_provider:configure \
+  --loader vllm_neuron.model.glm53_flash.original_target_provider:load \
+  --runner vllm_neuron.model.glm53_flash.original_target_provider:run \
+  --tokenizer vllm_neuron.model.glm53_flash.original_target_provider:tokenize \
+  --loader-version transformers=5.16.1 \
+  --loader-version torch=2.9.1+cpu \
+  --tokenizer-version processor=Glm5NextProcessor@5.16.1 \
+  --dry-run
+```
+
+The dry run validates pinned checkpoint metadata and the tokenizer's four
+non-empty integer `input_ids` sequences, then emits the 4x10 contract without
+loading weights.  Remove `--dry-run` only when the exact full checkpoint is
+resident and capacity gates pass; the provider then loads with `dtype="auto"`
+to preserve serialized precision and writes 40 rows transactionally.
 
 Admission is fail-closed at >=1.1 TiB available RAM and >=1.1 TiB free scratch,
 with 32-64 physical CPU cores isolated from active lanes.  Prefer one SMT

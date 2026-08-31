@@ -40,6 +40,13 @@ def _run(_model, _prompt_id, _positions, _token_ids):
     return []
 
 
+_configured = []
+
+
+def _configure(checkpoint, semantics):
+    _configured.append((checkpoint, semantics))
+
+
 def _bad_run(_model, _prompt_id, _positions):
     return []
 
@@ -143,6 +150,72 @@ def test_cli_dry_run_records_tokenizer_binding(tmp_path, capsys):
     assert '"provider_bound": true' in output
     assert '"tokenizer_versions": {\n    "tokenizer": "tiny-v1"' in output
     assert '"prompt_token_ids": {\n    "feedback-0": [\n      11,' in output
+
+
+def test_cli_configures_provider_before_binding_tokenizer(tmp_path, capsys):
+    _configured.clear()
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    MODULE.main(
+        [
+            "--checkpoint-dir",
+            str(checkpoint),
+            "--output-dir",
+            str(tmp_path / "bank"),
+            "--reference-id",
+            "original-test",
+            "--semantics",
+            "native-block-fp8",
+            "--configure",
+            f"{__name__}:_configure",
+            "--loader",
+            f"{__name__}:_load",
+            "--runner",
+            f"{__name__}:_run",
+            "--tokenizer",
+            f"{__name__}:_tokenize",
+            "--loader-version",
+            "transformers=5.16.1",
+            "--tokenizer-version",
+            "processor=glm5-next",
+            "--dry-run",
+        ],
+        preflight=lambda _path: object(),
+        producer_cls=_Producer,
+        spec_cls=_Spec,
+    )
+    assert _configured == [(checkpoint.resolve(), "native-block-fp8")]
+    assert '"provider_bound": true' in capsys.readouterr().out
+
+
+def test_cli_rejects_configure_without_tokenizer(tmp_path):
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    with pytest.raises(ValueError, match="requires --tokenizer"):
+        MODULE.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--output-dir",
+                str(tmp_path / "bank"),
+                "--reference-id",
+                "original-test",
+                "--semantics",
+                "native-block-fp8",
+                "--configure",
+                f"{__name__}:_configure",
+                "--loader",
+                f"{__name__}:_load",
+                "--runner",
+                f"{__name__}:_run",
+                "--loader-version",
+                "transformers=5.16.1",
+                "--dry-run",
+            ],
+            preflight=lambda _path: object(),
+            producer_cls=_Producer,
+            spec_cls=_Spec,
+        )
 
 
 def test_cli_rejects_non_dry_run_without_tokenizer_binding(tmp_path):

@@ -127,6 +127,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantics", required=True)
     parser.add_argument("--loader", required=True, help="MODULE:CALLABLE")
     parser.add_argument("--runner", required=True, help="MODULE:CALLABLE")
+    parser.add_argument(
+        "--configure",
+        help="optional MODULE:CALLABLE receiving (checkpoint_dir, semantics)",
+    )
     parser.add_argument("--tokenizer", help="MODULE:CALLABLE returning input_ids")
     parser.add_argument("--loader-version", action="append", default=[])
     parser.add_argument("--tokenizer-version", action="append", default=[])
@@ -163,12 +167,23 @@ def main(
     prompt_token_ids = {}
     loader = tokenizer = runner = None
     if args.tokenizer:
+        if args.configure:
+            configure = _callable(args.configure, "--configure")
+            try:
+                inspect.signature(configure).bind(checkpoint_dir, args.semantics)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "--configure provider must accept (checkpoint_dir, semantics)"
+                ) from exc
+            configure(checkpoint_dir, args.semantics)
         loader = _callable(args.loader, "--loader")
         tokenizer = _callable(args.tokenizer, "--tokenizer")
         runner = _callable(args.runner, "--runner")
         _validate_provider_signatures(loader, tokenizer, runner)
         tokenizer_versions = _loader_versions(args.tokenizer_version)
         prompt_token_ids = _prompt_token_ids(tokenizer, GLM53_PROMPTS)
+    elif args.configure:
+        raise ValueError("--configure requires --tokenizer")
     spec = spec_type(
         reference_id=args.reference_id,
         checkpoint_dir=checkpoint_dir,
