@@ -63,7 +63,9 @@ def test_tiny_original_producer_emits_verified_4x10_full_vocab_bank(tmp_path: Pa
     reference_module = importlib.util.module_from_spec(reference_spec)
     sys.modules[reference_spec.name] = reference_module
     reference_spec.loader.exec_module(reference_module)
-    target = reference_module.Glm53ReferenceTarget.from_manifest(manifest_path)
+    target = reference_module.Glm53ReferenceTarget.from_manifest(
+        manifest_path, allow_partial=True
+    )
     assert len(target.rows) == 40
     assert target.loader_versions["torch"] == "2.9.1-test"
     assert target.load_row(slot=0, prompt_id="feedback-0", position=0).shape == (

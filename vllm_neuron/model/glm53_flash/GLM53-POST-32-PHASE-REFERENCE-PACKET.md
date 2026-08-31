@@ -157,12 +157,18 @@ vocabulary `154880`, prompts
 real original-target implementation bound to the checkpoint above; the
 injected runner must return ten full-vocabulary rows per prompt.
 
-Expected output is 40 row files and a `reference.json` accepted by
-`Glm53ReferenceTarget.from_manifest`.  Every row must pass dtype, shape,
-finite-value, and SHA checks.  The manifest must include exact loader-version
-identities.  A missing full-checkpoint CPU loader/runner is a capability gap;
-do not substitute Q4, a generic FP32 bank, or a confidence-only reference.
-The producer's successful receipt still does not authorize correctness.
+Expected output is 40 row files and a `reference.json` accepted by the strict
+default of `Glm53ReferenceTarget.from_manifest`.  The manifest must bind the
+exact prompt list (`feedback-0..feedback-3`), positions (`0..9`), tokenizer
+version(s), and the processor-emitted token IDs; every row must pass dtype,
+shape, finite-value, and SHA checks.  This composite identity is immutable:
+checkpoint revision/config/index, explicit semantics, loader/tokenizer
+versions, token IDs, row hashes, and the 40 row keys must all match.  The
+reader's `allow_partial=True` mode is diagnostic-only for retained one-row or
+legacy fixtures and is not a canonical acceptance path.  A missing
+full-checkpoint CPU loader/runner is a capability gap; do not substitute Q4, a
+generic FP32 bank, or a confidence-only reference.  The producer's successful
+receipt still does not authorize correctness.
 
 The concrete provider is now
 `vllm_neuron/model/glm53_flash/original_target_provider.py`.  It binds
@@ -225,12 +231,23 @@ python tools/glm53_reference_target_producer.py \
 
 The dry run validates pinned checkpoint metadata and the tokenizer's four
 non-empty integer `input_ids` sequences, then emits the 4x10 contract without
-loading weights.  Remove `--dry-run` only when the exact full checkpoint is
-resident and capacity gates pass; the provider then loads with `dtype="auto"`
-to preserve serialized precision and writes 40 rows transactionally.  The
-producer materializes at most 11 runner values per prompt (the required 10
-plus one overflow probe), so a generator cannot publish short or extra
-coverage and cannot cause unbounded host-side materialization.
+loading weights.  For the selected CPU reference, use
+`--semantics native-block-fp8-dequantized-bfloat16`; this is released
+block-FP8 decoded to BF16, not native CPU-FP8 equivalence.  Remove
+`--dry-run` only when the exact full checkpoint is resident and capacity gates
+pass; the provider then loads through the declared 128x128 conversion path and
+writes 40 rows transactionally.  The producer materializes at most 11 runner
+values per prompt (the required 10 plus one overflow probe), so a generator
+cannot publish short or extra coverage and cannot cause unbounded host-side
+materialization.
+
+Before any score, call the strict reader on an existing candidate manifest and
+reuse it only if it accepts and all row hashes remain valid.  If strict
+admission fails (partial rows, missing tokenizer binding, identity drift,
+shape/dtype/finite failure, or row hash drift), quarantine that candidate and
+regenerate exactly once under the same pinned converted-BF16 semantics; never
+auto-rescue by changing prompts, tokenizer, precision, or target checkpoint.
+No bank has been generated in this source-only stage.
 
 Admission is fail-closed at >=1.1 TiB available RAM and >=1.1 TiB free scratch,
 with 32-64 physical CPU cores isolated from active lanes.  Prefer one SMT

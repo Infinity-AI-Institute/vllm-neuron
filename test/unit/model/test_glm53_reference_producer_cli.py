@@ -33,6 +33,10 @@ def _tokenize(prompt_id):
     return {"input_ids": [11, len(prompt_id)]}
 
 
+def _bad_tokenize(_prompt_id):
+    return {"input_ids": [154880]}
+
+
 def _load(_checkpoint):
     return object()
 
@@ -216,6 +220,38 @@ def test_cli_rejects_configure_without_tokenizer(tmp_path):
                 f"{__name__}:_run",
                 "--loader-version",
                 "transformers=5.16.1",
+                "--dry-run",
+            ],
+            preflight=lambda _path: object(),
+            producer_cls=_Producer,
+            spec_cls=_Spec,
+        )
+
+
+def test_cli_rejects_out_of_vocabulary_token_ids(tmp_path):
+    checkpoint = tmp_path / "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    checkpoint.mkdir()
+    with pytest.raises(ValueError, match="invalid input_ids"):
+        MODULE.main(
+            [
+                "--checkpoint-dir",
+                str(checkpoint),
+                "--output-dir",
+                str(tmp_path / "bank"),
+                "--reference-id",
+                "original-test",
+                "--semantics",
+                "native-block-fp8",
+                "--loader",
+                f"{__name__}:_load",
+                "--runner",
+                f"{__name__}:_run",
+                "--tokenizer",
+                f"{__name__}:_bad_tokenize",
+                "--loader-version",
+                "transformers=5.16.1",
+                "--tokenizer-version",
+                "tokenizer=tiny-v1",
                 "--dry-run",
             ],
             preflight=lambda _path: object(),

@@ -170,7 +170,8 @@ class Glm53OriginalTargetProducerSpec:
                     isinstance(token_ids, tuple)
                     and token_ids
                     and all(
-                        type(token_id) is int and token_id >= 0
+                        type(token_id) is int
+                        and 0 <= token_id < GLM53_RAW_CAPTURE_VOCAB_SIZE
                         for token_id in token_ids
                     ),
                     f"prompt token ids are invalid for {prompt_id}",
@@ -279,6 +280,8 @@ class Glm53OriginalTargetProducer:
                 "semantics": self.spec.semantics,
                 "dtype": self.spec.output_dtype,
                 "vocab_size": self.spec.vocab_size,
+                "prompt_ids": list(self.spec.prompt_ids),
+                "positions": list(self.spec.positions),
                 "loader_versions": dict(self.spec.loader_versions),
                 "rows": rows,
             }

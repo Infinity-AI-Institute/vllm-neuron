@@ -89,7 +89,8 @@ def _prompt_token_ids(tokenizer: Callable[..., Any], prompt_ids: tuple[str, ...]
             raise TypeError(f"tokenizer returned invalid input_ids for {prompt_id}")
         token_ids = tuple(encoded)
         if not token_ids or not all(
-            type(token_id) is int and token_id >= 0 for token_id in token_ids
+            type(token_id) is int and 0 <= token_id < GLM53_VOCAB_SIZE
+            for token_id in token_ids
         ):
             raise ValueError(f"tokenizer returned invalid input_ids for {prompt_id}")
         result[prompt_id] = token_ids

@@ -27,6 +27,8 @@ COMMON = {
     "semantics": "original-checkpoint-cpu-fp32",
     "dtype": "torch.float32",
     "vocab_size": VOCAB,
+    "prompt_ids": [f"feedback-{index}" for index in range(4)],
+    "positions": list(range(10)),
 }
 
 
@@ -56,7 +58,9 @@ def _manifest(
 def test_original_target_manifest_loads_one_verified_full_vocab_row(
     tmp_path: Path,
 ) -> None:
-    target = MODULE.Glm53ReferenceTarget.from_manifest(_manifest(tmp_path))
+    target = MODULE.Glm53ReferenceTarget.from_manifest(
+        _manifest(tmp_path), allow_partial=True
+    )
     row = target.load_row(slot=0, prompt_id="p0", position=0)
     assert tuple(row.shape) == (VOCAB,)
     assert row.dtype is torch.float32
@@ -75,12 +79,50 @@ def test_reference_manifest_rejects_identity_or_semantic_drift(
     tmp_path: Path, changes: dict[str, object], match: str
 ) -> None:
     with pytest.raises(MODULE.Glm53ReferenceTargetError, match=match):
-        MODULE.Glm53ReferenceTarget.from_manifest(_manifest(tmp_path, **changes))
+        MODULE.Glm53ReferenceTarget.from_manifest(
+            _manifest(tmp_path, **changes), allow_partial=True
+        )
 
 
 def test_reference_row_hash_drift_is_fail_closed(tmp_path: Path) -> None:
     path = _manifest(tmp_path)
-    target = MODULE.Glm53ReferenceTarget.from_manifest(path)
+    target = MODULE.Glm53ReferenceTarget.from_manifest(path, allow_partial=True)
     (tmp_path / "rows/0-p0-0.bin").write_bytes(b"corrupt")
     with pytest.raises(MODULE.Glm53ReferenceTargetError, match="hash drift"):
         target.load_row(slot=0, prompt_id="p0", position=0)
+
+
+def test_canonical_reader_rejects_partial_or_unbound_manifest(tmp_path: Path) -> None:
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    with pytest.raises(MODULE.Glm53ReferenceTargetError, match="exactly the 40"):
+        MODULE.Glm53ReferenceTarget.from_manifest(_manifest(partial))
+
+    tmp_path = tmp_path / "full"
+    tmp_path.mkdir()
+    path = _manifest(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["rows"] = [
+        {
+            **data["rows"][0],
+            "prompt_id": prompt_id,
+            "position": position,
+        }
+        for prompt_id in MODULE.GLM53_REFERENCE_PROMPT_IDS
+        for position in MODULE.GLM53_REFERENCE_POSITIONS
+    ]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(MODULE.Glm53ReferenceTargetError, match="tokenizer versions"):
+        MODULE.Glm53ReferenceTarget.from_manifest(path)
+
+    data["tokenizer_versions"] = {"processor": "Glm5NextProcessor@5.16.1"}
+    data["prompt_token_ids"] = {
+        prompt_id: [101 + index]
+        for index, prompt_id in enumerate(MODULE.GLM53_REFERENCE_PROMPT_IDS)
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    target = MODULE.Glm53ReferenceTarget.from_manifest(path)
+    assert target.prompt_token_ids == {
+        prompt_id: (101 + index,)
+        for index, prompt_id in enumerate(MODULE.GLM53_REFERENCE_PROMPT_IDS)
+    }

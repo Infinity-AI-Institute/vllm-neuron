@@ -173,7 +173,9 @@ def test_reference_comparison_is_full_vocab_and_non_authorizing(tmp_path):
     }
     manifest_path = tmp_path / "reference.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    target = reference_module.Glm53ReferenceTarget.from_manifest(manifest_path)
+    target = reference_module.Glm53ReferenceTarget.from_manifest(
+        manifest_path, allow_partial=True
+    )
     capture = MODULE.Glm53RawCapture(
         _plan(
             slot_count=1,
