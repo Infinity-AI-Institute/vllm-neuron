@@ -306,6 +306,16 @@ def _validate_retained_packet(
     ):
         bound = _bound_file(root, entry, name)
         _require(bound.resolve() == actual.resolve(), f"{name} path drift")
+    model_entry = packet.get("model")
+    model_path = _bound_file(root, model_entry, "serialized model")
+    _require(
+        model_path.resolve() == (root / "artifacts/model/model.pt").resolve(),
+        "serialized model path drift",
+    )
+    _require(
+        model_path.stat().st_size == model_entry.get("bytes"),
+        "serialized model size drift",
+    )
     compiler = packet.get("compiler_evidence")
     _require(isinstance(compiler, dict), "compiler evidence is missing")
     hlo_relative = compiler.get("hlo_relative_path")

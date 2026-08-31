@@ -69,6 +69,8 @@ def _write_artifact(
     (model / "neuron_config.json").write_text(
         json.dumps({"neuron_config": emitted}), encoding="utf-8"
     )
+    model_pt_path = model / "model.pt"
+    model_pt_path.write_bytes(b"serialized-model")
     effective_shape_path = root / "artifacts" / "effective-shape.json"
     effective_shape_path.write_text(
         json.dumps(
@@ -120,6 +122,11 @@ def _write_artifact(
         "source_identity": {
             "relative_path": "artifacts/source-identity.json",
             "sha256": sha256(source_identity_path),
+        },
+        "model": {
+            "relative_path": "artifacts/model/model.pt",
+            "sha256": sha256(model_pt_path),
+            "bytes": model_pt_path.stat().st_size,
         },
         "effective_shape": {
             "relative_path": "artifacts/effective-shape.json",
@@ -193,6 +200,17 @@ def test_tkg_artifact_is_explicitly_not_fresh_prompt_ready(tmp_path: Path) -> No
     assert "context_encoding_model" in receipt.blockers[0]
     assert "32 TP32 sharded" in receipt.blockers[1]
     assert receipt.to_mapping()["readiness"]["card_launch_authorized"] is False
+
+
+def test_tkg_packet_rejects_serialized_model_hash_drift(tmp_path: Path) -> None:
+    root, packet_path = _write_artifact(tmp_path)
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    packet["model"]["sha256"] = "0" * 64
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    with pytest.raises(
+        PREP.Glm53CardPreparationError, match="serialized model hash drift"
+    ):
+        PREP.inspect_tkg_artifact(root, retained_packet_path=packet_path)
 
 
 def test_memory_measurement_is_exact_and_audit_loads_no_payload() -> None:

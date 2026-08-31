@@ -1,10 +1,10 @@
 # GLM-5.3 TKG card-preparation boundary
 
 `RETAINED-TKG-ARTIFACT-PACKET.json` binds the retained compiler evidence: the
-effective-shape receipt, emitted `neuron_config.json`, compile result, HLO,
-NEFF, source/tree identities, and pinned NxDI/checkpoint identities.  The HLO
-and NEFF are evidence only; this change does not recompile or authorize a card
-launch.
+effective-shape receipt, emitted `neuron_config.json`, serialized `model.pt`,
+compile result, HLO, NEFF, source/tree identities, and pinned
+NxDI/checkpoint identities.  The HLO, NEFF, and model archive are evidence
+only; this change does not recompile or authorize a card launch.
 
 The artifact is TKG-only: it contains exactly one
 `token_generation_model`, no `context_encoding_model`, and no CTE bucket.  A
@@ -56,6 +56,33 @@ tools/glm53_tkg_card_prep.py \
 Omitting `--retained-packet` preserves the checked-in packet default.  The
 option only selects the evidence manifest; it never authorizes compile,
 runtime, card load, correctness, or performance claims.
+
+Before any paired runtime load, run the separate host-only phase handoff
+probe.  It reads the serialized `model.pt` archives without importing torch:
+
+```bash
+python tools/glm53_phase_handoff.py \
+  --tkg-artifact-root /mnt/compile/runroot/glm53-pr22-tkg-tp32-b1-s128-20260830T004316Z \
+  --cte-artifact-root /mnt/compile/runroot/glm53-pr22-cte-tp32-b1-s128-20260830T0140Z \
+  --compose-receipt /mnt/compile/runroot/glm53-pr22-cte-tp32-b1-s128-20260830T0140Z/artifacts/tkg-cte-compose-receipt.json \
+  --output /mnt/compile/runroot/glm53-pr22-phase-handoff/phase-handoff-receipt.json
+```
+
+The probe requires TKG's serialized `LayoutTransformation` and CTE's
+serialized `torch.ops.neuron._parallel_load` to remain phase-local, binds the
+`model.pt` bytes for both phases, and requires identical serialized
+`past_key_values.*` state-key sets, emitted-config hash, source identity, and
+compose-receipt hashes.  CTE may omit `artifacts/source-identity.json` only
+when the immutable compose/launch receipt supplies the same identity.  Its
+receipt is evidence only and keeps runtime/card/correctness claims false.
+
+The paired runtime seam is
+`vllm_neuron.model.glm53_flash.phase_runtime.Glm53PairedPhaseRuntime`.  It
+calls each resident serialized model's `nxd_model.initialize(sharded_checkpoint)`
+and reads the resulting `nxd_model.state` schema; the SDK-owned layout/load
+operation remains phase-local.  `initialize_with_saved_weights()` is available
+only through its explicit opt-in.  The adapter refuses rank/state-key drift and
+emits `runtime_permitted=false`; it does not transfer state or launch cards.
 
 Readiness remains false unless the optional inputs are independently bound:
 the CTE companion must carry the exact TP32/LNC2/B1/S128 context-encoding

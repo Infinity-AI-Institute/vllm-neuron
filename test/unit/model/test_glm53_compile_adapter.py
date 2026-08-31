@@ -152,10 +152,10 @@ def test_transplant_manifest_binds_every_reviewed_file_to_current_bytes():
     assert manifest["origin_claim"] is None
     assert manifest["base_commit"] == "1b2e90d1f7fa5296aeaa57420794393958fe566e"
     assert manifest["reviewed_source_commit"] == (
-        "d82f4f2d8c8a2b4a71965d3b401ecae060df46a8"
+        "55ab7ce771aa6299050e4fb09830831f6ac89375"
     )
     assert manifest["reviewed_source_tree"] == (
-        "0da3326192d16ed70a9eff1a92d133cd49fab4e4"
+        "8a3f86f05fcfeac417072ed1c6fb96c8480be69d"
     )
     rows = manifest["files"]
     assert len(rows) == 30
@@ -170,7 +170,11 @@ def test_transplant_manifest_binds_every_reviewed_file_to_current_bytes():
             ],
             text=True,
         ).splitlines()
-        if path.startswith("vllm_neuron/")
+        if (
+            path.startswith(("vllm_neuron/kernels/", "vllm_neuron/model/glm53_flash/"))
+            or path == "vllm_neuron/model/registry.py"
+        )
+        and path != "vllm_neuron/model/glm53_flash/TRANSPLANT-PROVENANCE.json"
     }
     assert {row["path"] for row in rows} == expected_paths
     root = MANIFEST.parents[3]

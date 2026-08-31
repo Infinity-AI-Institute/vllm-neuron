@@ -11,6 +11,11 @@
     "relative_path": "artifacts/source-identity.json",
     "sha256": "2a2fd20fe12275b0ad28b3abf2092f14c1f4c5822a7e11a0550980e73c94175b"
   },
+  "model": {
+    "relative_path": "artifacts/model/model.pt",
+    "sha256": "778b80a5cdde64ee821df3a569f66a65ac9878530654b4ba25d748709078207f",
+    "bytes": 43694275
+  },
   "effective_shape": {
     "relative_path": "artifacts/effective-shape.json",
     "sha256": "906b9a98853a12b555a9997f4375be555dfa0005aa975e958f2eae76968f038f"

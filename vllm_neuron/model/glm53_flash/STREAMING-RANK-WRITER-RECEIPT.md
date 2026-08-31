@@ -49,3 +49,22 @@ before any compile or runtime use.
 
 No model weights, r7i compile slot, Trn2 device, runtime correctness,
 performance, or tokenomics claim is part of this receipt.
+
+## Canonical host runner
+
+`tools/glm53_stream_rank_checkpoint.py` is the bounded host adapter for the
+writer.  It emits the exact filenames consumed by the card-preparation and
+runtime-factory gates, refuses duplicate/out-of-range ranks and pre-existing
+transactional paths before streaming, and fixes the TP32/64 MiB contract:
+
+```bash
+python tools/glm53_stream_rank_checkpoint.py \
+  --checkpoint-dir /hf/snapshots/04c4e9e95c5da8862dced7e5056455116f83a7e0 \
+  --output-dir /rank-bundle \
+  --rank 0 --rank 1
+```
+
+The command may be repeated for ranks `0..31` with enough host storage.  Its
+receipt always keeps card launch, runtime, correctness, and performance
+claims false.  Each rank remains transactional and writes its manifest only
+after complete coverage and source/checkpoint validation.
