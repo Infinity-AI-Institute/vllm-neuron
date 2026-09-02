@@ -846,13 +846,31 @@ if _NXDI_AVAILABLE:
             # this wrapper loads it in the config dtype (bf16 by default)
             # and up-casts inside the forward — the difference is measured
             # in the mini-golden and stays inside BF16 tolerance.
-            self.weights_proj = _NxdColumnParallelLinear(
-                self.hidden_size,
-                self.index_n_heads,
-                bias=False,
-                gather_output=True,
-                dtype=dtype,
-            )
+            if tp_degree == 32:
+                self.weights_proj = _NxdColumnParallelLinear(
+                    self.hidden_size,
+                    self.index_n_heads,
+                    bias=False,
+                    gather_output=True,
+                    dtype=dtype,
+                )
+                self.weights_proj_ownership = "tp32_sharded_gathered"
+            elif tp_degree == 64:
+                # GLM has 32 index heads. Sharding this 32-wide output across
+                # 64 TP ranks would create zero-width output partitions; keep
+                # the small projection replicated without changing its
+                # [B, Q, 32] scorer/state contract.
+                self.weights_proj = nn.Linear(
+                    self.hidden_size,
+                    self.index_n_heads,
+                    bias=False,
+                    dtype=dtype,
+                )
+                self.weights_proj_ownership = "tp64_replicated"
+            else:
+                raise NotImplementedError(
+                    f"GLM-5.3 indexer supports TP32 or TP64, got TP{tp_degree}"
+                )
 
             # ``index_kpool_compress_ape``: per-pool-slot APE, added inside
             # the softmax over the pool axis.  Small parameter, replicated.

@@ -291,9 +291,9 @@ def build_glm53_rank_plan(
     weight_map = index["weight_map"]
     if not isinstance(text, dict) or not isinstance(weight_map, dict):
         raise Glm53ArchitectureMismatch("pinned config/index schema changed")
-    if tp_degree != 32:
+    if tp_degree not in (32, 64):
         raise Glm53ArchitectureMismatch(
-            "the qualified GLM-5.3 target contract requires TP=32"
+            "the qualified GLM-5.3 target contract requires TP=32 or TP=64"
         )
     if rank < 0 or rank >= tp_degree or max_chunk_bytes <= 0:
         raise ValueError("invalid rank, TP degree, or max_chunk_bytes")
@@ -326,8 +326,8 @@ def build_glm53_rank_plan(
         kda_heads,
         q_lora,
         kv_lora,
-        index_heads,
         index_dim,
+        index_heads * index_dim,
     )
     if any(value % tp_degree for value in divisibles):
         raise Glm53ArchitectureMismatch(
@@ -533,7 +533,11 @@ def build_glm53_rank_plan(
             index_specs = (
                 ("wq_b.weight", (index_heads * index_dim, q_lora), "shard0"),
                 ("wk.weight", (index_dim, hidden), "shard0"),
-                ("weights_proj.weight", (index_heads, hidden), "shard0"),
+                (
+                    "weights_proj.weight",
+                    (index_heads, hidden),
+                    "shard0" if tp_degree == 32 else "copy",
+                ),
                 ("k_norm.weight", (index_dim,), "copy"),
                 ("k_norm.bias", (index_dim,), "copy"),
                 ("index_kpool_compress_ape", (index_kpool, index_dim), "copy"),

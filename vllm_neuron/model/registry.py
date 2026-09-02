@@ -2,7 +2,7 @@
 import os
 
 from .glm52_moe_dsa.factory import GlmMoeDsaForCausalLM
-from .glm53_flash import NeuronGlm53FlashForCausalLM
+from .glm53_flash.provider_factory import Glm53FlashProviderForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, LlamaForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
@@ -21,7 +21,7 @@ def get_models() -> list[tuple[str, type]]:
         ("LlamaForCausalLM", LlamaForCausalLM),
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("GlmMoeDsaForCausalLM", GlmMoeDsaForCausalLM),
-        ("Glm5NextForConditionalGeneration", NeuronGlm53FlashForCausalLM),
+        ("Glm5NextForConditionalGeneration", Glm53FlashProviderForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
     ]

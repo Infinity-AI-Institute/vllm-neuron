@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
-GLM53_RUNTIME_CONFIG_SCHEMA = "glm53-emitted-runtime-config-v1"
+GLM53_RUNTIME_CONFIG_SCHEMA = "glm53-emitted-runtime-config-v2"
 GLM53_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 GLM53_CHECKPOINT_REVISION = "04c4e9e95c5da8862dced7e5056455116f83a7e0"
 
@@ -88,6 +88,7 @@ class Glm53RuntimeConfig:
     cache_dtype: str
     runtime_quantization: str
     sampling_mode: str
+    output_logits: bool
     speculative_decode: bool
 
     @classmethod
@@ -170,8 +171,8 @@ class Glm53RuntimeConfig:
             "max_sequence_length",
         )
         integers = {name: _positive_int(value[name], name) for name in integer_names}
-        if integers["tensor_parallel_degree"] != 32:
-            raise Glm53RuntimeConfigError("GLM-5.3 rank plan requires TP32")
+        if integers["tensor_parallel_degree"] not in (32, 64):
+            raise Glm53RuntimeConfigError("GLM-5.3 rank plan requires TP32 or TP64")
         context_buckets = _strictly_increasing_ints(
             value["context_encoding_buckets"], "context_encoding_buckets"
         )
@@ -185,6 +186,13 @@ class Glm53RuntimeConfig:
             )
         if strings["sampling_mode"] != "greedy":
             raise Glm53RuntimeConfigError("formal gate requires greedy sampling")
+        output_logits = value["output_logits"]
+        if type(output_logits) is not bool:
+            raise Glm53RuntimeConfigError("output_logits must be a boolean")
+        if integers["tensor_parallel_degree"] == 64 and output_logits is not True:
+            raise Glm53RuntimeConfigError(
+                "TP64 profile requires output_logits=true for the full-vocabulary gate"
+            )
         if type(value["speculative_decode"]) is not bool:
             raise Glm53RuntimeConfigError("speculative_decode must be a boolean")
         if value["speculative_decode"]:
@@ -199,6 +207,7 @@ class Glm53RuntimeConfig:
             **integers,
             context_encoding_buckets=context_buckets,
             token_generation_buckets=token_buckets,
+            output_logits=output_logits,
             speculative_decode=False,
         )
 
@@ -226,6 +235,7 @@ class Glm53RuntimeConfig:
             "cache_dtype": self.cache_dtype,
             "runtime_quantization": self.runtime_quantization,
             "sampling_mode": self.sampling_mode,
+            "output_logits": self.output_logits,
             "speculative_decode": self.speculative_decode,
         }
 

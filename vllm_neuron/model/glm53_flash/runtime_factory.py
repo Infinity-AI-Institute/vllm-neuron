@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-only runtime-artifact factory for the exact GLM-5.3 TP32 bundle.
+"""Host-only runtime-artifact factory for qualified GLM-5.3 TP bundles.
 
 The factory joins three already-reviewed boundaries without constructing or
-loading a model: the immutable checkpoint metadata, the transactional TP32
-rank plan, and the requested-versus-emitted runtime configuration.  It emits a
-canonical bundle contract only after all 32 rank files and manifests verify.
+loading a model: the immutable checkpoint metadata, the transactional rank
+plan, and the requested-versus-emitted runtime configuration.  It emits a
+canonical bundle contract only after every rank file and manifest verifies.
 Compile and runtime remain explicitly unauthorized.
 """
 
@@ -31,9 +31,18 @@ GLM53_RUNTIME_ADAPTER = (
 GLM53_RUNTIME_BUNDLE_SCHEMA = "glm53-runtime-artifact-bundle-v1"
 GLM53_RUNTIME_FACTORY_ABI = (
     "glm53-runtime-factory-v1|checkpoint=04c4e9e95c5d|tp=32|"
-    "rank-manifest=glm53-streaming-rank-v1|emitted-config=v1|no-spec|no-runtime-quant"
+    "rank-manifest=glm53-streaming-rank-v1|emitted-config=v2|no-spec|no-runtime-quant"
 )
-GLM53_RANK_COUNT = 32
+GLM53_TP64_RUNTIME_FACTORY_ABI = (
+    "glm53-runtime-factory-v2|class=R3|checkpoint=04c4e9e95c5d|tp=64|"
+    "rank-manifest=glm53-streaming-rank-v1+rank-plan-copy[32,4096]|"
+    "emitted-config=v2|lnc=2|b1-prefill-s2048-decode-total-s2560|"
+    "no-spec|no-runtime-quant"
+)
+GLM53_TP32_RANK_COUNT = 32
+GLM53_TP64_RANK_COUNT = 64
+# Compatibility alias: existing TP32 callers remain bound to 32 ranks.
+GLM53_RANK_COUNT = GLM53_TP32_RANK_COUNT
 GLM53_MAX_CHUNK_BYTES = 64 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _UNIT = re.compile(r"glm53-compile-[A-Za-z0-9_.-]{1,96}")
@@ -68,6 +77,22 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise Glm53RuntimeFactoryError(f"duplicate JSON key: {key!r}")
         result[key] = value
     return result
+
+
+def _rank_count_for(tp_degree: int) -> int:
+    if tp_degree == 32:
+        return GLM53_TP32_RANK_COUNT
+    if tp_degree == 64:
+        return GLM53_TP64_RANK_COUNT
+    raise Glm53RuntimeFactoryError(f"unsupported tensor parallelism: TP{tp_degree}")
+
+
+def _factory_abi_for(tp_degree: int) -> str:
+    if tp_degree == 32:
+        return GLM53_RUNTIME_FACTORY_ABI
+    if tp_degree == 64:
+        return GLM53_TP64_RUNTIME_FACTORY_ABI
+    raise Glm53RuntimeFactoryError(f"unsupported tensor parallelism: TP{tp_degree}")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -174,6 +199,8 @@ class Glm53RuntimeRank:
 class Glm53RuntimeArtifactBundle:
     requested_config_sha256: str
     emitted_config_sha256: str
+    tensor_parallel_degree: int
+    output_logits: bool
     compile_policy: Glm53CompileLaunchPolicy
     ranks: tuple[Glm53RuntimeRank, ...]
 
@@ -189,7 +216,17 @@ class Glm53RuntimeArtifactBundle:
             },
             "factory": {
                 "adapter": GLM53_RUNTIME_ADAPTER,
-                "abi": GLM53_RUNTIME_FACTORY_ABI,
+                "abi": _factory_abi_for(self.tensor_parallel_degree),
+            },
+            "topology": {
+                "tp_degree": self.tensor_parallel_degree,
+                "rank_count": len(rank_rows),
+                "indexer_weights_proj_ownership": (
+                    "replicated-copy[32,4096]"
+                    if self.tensor_parallel_degree == 64
+                    else "tp32-sharded-gathered"
+                ),
+                "output_logits": self.output_logits,
             },
             "runtime_config": {
                 "requested_sha256": self.requested_config_sha256,
@@ -242,9 +279,8 @@ class Glm53RuntimeFactory:
             requested.runtime_adapter == GLM53_RUNTIME_ADAPTER,
             "runtime adapter identity drift",
         )
-        _require(
-            requested.tensor_parallel_degree == 32, "runtime factory requires TP32"
-        )
+        tp_degree = requested.tensor_parallel_degree
+        _require(tp_degree in (32, 64), "runtime factory requires TP32 or TP64")
         _require(
             requested.logical_neuron_cores == 2,
             "runtime factory requires LNC2",
@@ -259,21 +295,41 @@ class Glm53RuntimeFactory:
         _require(
             requested.speculative_decode is False, "speculative decode is forbidden"
         )
+        if tp_degree == 64:
+            _require(
+                requested.output_logits is True,
+                "TP64 factory requires output_logits=true",
+            )
+            _require(requested.batch_size == 1, "TP64 factory requires B1")
+            _require(
+                requested.max_sequence_length == 2560,
+                "TP64 factory requires total S2560",
+            )
+            _require(
+                requested.context_encoding_buckets == (2048,),
+                "TP64 factory requires one CTE S2048 bucket",
+            )
+            _require(
+                requested.token_generation_buckets == (2560,),
+                "TP64 factory requires one TKG total-S2560 bucket",
+            )
         policy = Glm53CompileLaunchPolicy.from_mapping(compile_policy)
         ranks = tuple(
-            cls._validate_rank(checkpoint_root, rank_root, rank)
-            for rank in range(GLM53_RANK_COUNT)
+            cls._validate_rank(checkpoint_root, rank_root, rank, tp_degree=tp_degree)
+            for rank in range(_rank_count_for(tp_degree))
         )
         return Glm53RuntimeArtifactBundle(
             requested_config_sha256=requested.sha256(),
             emitted_config_sha256=emitted.sha256(),
+            tensor_parallel_degree=tp_degree,
+            output_logits=requested.output_logits,
             compile_policy=policy,
             ranks=ranks,
         )
 
     @staticmethod
     def _validate_rank(
-        checkpoint_root: Path, rank_root: Path, rank: int
+        checkpoint_root: Path, rank_root: Path, rank: int, *, tp_degree: int
     ) -> Glm53RuntimeRank:
         checkpoint = rank_root / f"tp{rank}_sharded_checkpoint.safetensors"
         manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".manifest.json")
@@ -288,14 +344,14 @@ class Glm53RuntimeFactory:
         expected_plan = build_glm53_rank_plan(
             checkpoint_root,
             rank=rank,
-            tp_degree=GLM53_RANK_COUNT,
+            tp_degree=tp_degree,
             max_chunk_bytes=GLM53_MAX_CHUNK_BYTES,
         )
         _require(
             manifest.get("schema") == "glm53-streaming-rank-v1", "rank schema drift"
         )
         _require(manifest.get("rank") == rank, f"rank manifest identity drift: {rank}")
-        _require(manifest.get("tp_degree") == 32, "rank manifest TP drift")
+        _require(manifest.get("tp_degree") == tp_degree, "rank manifest TP drift")
         source = manifest.get("source", {})
         _require(
             {
@@ -319,6 +375,23 @@ class Glm53RuntimeFactory:
             manifest.get("rank_plan_sha256") == expected_plan.contract_sha256,
             "rank plan identity drift",
         )
+        if tp_degree == 64:
+            indexer_ops = [
+                operation
+                for operation in getattr(expected_plan, "operations", ())
+                if operation.target.name.endswith("indexer.weights_proj.weight")
+            ]
+            _require(
+                len(indexer_ops) == 11,
+                "TP64 rank plan lacks all 11 indexer weights_proj entries",
+            )
+            _require(
+                all(
+                    operation.kind == "copy" and operation.target.shape == (32, 4096)
+                    for operation in indexer_ops
+                ),
+                "TP64 rank plan must copy full indexer weights_proj [32,4096]",
+            )
         checkpoint_row = manifest.get("checkpoint", {})
         _require(
             checkpoint_row.get("path") == checkpoint.name, "rank checkpoint path drift"
@@ -387,6 +460,7 @@ __all__ = [
     "GLM53_RUNTIME_ADAPTER",
     "GLM53_RUNTIME_BUNDLE_SCHEMA",
     "GLM53_RUNTIME_FACTORY_ABI",
+    "GLM53_TP64_RUNTIME_FACTORY_ABI",
     "Glm53CompileLaunchPolicy",
     "Glm53RuntimeArtifactBundle",
     "Glm53RuntimeFactory",

@@ -70,6 +70,7 @@ def _profile() -> dict:
         "cache_dtype": "bfloat16",
         "runtime_quantization": "none",
         "sampling_mode": "greedy",
+        "output_logits": True,
         "speculative_decode": False,
     }
 
@@ -175,6 +176,7 @@ def test_exact_bundle_verifies_all_32_ranks_without_authorizing_execution(
     payload = bundle.to_mapping()
     assert len(payload["ranks"]) == 32
     assert payload["runtime_config"]["equal"] is True
+    assert payload["topology"]["output_logits"] is True
     assert payload["claims"] == {
         "rank_files_verified": True,
         "compile_permitted": False,

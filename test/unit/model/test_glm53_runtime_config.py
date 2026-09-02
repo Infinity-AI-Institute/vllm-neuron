@@ -56,6 +56,7 @@ def valid_profile() -> dict:
         "cache_dtype": "bfloat16",
         "runtime_quantization": "explicit-test-value",
         "sampling_mode": "greedy",
+        "output_logits": True,
         "speculative_decode": False,
     }
 
@@ -108,6 +109,7 @@ def test_duplicate_json_key_fails_closed():
         ("compiler_image_digest", "latest", "exact repository digest"),
         ("tensor_parallel_degree", 16, "requires TP32"),
         ("sampling_mode", "temperature", "requires greedy"),
+        ("output_logits", "true", "output_logits must be a boolean"),
         ("speculative_decode", True, "outside the GLM-5.3 formal gate"),
     ],
 )
@@ -143,6 +145,24 @@ def test_bucket_beyond_max_sequence_fails_closed():
     requested["token_generation_buckets"] = [128, 16384]
 
     with pytest.raises(Glm53RuntimeConfigError, match="cannot exceed"):
+        Glm53RuntimeConfig.from_mapping(requested)
+
+
+def test_tp64_requires_explicit_full_vocabulary_logits():
+    requested = valid_profile()
+    requested.update(
+        {
+            "tensor_parallel_degree": 64,
+            "max_sequence_length": 2560,
+            "context_encoding_buckets": [2048],
+            "token_generation_buckets": [2560],
+            "output_logits": False,
+        }
+    )
+
+    with pytest.raises(
+        Glm53RuntimeConfigError, match="TP64 profile requires output_logits"
+    ):
         Glm53RuntimeConfig.from_mapping(requested)
 
 
