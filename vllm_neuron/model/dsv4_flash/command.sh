@@ -145,7 +145,12 @@ with open("/runroot/logs/compile-result.json", "w", encoding="utf-8") as fh:
 PY
   '
 
-sudo chown -R ec2-user:ec2-user "$COMPILE_RUN_ROOT"
+# The run root is created by this driver as the invoking user, but the container
+# writes into it as root.  Hand it back to whoever launched the compile -- not to
+# `ec2-user`, which does not exist on research-7 (`id ec2-user` -> no such user).
+# Under `set -e` that failure aborted the driver AFTER a successful compile,
+# discarding the run at its very last step.
+sudo chown -R "$(id -u):$(id -g)" "$COMPILE_RUN_ROOT"
 test -s "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json"
 jq --arg slug "$CONTRACT_SLUG" '. + {contract_slug: $slug}' \
   "$COMPILE_RUN_ROOT/artifacts/model/neuron_config.json" \
