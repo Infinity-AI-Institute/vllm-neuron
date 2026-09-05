@@ -38,6 +38,8 @@ PROMPTS = [
 ]
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^[0-9a-f]{40}$")
+BUILD_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.]{6,63}$")
+SOURCE_IDENTITY_KINDS = {"git_oid", "vendor_build_id"}
 PAYLOAD_LINE_RE = re.compile(r"^([0-9a-f]{64})  \./([^/]+)$")
 
 
@@ -88,6 +90,91 @@ def _require_git_oid(value: Any, label: str) -> str:
         f"{label} must be a 40-character Git object ID",
     )
     return value
+
+
+def _version_build_segment(version: str) -> str | None:
+    """Return the build-metadata segment of a PEP 440 local or dpkg version.
+
+    ``2.26.6360.0+6f180f47`` -> ``6f180f47``;
+    ``2.33.10.0-3dcef56f0``  -> ``3dcef56f0``.
+    """
+    if "+" in version:
+        return version.split("+", 1)[1]
+    if "-" in version:
+        return version.rsplit("-", 1)[1]
+    return None
+
+
+def _require_source_identity(identity: Any, label: str, version: str) -> None:
+    """Require a *typed* source identity rather than a bare 40-hex string.
+
+    Rationale, recorded here because this is deliberately a relaxation of shape
+    and a tightening of meaning:
+
+    ``_require_git_oid`` only regex-checks that a value is 40 lowercase hex
+    characters.  Six of this packet's seven packages are closed-source AWS
+    Neuron wheels that publish no source repository and therefore no Git object
+    ID at all -- they carry 8-9 character vendor build ids.  The only way to
+    satisfy the old rule for them was to *invent* a 40-hex string, which the
+    regex would have accepted and which would then have silently poisoned every
+    downstream provenance claim.  A shape check that only a lie can satisfy is
+    not provenance.
+
+    So: a package that genuinely has a Git OID keeps the strict 40-hex rule and
+    must additionally name the repository the OID resolves in.  A package that
+    does not may declare a vendor build id -- but that id must be *exactly* the
+    build-metadata segment of the recorded version string, so it cannot be
+    chosen independently of the artifact it claims to identify, and that
+    artifact is pinned separately by ``artifact_sha256`` and by the image
+    digest.  That is a strictly stronger binding than the regex it replaces.
+    """
+    _require(
+        isinstance(identity, Mapping),
+        f"{label} source_identity must be an object",
+    )
+    kind = identity.get("kind")
+    _require(
+        kind in SOURCE_IDENTITY_KINDS,
+        f"{label} source_identity kind must be one of {sorted(SOURCE_IDENTITY_KINDS)}",
+    )
+    _require(
+        isinstance(identity.get("reason"), str) and identity["reason"].strip(),
+        f"{label} source_identity must record why this kind was used",
+    )
+    if kind == "git_oid":
+        _require(
+            set(identity) == {"kind", "value", "repository", "reason"},
+            f"{label} git_oid identity fields drift",
+        )
+        _require_git_oid(identity["value"], f"{label} source")
+        _require(
+            isinstance(identity.get("repository"), str)
+            and identity["repository"].strip(),
+            f"{label} git_oid identity must name the repository it resolves in",
+        )
+        return
+
+    _require(
+        set(identity) == {"kind", "value", "vendor", "version_binding", "reason"},
+        f"{label} vendor_build_id identity fields drift",
+    )
+    _require(
+        isinstance(identity.get("vendor"), str) and identity["vendor"].strip(),
+        f"{label} vendor_build_id identity must name the vendor",
+    )
+    value = identity.get("value")
+    _require(
+        isinstance(value, str) and BUILD_ID_RE.fullmatch(value) is not None,
+        f"{label} vendor build id malformed",
+    )
+    _require(
+        identity.get("version_binding") == "local_version_segment",
+        f"{label} vendor build id must declare its binding to the version",
+    )
+    _require(
+        _version_build_segment(version) == value,
+        f"{label} vendor build id is not the recorded version's build segment",
+    )
 
 
 def _safe_artifact(root: Path, relative: Any, label: str) -> Path:
@@ -846,7 +933,7 @@ def _validate_compiler(packet: Mapping[str, Any], compiler: Mapping[str, Any]) -
     )
     for name, identity in packages.items():
         _require(
-            set(identity) == {"version", "artifact_sha256", "source_commit"},
+            set(identity) == {"version", "artifact_sha256", "source_identity"},
             f"{name} identity fields drift",
         )
         _require(
@@ -854,7 +941,7 @@ def _validate_compiler(packet: Mapping[str, Any], compiler: Mapping[str, Any]) -
             f"{name} version missing",
         )
         _require_sha256(identity["artifact_sha256"], f"{name} artifact")
-        _require_git_oid(identity["source_commit"], f"{name} source")
+        _require_source_identity(identity["source_identity"], name, identity["version"])
     _require(
         compiler.get("canonical_inventory_sha256") == _canonical_sha256(packages),
         "compiler canonical digest drift",
