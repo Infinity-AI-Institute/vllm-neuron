@@ -41,6 +41,52 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
+_PACKAGE_NAMES = (
+    "neuronx-cc",
+    "torch-neuronx",
+    "nxdi",
+    "nxd",
+    "nki",
+    "torch",
+    "runtime",
+)
+
+
+def _package_identity(name: str) -> dict:
+    """Build one compiler-inventory entry with a *typed* source identity.
+
+    Deliberately exercises both kinds the validator accepts, because the real
+    packet needs both: ``torch`` is open source and really does resolve a Git
+    OID, while the six AWS Neuron wheels publish no source repository at all
+    and can only name a vendor build id -- which the validator then requires to
+    be exactly the build-metadata segment of the recorded version.
+    """
+    artifact = _sha_bytes(f"artifact-{name}".encode())
+    if name == "torch":
+        return {
+            "version": "2.9.0",
+            "artifact_sha256": artifact,
+            "source_identity": {
+                "kind": "git_oid",
+                "value": hashlib.sha1(f"source-{name}".encode()).hexdigest(),
+                "repository": "https://github.com/pytorch/pytorch",
+                "reason": "open-source wheel built from a public tagged commit",
+            },
+        }
+    build_id = hashlib.sha1(f"build-{name}".encode()).hexdigest()[:8]
+    return {
+        "version": f"2.26.6360.0+{build_id}",
+        "artifact_sha256": artifact,
+        "source_identity": {
+            "kind": "vendor_build_id",
+            "value": build_id,
+            "vendor": "Amazon Web Services",
+            "version_binding": "local_version_segment",
+            "reason": "closed-source Neuron wheel; no public source repository",
+        },
+    }
+
+
 def _git_repository(root: Path) -> tuple[Path, str, str, str]:
     repo = root / "repo"
     repo.mkdir()
@@ -180,22 +226,7 @@ def _complete_evidence(
         },
     )
 
-    packages = {
-        name: {
-            "version": "1.0",
-            "artifact_sha256": _sha_bytes(f"artifact-{name}".encode()),
-            "source_commit": hashlib.sha1(f"source-{name}".encode()).hexdigest(),
-        }
-        for name in (
-            "neuronx-cc",
-            "torch-neuronx",
-            "nxdi",
-            "nxd",
-            "nki",
-            "torch",
-            "runtime",
-        )
-    }
+    packages = {name: _package_identity(name) for name in _PACKAGE_NAMES}
     _write_json(
         evidence / "compiler-provenance.json",
         {
@@ -494,6 +525,50 @@ def test_incomplete_mutated_or_duplicate_evidence_fails(
         value = json.loads(path.read_text(encoding="utf-8"))
         value["prompts"][0]["logits"].pop()
         _write_json(path, value)
+    with pytest.raises(AUTH.AuthorizationError):
+        AUTH.validate_evidence(_packet(), evidence, repo)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "legacy_source_commit",
+        "invented_build_id",
+        "unbound_build_id",
+        "git_oid_without_repository",
+        "unreasoned_identity",
+    ],
+)
+def test_compiler_source_identity_is_bound_to_the_artifact(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Every way of naming a source that is not tied to the artifact must fail.
+
+    ``invented_build_id`` is the case the old 40-hex regex could not catch: a
+    plausible-looking identifier chosen freely by whoever wrote the packet.  It
+    is rejected here only because the validator now requires the id to be the
+    recorded version's own build-metadata segment.
+    """
+    evidence, repo = _complete_evidence(tmp_path)
+    path = evidence / "compiler-provenance.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    packages = value["packages"]
+    if mutation == "legacy_source_commit":
+        entry = packages["neuronx-cc"]
+        entry.pop("source_identity")
+        entry["source_commit"] = "a" * 40
+    elif mutation == "invented_build_id":
+        # Same shape, same declared binding -- but not this artifact's segment.
+        packages["neuronx-cc"]["source_identity"]["value"] = "deadbeef"
+    elif mutation == "unbound_build_id":
+        packages["neuronx-cc"]["source_identity"]["version_binding"] = "asserted"
+    elif mutation == "git_oid_without_repository":
+        packages["torch"]["source_identity"].pop("repository")
+    else:
+        packages["torch"]["source_identity"]["reason"] = "   "
+    # Recompute the digest so the identity rule is the only remaining defect.
+    value["canonical_inventory_sha256"] = AUTH._canonical_sha256(packages)
+    _write_json(path, value)
     with pytest.raises(AUTH.AuthorizationError):
         AUTH.validate_evidence(_packet(), evidence, repo)
 
