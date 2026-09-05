@@ -1,0 +1,4 @@
+# Shell scripts are executed verbatim on Linux hosts. Without this, a Windows
+# checkout (core.autocrlf=true) rewrites them to CRLF, which makes the shebang
+# `#!/usr/bin/env bash\r` and kills `set -o pipefail` at the first line that uses it.
+*.sh text eol=lf

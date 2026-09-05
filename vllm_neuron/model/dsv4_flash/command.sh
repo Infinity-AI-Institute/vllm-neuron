@@ -18,15 +18,15 @@ COMPILE_RUN_ROOT="$(realpath "$COMPILE_RUN_ROOT")"
 MODEL_DIR="$(realpath "$MODEL_DIR")"
 SRC_DIR="$(realpath "$SRC_DIR")"
 AUTH_EVIDENCE_ROOT="$(realpath "$AUTH_EVIDENCE_ROOT")"
-RANK_SOURCE_DIR="$(realpath "$COMPILE_RUN_ROOT/weights")"
+RANK_SOURCE_DIR="$COMPILE_RUN_ROOT/weights"
 
 IMAGE="$(jq -er '.stack.container_digest' "$COMPILE_CONTRACT")"
 TP="$(jq -er '.compile.tp' "$COMPILE_CONTRACT")"
 SEQ="$(jq -er '.compile.sequence_buckets | if length == 1 then .[0] else error("one sequence bucket required") end' "$COMPILE_CONTRACT")"
 CTX_BATCH="$(jq -er '.compile.ctx_batch_size' "$COMPILE_CONTRACT")"
 TKG_BATCH="$(jq -er '.compile.tkg_batch_size' "$COMPILE_CONTRACT")"
-DISABLE_ARGMAX="$(jq -er '.compile.disable_argmax_kernel' "$COMPILE_CONTRACT")"
-DRY_RUN="$(jq -er '.compile.dry_run' "$COMPILE_CONTRACT")"
+DISABLE_ARGMAX="$(jq -r '.compile.disable_argmax_kernel | if type == "boolean" then tostring else error("compile.disable_argmax_kernel must be a boolean") end' "$COMPILE_CONTRACT")"
+DRY_RUN="$(jq -r '.compile.dry_run | if type == "boolean" then tostring else error("compile.dry_run must be a boolean") end' "$COMPILE_CONTRACT")"
 CONTRACT_SLUG="$(jq -er '.contract_slug' "$COMPILE_CONTRACT")"
 
 AUTH_PACKET="${AUTH_PACKET:-$SRC_DIR/vllm_neuron/model/dsv4_flash/tp32_compile_authorization.json}"
@@ -35,7 +35,7 @@ OUT_DIR="$COMPILE_RUN_ROOT/artifacts/model"
 test -s "$MODEL_DIR/config.json"
 test -f "$SRC_DIR/vllm_neuron/model/dsv4_flash/neuron_wrapper.py"
 test "$TP" -eq 32
-python "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py" \
+"${PYTHON:-python3}" "$SRC_DIR/vllm_neuron/model/dsv4_flash/validate_compile_authorization.py" \
   --packet "$AUTH_PACKET" \
   --compile-contract "$COMPILE_CONTRACT" \
   --evidence-root "$AUTH_EVIDENCE_ROOT" \
