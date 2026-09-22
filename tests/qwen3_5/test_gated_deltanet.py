@@ -390,3 +390,41 @@ def test_against_transformers_layer():
         expected = layer(hidden)
     out, _, _ = run_mixer(hidden, torch.tensor([13]), w, chunk=4)
     torch.testing.assert_close(out, expected, atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.parametrize("size", [4, 5, 64])
+def test_unit_lower_inverse_is_exact(size):
+    """The doubling product must equal the true inverse, including when the
+    chunk size is not a power of two (the product then covers more terms
+    than needed, which is harmless because M is nilpotent).
+
+    Entries are scaled like the real ``system`` (k_beta @ key^T times a decay
+    that is at most 1). Unscaled N(0, 1) entries make a unit-lower 64x64
+    system whose inverse reaches 1e8, which measures conditioning rather
+    than the implementation.
+    """
+    torch.manual_seed(size)
+    system = torch.randn(2, 3, size, size, dtype=torch.float64) / size**0.5
+    got = gdn._unit_lower_inverse(system)
+    lower = torch.eye(size, dtype=torch.float64) + system.tril(-1)
+    eye = torch.eye(size, dtype=torch.float64).expand_as(got)
+    torch.testing.assert_close(got, torch.linalg.inv(lower), atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(got @ lower, eye, atol=1e-9, rtol=1e-9)
+
+
+def test_unit_lower_inverse_matches_forward_substitution():
+    """The doubling product must agree with the row-by-row forward
+    substitution transformers uses (which XLA cannot lower)."""
+    torch.manual_seed(7)
+    system = torch.randn(2, 64, 64, dtype=torch.float64) / 8
+
+    substituted = -system.tril(-1)
+    for i in range(1, 64):
+        row = substituted[..., i, :i].clone()
+        sub = substituted[..., :i, :i].clone()
+        substituted[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    substituted = substituted + torch.eye(64, dtype=torch.float64)
+
+    torch.testing.assert_close(
+        gdn._unit_lower_inverse(system), substituted, atol=1e-9, rtol=1e-9
+    )

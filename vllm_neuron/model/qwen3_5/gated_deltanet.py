@@ -151,19 +151,28 @@ def recurrent_gated_delta_rule(
 
 
 def _unit_lower_inverse(system: torch.Tensor) -> torch.Tensor:
-    """``(I + strictly_lower(system))^{-1}`` by forward substitution.
+    """``(I + strictly_lower(system))^{-1}``.
 
-    transformers' export-safe path; avoids ``torch.linalg.solve_triangular``.
-    Loops over the static chunk size, so it unrolls under ``torch.compile``.
+    With ``M = -strictly_lower(system)`` (nilpotent: ``M^size == 0``) the
+    inverse is the finite Neumann sum ``sum_k M^k``, and the binary
+    expansion collapses it to ``prod_j (I + M^(2^j))``: 6 matmuls for
+    chunk 64 instead of 64 sequential row updates.
+
+    The row-by-row forward substitution transformers uses writes into a
+    slice, which XLA cannot lower ("Error while lowering: xla::unselect")
+    and which unrolls into a large graph. Powers commute, so the product
+    can be taken in any order.
     """
     size = system.shape[-1]
-    inverse = -system.tril(-1)
-    for i in range(1, size):
-        row = inverse[..., i, :i].clone()
-        sub = inverse[..., :i, :i].clone()
-        inverse[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    power = -system.tril(-1)
     eye = torch.eye(size, dtype=system.dtype, device=system.device)
-    return inverse + eye
+    inverse = eye + power
+    span = 2
+    while span < size:
+        power = power @ power  # M^(2^j)
+        inverse = inverse @ (eye + power)
+        span *= 2
+    return inverse
 
 
 def chunk_gated_delta_rule(
