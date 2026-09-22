@@ -51,10 +51,10 @@ class GdnStepInputs:
     """
 
     request_of_token: torch.Tensor  # [num_tokens] int64: segment row per flat token
-    lengths: torch.Tensor           # [rows] int64: real tokens per row
-    state_slots: torch.Tensor       # [rows] int64: stable state slot per row
-    state_reset: torch.Tensor       # [rows] bool: start this row from zero state
-    max_len: int                    # static padded segment length for this bucket
+    lengths: torch.Tensor  # [rows] int64: real tokens per row
+    state_slots: torch.Tensor  # [rows] int64: stable state slot per row
+    state_reset: torch.Tensor  # [rows] bool: start this row from zero state
+    max_len: int  # static padded segment length for this bucket
 
     @property
     def rows(self) -> int:
@@ -139,7 +139,7 @@ class GdnRunnerState:
         counts = np.bincount(request_of_token, minlength=num_reqs_padded + 1)
         max_len = int(max(1, counts.max()))
 
-        as_tensor = lambda a, dtype: torch.as_tensor(a, dtype=dtype, device=device)  # noqa: E731
+        as_tensor = lambda a, dtype: torch.as_tensor(a, dtype=dtype, device=device)
         return GdnStepInputs(
             request_of_token=as_tensor(request_of_token, torch.int64),
             lengths=as_tensor(lengths, torch.int64),
@@ -149,7 +149,10 @@ class GdnRunnerState:
         )
 
     def warmup_inputs(
-        self, num_reqs_padded: int, num_tokens: int, max_len: int,
+        self,
+        num_reqs_padded: int,
+        num_tokens: int,
+        max_len: int,
         device: torch.device | str = "cpu",
     ) -> GdnStepInputs:
         """Dummy inputs of the right shapes for compile warmup.
@@ -160,9 +163,13 @@ class GdnRunnerState:
         """
         rows = num_reqs_padded + 1
         return GdnStepInputs(
-            request_of_token=torch.full((num_tokens,), num_reqs_padded, dtype=torch.int64, device=device),
+            request_of_token=torch.full(
+                (num_tokens,), num_reqs_padded, dtype=torch.int64, device=device
+            ),
             lengths=torch.zeros(rows, dtype=torch.int64, device=device),
-            state_slots=torch.full((rows,), self.sink, dtype=torch.int64, device=device),
+            state_slots=torch.full(
+                (rows,), self.sink, dtype=torch.int64, device=device
+            ),
             state_reset=torch.ones(rows, dtype=torch.bool, device=device),
             max_len=max_len,
         )

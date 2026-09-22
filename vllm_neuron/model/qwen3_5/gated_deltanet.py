@@ -200,9 +200,7 @@ def chunk_gated_delta_rule(
         chunk_size, chunk_size, dtype=torch.bool, device=query.device
     ).triu(1)
     cum = g.cumsum(dim=-1)
-    pairwise = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).masked_fill(
-        upper, float("-inf")
-    )
+    pairwise = (cum.unsqueeze(-1) - cum.unsqueeze(-2)).masked_fill(upper, float("-inf"))
     pairwise = pairwise.exp()
 
     system = (k_beta @ key.transpose(-1, -2)) * pairwise
@@ -259,7 +257,9 @@ def segment(request_of_token: torch.Tensor, num_requests: int):
     counts = torch.zeros(
         num_requests, dtype=torch.int64, device=request_of_token.device
     ).index_add_(
-        0, request_of_token.to(torch.int64), torch.ones_like(request_of_token, dtype=torch.int64)
+        0,
+        request_of_token.to(torch.int64),
+        torch.ones_like(request_of_token, dtype=torch.int64),
     )
     offsets = torch.cumsum(counts, dim=0) - counts
     return counts, offsets

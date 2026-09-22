@@ -27,10 +27,15 @@ no Python dict lives inside the traced model.
 """
 
 import torch
+from torch import nn
 
 
-class RecurrentStateBuffers:
+class RecurrentStateBuffers(nn.Module):
     """Device buffers for every Gated DeltaNet layer, indexed by slot.
+
+    An ``nn.Module`` with registered buffers, so ``torch.compile`` treats the
+    in-place ``index_copy_`` writes as module state rather than mutation of
+    an opaque Python dict. ``conv`` / ``recurrent`` give per-layer views.
 
     Slot ``num_slots`` (the last row) is a scratch sink: padded batch rows
     point at it, so their writes never land on a live request.
@@ -48,18 +53,39 @@ class RecurrentStateBuffers:
         conv_dtype: torch.dtype,
         device: torch.device | str = "cpu",
     ):
+        super().__init__()
         self.layer_indices = list(layer_indices)
         self.num_slots = num_slots
         rows = num_slots + 1
-        self.conv = {
-            layer: torch.zeros(rows, conv_dim, conv_width, dtype=conv_dtype, device=device)
-            for layer in self.layer_indices
-        }
-        self.recurrent = {
-            layer: torch.zeros(
-                rows, num_v_heads, head_k_dim, head_v_dim, dtype=torch.float32, device=device
+        for layer in self.layer_indices:
+            self.register_buffer(
+                f"conv_{layer}",
+                torch.zeros(
+                    rows, conv_dim, conv_width, dtype=conv_dtype, device=device
+                ),
+                persistent=False,
             )
-            for layer in self.layer_indices
+            self.register_buffer(
+                f"recurrent_{layer}",
+                torch.zeros(
+                    rows,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                persistent=False,
+            )
+
+    @property
+    def conv(self) -> dict[int, torch.Tensor]:
+        return {layer: getattr(self, f"conv_{layer}") for layer in self.layer_indices}
+
+    @property
+    def recurrent(self) -> dict[int, torch.Tensor]:
+        return {
+            layer: getattr(self, f"recurrent_{layer}") for layer in self.layer_indices
         }
 
     @property
@@ -68,8 +94,13 @@ class RecurrentStateBuffers:
 
     @staticmethod
     def bytes_per_slot(
-        num_layers: int, conv_dim: int, conv_width: int, num_v_heads: int,
-        head_k_dim: int, head_v_dim: int, conv_itemsize: int,
+        num_layers: int,
+        conv_dim: int,
+        conv_width: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_itemsize: int,
     ) -> int:
         recurrent = num_v_heads * head_k_dim * head_v_dim * 4
         conv = conv_dim * conv_width * conv_itemsize
@@ -79,8 +110,8 @@ class RecurrentStateBuffers:
         self, layer: int, slots: torch.Tensor, reset: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather this layer's state for the batch; zeros where ``reset``."""
-        conv = self.conv[layer].index_select(0, slots)
-        recurrent = self.recurrent[layer].index_select(0, slots)
+        conv = getattr(self, f"conv_{layer}").index_select(0, slots)
+        recurrent = getattr(self, f"recurrent_{layer}").index_select(0, slots)
         conv = torch.where(reset.view(-1, 1, 1), torch.zeros_like(conv), conv)
         recurrent = torch.where(
             reset.view(-1, 1, 1, 1), torch.zeros_like(recurrent), recurrent
@@ -88,11 +119,18 @@ class RecurrentStateBuffers:
         return conv, recurrent
 
     def write(
-        self, layer: int, slots: torch.Tensor, conv: torch.Tensor, recurrent: torch.Tensor
+        self,
+        layer: int,
+        slots: torch.Tensor,
+        conv: torch.Tensor,
+        recurrent: torch.Tensor,
     ) -> None:
         """Scatter this layer's updated state back to its slots."""
-        self.conv[layer].index_copy_(0, slots, conv.to(self.conv[layer].dtype))
-        self.recurrent[layer].index_copy_(0, slots, recurrent.to(torch.float32))
+        conv_buffer = getattr(self, f"conv_{layer}")
+        conv_buffer.index_copy_(0, slots, conv.to(conv_buffer.dtype))
+        getattr(self, f"recurrent_{layer}").index_copy_(
+            0, slots, recurrent.to(torch.float32)
+        )
 
 
 class SlotAllocator:

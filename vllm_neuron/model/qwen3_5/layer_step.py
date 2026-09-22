@@ -54,10 +54,18 @@ def gdn_layer_step(
 
     conv, recurrent = buffers.read(layer, step.state_slots, step.state_reset)
     out, conv, recurrent = gdn.gated_deltanet_mixer(
-        padded, weights, conv, recurrent, step.lengths,
-        num_k_heads=num_k_heads, num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim, head_v_dim=head_v_dim,
-        eps=eps, decode=decode, chunk_size=chunk_size,
+        padded,
+        weights,
+        conv,
+        recurrent,
+        step.lengths,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        eps=eps,
+        decode=decode,
+        chunk_size=chunk_size,
     )
     buffers.write(layer, step.state_slots, conv, recurrent)
     return gdn.padded_to_tokens(out, step.request_of_token, offsets)

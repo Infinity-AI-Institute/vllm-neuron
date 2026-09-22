@@ -7,8 +7,10 @@ import torch
 from vllm_neuron.model.qwen3_5 import attention_math as am
 
 transformers = pytest.importorskip("transformers")
-from transformers.models.qwen3_5 import modeling_qwen3_5 as hf  # noqa: E402
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
+from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
+from transformers.models.qwen3_5.configuration_qwen3_5 import (
+    Qwen3_5TextConfig,
+)
 
 torch.manual_seed(0)
 HIDDEN, HEADS, KV_HEADS, HEAD_DIM, ROTARY, THETA, EPS = 64, 4, 2, 32, 8, 1e7, 1e-6
@@ -32,11 +34,19 @@ def test_zero_centred_is_not_plain_rmsnorm():
 
 def _hf_attention():
     config = Qwen3_5TextConfig(
-        hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
-        head_dim=HEAD_DIM, rms_norm_eps=EPS, num_hidden_layers=1,
-        layer_types=["full_attention"], partial_rotary_factor=ROTARY / HEAD_DIM,
-        rope_parameters={"rope_type": "default", "rope_theta": THETA,
-                         "partial_rotary_factor": ROTARY / HEAD_DIM},
+        hidden_size=HIDDEN,
+        num_attention_heads=HEADS,
+        num_key_value_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        rms_norm_eps=EPS,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        partial_rotary_factor=ROTARY / HEAD_DIM,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": THETA,
+            "partial_rotary_factor": ROTARY / HEAD_DIM,
+        },
     )
     config._attn_implementation = "eager"
     layer = hf.Qwen3_5Attention(config, layer_idx=0).eval()
@@ -55,11 +65,14 @@ def _manual_attention(layer, hidden, positions):
     query = am.zero_centred_rmsnorm(query, layer.q_norm.weight, EPS).transpose(0, 1)
     key = am.zero_centred_rmsnorm(key, layer.k_norm.weight, EPS).transpose(0, 1)
     cos, sin = am.rotary_cos_sin(positions, ROTARY, THETA, hidden.dtype)
-    query, key = am.apply_partial_rotary(query, cos, sin), am.apply_partial_rotary(key, cos, sin)
+    query, key = (
+        am.apply_partial_rotary(query, cos, sin),
+        am.apply_partial_rotary(key, cos, sin),
+    )
     groups = HEADS // KV_HEADS
     key = key.repeat_interleave(groups, 0)
     value = value.transpose(0, 1).repeat_interleave(groups, 0)
-    scores = (query @ key.transpose(-1, -2)) * HEAD_DIM ** -0.5
+    scores = (query @ key.transpose(-1, -2)) * HEAD_DIM**-0.5
     mask = torch.ones(tokens, tokens, dtype=torch.bool).triu(1)
     scores = scores.masked_fill(mask, float("-inf")).softmax(-1)
     attention = (scores @ value).transpose(0, 1).reshape(tokens, HEADS * HEAD_DIM)
@@ -97,4 +110,6 @@ def test_query_and_gate_stay_paired_per_head():
     for h in range(HEADS):
         block = q_proj[0, h * 2 * HEAD_DIM : (h + 1) * 2 * HEAD_DIM]
         torch.testing.assert_close(query[0, h], block[:HEAD_DIM])
-        torch.testing.assert_close(gate[0, h * HEAD_DIM : (h + 1) * HEAD_DIM], block[HEAD_DIM:])
+        torch.testing.assert_close(
+            gate[0, h * HEAD_DIM : (h + 1) * HEAD_DIM], block[HEAD_DIM:]
+        )

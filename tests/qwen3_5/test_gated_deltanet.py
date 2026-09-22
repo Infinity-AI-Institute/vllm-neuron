@@ -89,9 +89,18 @@ def run_mixer(hidden_batch, lengths, w, decode=False, conv=None, state=None, chu
     conv = torch.zeros(batch, CONV_DIM, CONV - 1) if conv is None else conv
     state = torch.zeros(batch, V_HEADS, DK, DV) if state is None else state
     return gdn.gated_deltanet_mixer(
-        hidden_batch, w, conv, state, lengths,
-        num_k_heads=K_HEADS, num_v_heads=V_HEADS, head_k_dim=DK, head_v_dim=DV,
-        eps=EPS, decode=decode, chunk_size=chunk,
+        hidden_batch,
+        w,
+        conv,
+        state,
+        lengths,
+        num_k_heads=K_HEADS,
+        num_v_heads=V_HEADS,
+        head_k_dim=DK,
+        head_v_dim=DV,
+        eps=EPS,
+        decode=decode,
+        chunk_size=chunk,
     )
 
 
@@ -108,7 +117,9 @@ def test_chunked_matches_recurrent(length, chunk):
     s0 = torch.randn(2, V_HEADS, DK, DV) * 0.1
     lengths = torch.tensor([length, length])
     out_r, s_r = gdn.recurrent_gated_delta_rule(q, k, v, g, beta, s0, lengths)
-    out_c, s_c = gdn.chunk_gated_delta_rule(q, k, v, g, beta, s0, lengths, chunk_size=chunk)
+    out_c, s_c = gdn.chunk_gated_delta_rule(
+        q, k, v, g, beta, s0, lengths, chunk_size=chunk
+    )
     torch.testing.assert_close(out_c, out_r, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(s_c, s_r, atol=2e-5, rtol=2e-5)
 
@@ -117,7 +128,9 @@ def test_unit_lower_inverse_matches_solve():
     system = torch.randn(3, 16, 16) * 0.3
     inverse = gdn._unit_lower_inverse(system.clone())
     unit = system.tril(-1) + torch.eye(16)
-    torch.testing.assert_close(inverse @ unit, torch.eye(16).expand(3, 16, 16), atol=1e-5, rtol=0)
+    torch.testing.assert_close(
+        inverse @ unit, torch.eye(16).expand(3, 16, 16), atol=1e-5, rtol=0
+    )
 
 
 # ── the whole mixer against the independent float64 reference ───────────
@@ -143,10 +156,17 @@ def test_prefill_then_decode_equals_one_long_prefill():
     pieces = [out[0]]
     for t in range(8, 12):
         step, conv, state = run_mixer(
-            hidden[None, t : t + 1], torch.tensor([1]), w, decode=True, conv=conv, state=state
+            hidden[None, t : t + 1],
+            torch.tensor([1]),
+            w,
+            decode=True,
+            conv=conv,
+            state=state,
         )
         pieces.append(step[0])
-    torch.testing.assert_close(torch.cat(pieces).double(), expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(
+        torch.cat(pieces).double(), expected, atol=1e-5, rtol=1e-4
+    )
 
 
 def test_split_prefill_equals_whole_prefill():
@@ -155,8 +175,12 @@ def test_split_prefill_equals_whole_prefill():
     hidden = torch.randn(15, HIDDEN)
     whole, conv_w, state_w = run_mixer(hidden[None], torch.tensor([15]), w, chunk=4)
     first, conv, state = run_mixer(hidden[None, :6], torch.tensor([6]), w, chunk=4)
-    second, conv, state = run_mixer(hidden[None, 6:], torch.tensor([9]), w, conv=conv, state=state, chunk=4)
-    torch.testing.assert_close(torch.cat([first[0], second[0]]), whole[0], atol=1e-5, rtol=1e-4)
+    second, conv, state = run_mixer(
+        hidden[None, 6:], torch.tensor([9]), w, conv=conv, state=state, chunk=4
+    )
+    torch.testing.assert_close(
+        torch.cat([first[0], second[0]]), whole[0], atol=1e-5, rtol=1e-4
+    )
     torch.testing.assert_close(state, state_w, atol=1e-5, rtol=1e-4)
     # The conv state holds raw in_proj_qkv projections. F32 matmul is not
     # bit-reproducible across input shapes (BLAS blocking differs for 6, 9 and
@@ -173,8 +197,12 @@ def test_padding_is_an_exact_no_op(decode):
     long_h, short_h = torch.randn(long_len, HIDDEN), torch.randn(short_len, HIDDEN)
     batch = torch.zeros(2, long_len, HIDDEN)
     batch[0, :long_len], batch[1, :short_len] = long_h, short_h
-    out, conv, state = run_mixer(batch, torch.tensor([long_len, short_len]), w, decode=decode, chunk=4)
-    alone, conv_a, state_a = run_mixer(short_h[None], torch.tensor([short_len]), w, decode=decode, chunk=4)
+    out, conv, state = run_mixer(
+        batch, torch.tensor([long_len, short_len]), w, decode=decode, chunk=4
+    )
+    alone, conv_a, state_a = run_mixer(
+        short_h[None], torch.tensor([short_len]), w, decode=decode, chunk=4
+    )
     torch.testing.assert_close(out[1, :short_len], alone[0], atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(state[1], state_a[0], atol=1e-6, rtol=1e-5)
     # F32 rounding, not bit equality: a [2, L, H] projection and a [1, L, H]
@@ -198,10 +226,14 @@ def test_conv_state_is_gathered_from_real_inputs():
     batch[1, :short_len] = torch.randn(short_len, HIDDEN)
     mixed = F.linear(batch, projection).transpose(1, 2)
     _, state = gdn.causal_conv1d(
-        mixed, kernel, torch.zeros(2, channels, width - 1),
+        mixed,
+        kernel,
+        torch.zeros(2, channels, width - 1),
         torch.tensor([long_len, short_len]),
     )
-    truth = (batch[1, short_len - (width - 1) : short_len].double() @ projection.double().T).T
+    truth = (
+        batch[1, short_len - (width - 1) : short_len].double() @ projection.double().T
+    ).T
     tail = mixed[1, :, long_len - (width - 1) : long_len].double()
     assert (state[1].double() - truth).abs().max() < 1e-6
     assert (state[1].double() - tail).abs().max() > 0.1 * truth.abs().max()
@@ -211,7 +243,14 @@ def test_zero_length_row_leaves_state_untouched():
     w = make_weights()
     conv0 = torch.randn(1, CONV_DIM, CONV - 1)
     state0 = torch.randn(1, V_HEADS, DK, DV)
-    _, conv, state = run_mixer(torch.zeros(1, 3, HIDDEN), torch.tensor([0]), w, conv=conv0, state=state0, chunk=4)
+    _, conv, state = run_mixer(
+        torch.zeros(1, 3, HIDDEN),
+        torch.tensor([0]),
+        w,
+        conv=conv0,
+        state=state0,
+        chunk=4,
+    )
     torch.testing.assert_close(state, state0, atol=0, rtol=0)
     torch.testing.assert_close(conv, conv0, atol=0, rtol=0)
 
@@ -221,14 +260,18 @@ def test_zero_length_row_leaves_state_untouched():
 
 def test_token_layout_round_trips():
     counts_list = [3, 1, 5]
-    request_of_token = torch.repeat_interleave(torch.arange(3), torch.tensor(counts_list))
+    request_of_token = torch.repeat_interleave(
+        torch.arange(3), torch.tensor(counts_list)
+    )
     x = torch.randn(sum(counts_list), 7)
     counts, offsets = gdn.segment(request_of_token, 3)
     assert counts.tolist() == counts_list
     padded = gdn.tokens_to_padded(x, offsets, counts, max_len=5)
     assert padded.shape == (3, 5, 7)
     assert torch.all(padded[1, 1:] == 0)
-    torch.testing.assert_close(gdn.padded_to_tokens(padded, request_of_token, offsets), x)
+    torch.testing.assert_close(
+        gdn.padded_to_tokens(padded, request_of_token, offsets), x
+    )
 
 
 # ── slots survive condense() ─────────────────────────────────────────────
@@ -236,17 +279,27 @@ def test_token_layout_round_trips():
 
 def test_state_follows_the_request_not_the_row():
     """Simulate condense(): requests move rows, their state must not."""
-    buffers = RecurrentStateBuffers([0], num_slots=4, conv_dim=CONV_DIM, conv_width=CONV - 1,
-                                    num_v_heads=V_HEADS, head_k_dim=DK, head_v_dim=DV,
-                                    conv_dtype=torch.float32)
+    buffers = RecurrentStateBuffers(
+        [0],
+        num_slots=4,
+        conv_dim=CONV_DIM,
+        conv_width=CONV - 1,
+        num_v_heads=V_HEADS,
+        head_k_dim=DK,
+        head_v_dim=DV,
+        conv_dtype=torch.float32,
+    )
     alloc = SlotAllocator(4)
     for rid in ("a", "b", "c"):
         alloc.acquire(rid)
     marks = {rid: float(i + 1) for i, rid in enumerate(("a", "b", "c"))}
     slots = torch.tensor(alloc.slots_for_rows(["a", "b", "c"], buffers.sink))
-    buffers.write(0, slots,
-                  torch.stack([torch.full((CONV_DIM, CONV - 1), marks[r]) for r in "abc"]),
-                  torch.stack([torch.full((V_HEADS, DK, DV), marks[r]) for r in "abc"]))
+    buffers.write(
+        0,
+        slots,
+        torch.stack([torch.full((CONV_DIM, CONV - 1), marks[r]) for r in "abc"]),
+        torch.stack([torch.full((V_HEADS, DK, DV), marks[r]) for r in "abc"]),
+    )
     # "b" finishes; condense() moves "c" into row 1.
     alloc.release("b")
     rows = ["a", "c"]
@@ -257,12 +310,24 @@ def test_state_follows_the_request_not_the_row():
 
 
 def test_new_request_starts_from_zero_even_in_a_reused_slot():
-    buffers = RecurrentStateBuffers([0], num_slots=2, conv_dim=CONV_DIM, conv_width=CONV - 1,
-                                    num_v_heads=V_HEADS, head_k_dim=DK, head_v_dim=DV,
-                                    conv_dtype=torch.float32)
+    buffers = RecurrentStateBuffers(
+        [0],
+        num_slots=2,
+        conv_dim=CONV_DIM,
+        conv_width=CONV - 1,
+        num_v_heads=V_HEADS,
+        head_k_dim=DK,
+        head_v_dim=DV,
+        conv_dtype=torch.float32,
+    )
     alloc = SlotAllocator(2)
     slot = alloc.acquire("old")
-    buffers.write(0, torch.tensor([slot]), torch.ones(1, CONV_DIM, CONV - 1), torch.ones(1, V_HEADS, DK, DV))
+    buffers.write(
+        0,
+        torch.tensor([slot]),
+        torch.ones(1, CONV_DIM, CONV - 1),
+        torch.ones(1, V_HEADS, DK, DV),
+    )
     alloc.release("old")
     assert alloc.acquire("new") == slot
     conv, recurrent = buffers.read(0, torch.tensor([slot]), torch.tensor([True]))
@@ -278,8 +343,13 @@ def test_allocator_refuses_rather_than_overwrites():
 
 def test_9b_state_budget():
     per_slot = RecurrentStateBuffers.bytes_per_slot(
-        num_layers=24, conv_dim=8192, conv_width=3, num_v_heads=32,
-        head_k_dim=128, head_v_dim=128, conv_itemsize=2,
+        num_layers=24,
+        conv_dim=8192,
+        conv_width=3,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_itemsize=2,
     )
     assert 48 * 2**20 < per_slot < 50 * 2**20
 
@@ -288,14 +358,20 @@ def test_9b_state_budget():
 
 
 def test_against_transformers_layer():
-    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers")
     from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
     config = Qwen3_5TextConfig(
-        hidden_size=HIDDEN, linear_num_key_heads=K_HEADS, linear_num_value_heads=V_HEADS,
-        linear_key_head_dim=DK, linear_value_head_dim=DV, linear_conv_kernel_dim=CONV,
-        rms_norm_eps=EPS, num_hidden_layers=1, layer_types=["linear_attention"],
+        hidden_size=HIDDEN,
+        linear_num_key_heads=K_HEADS,
+        linear_num_value_heads=V_HEADS,
+        linear_key_head_dim=DK,
+        linear_value_head_dim=DV,
+        linear_conv_kernel_dim=CONV,
+        rms_norm_eps=EPS,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
         hidden_act="silu",
     )
     layer = hf.Qwen3_5GatedDeltaNet(config, layer_idx=0).eval()

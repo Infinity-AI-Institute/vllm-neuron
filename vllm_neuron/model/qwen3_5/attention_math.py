@@ -25,7 +25,9 @@ numbers:
 import torch
 
 
-def zero_centred_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def zero_centred_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     """``Qwen3_5RMSNorm``: ``(x * rsqrt(mean(x^2) + eps)) * (1 + w)`` in F32."""
     h = x.float()
     h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)
@@ -38,7 +40,10 @@ def rotary_cos_sin(
     """``[T, rotary_dim]`` cos/sin for standard RoPE over ``rotary_dim`` channels."""
     inv_freq = 1.0 / (
         theta
-        ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=positions.device) / rotary_dim)
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=positions.device)
+            / rotary_dim
+        )
     )
     freqs = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
     emb = torch.cat((freqs, freqs), dim=-1)

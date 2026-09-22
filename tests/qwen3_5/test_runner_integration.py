@@ -14,16 +14,42 @@ from vllm_neuron.model.qwen3_5.layer_step import gdn_layer_step
 from vllm_neuron.model.qwen3_5.runner_state import GdnRunnerState
 from vllm_neuron.model.qwen3_5.state import RecurrentStateBuffers
 
-from .test_gated_deltanet import CONV, CONV_DIM, DK, DV, EPS, HIDDEN, K_HEADS, V_HEADS, make_weights, run_mixer
+from .test_gated_deltanet import (
+    CONV,
+    CONV_DIM,
+    DK,
+    DV,
+    EPS,
+    HIDDEN,
+    K_HEADS,
+    V_HEADS,
+    make_weights,
+    run_mixer,
+)
 
 torch.manual_seed(1)
 LAYER = 0
-DIMS = dict(num_k_heads=K_HEADS, num_v_heads=V_HEADS, head_k_dim=DK, head_v_dim=DV, eps=EPS, chunk_size=4)
+DIMS = {
+    "num_k_heads": K_HEADS,
+    "num_v_heads": V_HEADS,
+    "head_k_dim": DK,
+    "head_v_dim": DV,
+    "eps": EPS,
+    "chunk_size": 4,
+}
 
 
 def buffers(slots=8):
-    return RecurrentStateBuffers([LAYER], num_slots=slots, conv_dim=CONV_DIM, conv_width=CONV - 1,
-                                 num_v_heads=V_HEADS, head_k_dim=DK, head_v_dim=DV, conv_dtype=torch.float32)
+    return RecurrentStateBuffers(
+        [LAYER],
+        num_slots=slots,
+        conv_dim=CONV_DIM,
+        conv_width=CONV - 1,
+        num_v_heads=V_HEADS,
+        head_k_dim=DK,
+        head_v_dim=DV,
+        conv_dtype=torch.float32,
+    )
 
 
 def flat_layout(real, padded_sizes, bucket_pad):
@@ -45,8 +71,15 @@ def real_rows(flat, real, padded_sizes):
 
 
 def alone(tokens, w, decode=False, conv=None, state=None):
-    out, conv, state = run_mixer(tokens[None], torch.tensor([tokens.shape[0]]), w,
-                                 decode=decode, conv=conv, state=state, chunk=4)
+    out, conv, state = run_mixer(
+        tokens[None],
+        torch.tensor([tokens.shape[0]]),
+        w,
+        decode=decode,
+        conv=conv,
+        state=state,
+        chunk=4,
+    )
     return out[0], conv, state
 
 
@@ -59,14 +92,22 @@ def test_interleaved_padding_matches_each_request_alone():
     for rid in ids:
         runner.acquire(rid)
     flat = flat_layout(real, padded_sizes, bucket_pad=3)
-    step = runner.step_inputs(ids, np.zeros(3), np.array([5, 1, 3]), np.array(padded_sizes),
-                              num_reqs_padded=4, num_tokens=flat.shape[0])
+    step = runner.step_inputs(
+        ids,
+        np.zeros(3),
+        np.array([5, 1, 3]),
+        np.array(padded_sizes),
+        num_reqs_padded=4,
+        num_tokens=flat.shape[0],
+    )
     out = gdn_layer_step(flat, w, buf, LAYER, step, decode=False, **DIMS)
     for rid, tokens, got in zip(ids, real, real_rows(out, real, padded_sizes)):
         expected, _, state = alone(tokens, w)
         torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
         slot = runner.allocator.slot(rid)
-        torch.testing.assert_close(buf.recurrent[LAYER][slot], state[0], atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(
+            buf.recurrent[LAYER][slot], state[0], atol=1e-5, rtol=1e-4
+        )
 
 
 def test_state_survives_condense_between_steps():
@@ -79,16 +120,28 @@ def test_state_survives_condense_between_steps():
     real = [prompts[r] for r in "abc"]
     sizes = [4, 8, 4]
     flat = flat_layout(real, sizes, bucket_pad=0)
-    step = runner.step_inputs(list("abc"), np.zeros(3), np.array([4, 6, 3]), np.array(sizes),
-                              num_reqs_padded=3, num_tokens=flat.shape[0])
+    step = runner.step_inputs(
+        list("abc"),
+        np.zeros(3),
+        np.array([4, 6, 3]),
+        np.array(sizes),
+        num_reqs_padded=3,
+        num_tokens=flat.shape[0],
+    )
     gdn_layer_step(flat, w, buf, LAYER, step, decode=False, **DIMS)
 
     runner.release("b")
     nxt = {r: torch.randn(1, HIDDEN) for r in "ac"}
-    rows = ["a", "c"]                                  # 'c' moved from row 2 to row 1
+    rows = ["a", "c"]  # 'c' moved from row 2 to row 1
     flat = torch.cat([nxt[r] for r in rows])
-    step = runner.step_inputs(rows, np.array([4, 3]), np.array([1, 1]), np.array([1, 1]),
-                              num_reqs_padded=2, num_tokens=2)
+    step = runner.step_inputs(
+        rows,
+        np.array([4, 3]),
+        np.array([1, 1]),
+        np.array([1, 1]),
+        num_reqs_padded=2,
+        num_tokens=2,
+    )
     out = gdn_layer_step(flat, w, buf, LAYER, step, decode=True, **DIMS)
 
     for row, rid in enumerate(rows):
@@ -101,35 +154,59 @@ def test_chunked_prefill_across_steps_resets_only_once():
     w, buf, runner = make_weights(), buffers(), GdnRunnerState(8)
     prompt = torch.randn(10, HIDDEN)
     runner.acquire("a")
-    first = runner.step_inputs(["a"], np.array([0]), np.array([6]), np.array([8]),
-                               num_reqs_padded=1, num_tokens=8)
+    first = runner.step_inputs(
+        ["a"],
+        np.array([0]),
+        np.array([6]),
+        np.array([8]),
+        num_reqs_padded=1,
+        num_tokens=8,
+    )
     flat = flat_layout([prompt[:6]], [8], bucket_pad=0)
     out1 = gdn_layer_step(flat, w, buf, LAYER, first, decode=False, **DIMS)
-    second = runner.step_inputs(["a"], np.array([6]), np.array([4]), np.array([4]),
-                                num_reqs_padded=1, num_tokens=4)
+    second = runner.step_inputs(
+        ["a"],
+        np.array([6]),
+        np.array([4]),
+        np.array([4]),
+        num_reqs_padded=1,
+        num_tokens=4,
+    )
     assert bool(first.state_reset[0]) and not bool(second.state_reset[0])
     out2 = gdn_layer_step(prompt[6:], w, buf, LAYER, second, decode=False, **DIMS)
     expected, _, _ = alone(prompt, w)
-    torch.testing.assert_close(torch.cat([out1[:6], out2]), expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(
+        torch.cat([out1[:6], out2]), expected, atol=1e-5, rtol=1e-4
+    )
 
 
 def test_prefix_caching_is_refused_not_silently_resumed():
     runner = GdnRunnerState(4)
     runner.acquire("a")
     with pytest.raises(RuntimeError, match="no-enable-prefix-caching"):
-        runner.step_inputs(["a"], np.array([16]), np.array([4]), np.array([4]),
-                           num_reqs_padded=1, num_tokens=4)
+        runner.step_inputs(
+            ["a"],
+            np.array([16]),
+            np.array([4]),
+            np.array([4]),
+            num_reqs_padded=1,
+            num_tokens=4,
+        )
 
 
 def test_reused_slot_does_not_inherit_a_finished_request():
     w, buf, runner = make_weights(), buffers(slots=1), GdnRunnerState(1)
     runner.acquire("old")
-    step = runner.step_inputs(["old"], np.array([0]), np.array([5]), np.array([5]), 1, 5)
+    step = runner.step_inputs(
+        ["old"], np.array([0]), np.array([5]), np.array([5]), 1, 5
+    )
     gdn_layer_step(torch.randn(5, HIDDEN), w, buf, LAYER, step, decode=False, **DIMS)
     runner.release("old")
     runner.acquire("new")
     prompt = torch.randn(3, HIDDEN)
-    step = runner.step_inputs(["new"], np.array([0]), np.array([3]), np.array([3]), 1, 3)
+    step = runner.step_inputs(
+        ["new"], np.array([0]), np.array([3]), np.array([3]), 1, 3
+    )
     out = gdn_layer_step(prompt, w, buf, LAYER, step, decode=False, **DIMS)
     expected, _, _ = alone(prompt, w)
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
