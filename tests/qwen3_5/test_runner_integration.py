@@ -99,6 +99,7 @@ def test_interleaved_padding_matches_each_request_alone():
         np.array(padded_sizes),
         num_reqs_padded=4,
         num_tokens=flat.shape[0],
+        decode=False,
     )
     out = gdn_layer_step(flat, w, buf, LAYER, step, decode=False, **DIMS)
     for rid, tokens, got in zip(ids, real, real_rows(out, real, padded_sizes)):
@@ -127,6 +128,7 @@ def test_state_survives_condense_between_steps():
         np.array(sizes),
         num_reqs_padded=3,
         num_tokens=flat.shape[0],
+        decode=False,
     )
     gdn_layer_step(flat, w, buf, LAYER, step, decode=False, **DIMS)
 
@@ -141,6 +143,7 @@ def test_state_survives_condense_between_steps():
         np.array([1, 1]),
         num_reqs_padded=2,
         num_tokens=2,
+        decode=True,
     )
     out = gdn_layer_step(flat, w, buf, LAYER, step, decode=True, **DIMS)
 
@@ -161,6 +164,7 @@ def test_chunked_prefill_across_steps_resets_only_once():
         np.array([8]),
         num_reqs_padded=1,
         num_tokens=8,
+        decode=False,
     )
     flat = flat_layout([prompt[:6]], [8], bucket_pad=0)
     out1 = gdn_layer_step(flat, w, buf, LAYER, first, decode=False, **DIMS)
@@ -171,6 +175,7 @@ def test_chunked_prefill_across_steps_resets_only_once():
         np.array([4]),
         num_reqs_padded=1,
         num_tokens=4,
+        decode=False,
     )
     assert bool(first.state_reset[0]) and not bool(second.state_reset[0])
     out2 = gdn_layer_step(prompt[6:], w, buf, LAYER, second, decode=False, **DIMS)
@@ -191,6 +196,7 @@ def test_prefix_caching_is_refused_not_silently_resumed():
             np.array([4]),
             num_reqs_padded=1,
             num_tokens=4,
+            decode=False,
         )
 
 
@@ -198,14 +204,14 @@ def test_reused_slot_does_not_inherit_a_finished_request():
     w, buf, runner = make_weights(), buffers(slots=1), GdnRunnerState(1)
     runner.acquire("old")
     step = runner.step_inputs(
-        ["old"], np.array([0]), np.array([5]), np.array([5]), 1, 5
+        ["old"], np.array([0]), np.array([5]), np.array([5]), 1, 5, decode=False
     )
     gdn_layer_step(torch.randn(5, HIDDEN), w, buf, LAYER, step, decode=False, **DIMS)
     runner.release("old")
     runner.acquire("new")
     prompt = torch.randn(3, HIDDEN)
     step = runner.step_inputs(
-        ["new"], np.array([0]), np.array([3]), np.array([3]), 1, 3
+        ["new"], np.array([0]), np.array([3]), np.array([3]), 1, 3, decode=False
     )
     out = gdn_layer_step(prompt, w, buf, LAYER, step, decode=False, **DIMS)
     expected, _, _ = alone(prompt, w)
@@ -217,6 +223,58 @@ def test_warmup_never_touches_live_state():
     runner.acquire("live")
     slot = runner.allocator.slot("live")
     buf.recurrent[LAYER][slot].fill_(3.0)
-    step = runner.warmup_inputs(num_reqs_padded=4, num_tokens=16, max_len=16)
+    step = runner.warmup_inputs(num_reqs_padded=4, num_tokens=16, decode=False)
     gdn_layer_step(torch.randn(16, HIDDEN), w, buf, LAYER, step, decode=False, **DIMS)
     assert torch.all(buf.recurrent[LAYER][slot] == 3.0)
+
+
+def test_decode_bucket_padding_keeps_segment_length_one():
+    """Decode pads 2 live requests to a 4-row bucket. The two tail tokens go to
+    the sink, which overflows max_len=1; that must be harmless."""
+    w, buf, runner = make_weights(), buffers(), GdnRunnerState(8)
+    prompts = {rid: torch.randn(n, HIDDEN) for rid, n in (("a", 3), ("b", 5))}
+    for rid in "ab":
+        runner.acquire(rid)
+    for rid in "ab":  # prefill each alone so both slots hold real state
+        n = prompts[rid].shape[0]
+        step = runner.step_inputs(
+            [rid], np.array([0]), np.array([n]), np.array([n]), 1, n, decode=False
+        )
+        gdn_layer_step(prompts[rid], w, buf, LAYER, step, decode=False, **DIMS)
+    nxt = torch.randn(2, HIDDEN)
+    flat = torch.cat([nxt, torch.randn(2, HIDDEN) * 50])
+    step = runner.step_inputs(
+        list("ab"),
+        np.array([3, 5]),
+        np.array([1, 1]),
+        np.array([1, 1]),
+        num_reqs_padded=4,
+        num_tokens=4,
+        decode=True,
+    )
+    assert step.max_len == 1
+    out = gdn_layer_step(flat, w, buf, LAYER, step, decode=True, **DIMS)
+    for row, rid in enumerate("ab"):
+        _, conv, state = alone(prompts[rid], w)
+        expected, _, _ = alone(nxt[row : row + 1], w, decode=True, conv=conv, state=state)
+        torch.testing.assert_close(out[row : row + 1], expected, atol=1e-5, rtol=1e-4)
+
+
+def test_max_len_depends_only_on_the_compiled_shape():
+    runner = GdnRunnerState(8)
+    for rid in "ab":
+        runner.acquire(rid)
+    lens = set()
+    for real in ([1, 1], [7, 2], [16, 0]):
+        step = runner.step_inputs(
+            list("ab"),
+            np.zeros(2),
+            np.array(real),
+            np.array([max(r, 1) for r in real]),
+            num_reqs_padded=2,
+            num_tokens=32,
+            decode=False,
+        )
+        lens.add(step.max_len)
+        runner._fresh.update("ab")
+    assert lens == {32}

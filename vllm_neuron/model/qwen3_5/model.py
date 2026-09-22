@@ -59,7 +59,7 @@ from ..qwen3.model import Qwen3MLP
 from . import attention_math as am
 from .config import Qwen3_5Config
 from .layer_step import gdn_layer_step
-from .runner_state import GdnStepInputs
+from .runner_state import GdnStepInputs, static_max_len
 from .state import RecurrentStateBuffers
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,17 @@ logger = logging.getLogger(__name__)
 # Recurrent state slots, one per concurrent request. ~50 MiB per slot for the
 # 9B at TP=1 (~12.5 MiB per rank at TP=4). Defaults to max_num_seqs.
 STATE_SLOTS_ENV = "VLLM_NEURON_QWEN35_STATE_SLOTS"
+
+
+def state_slot_count() -> int:
+    """Concurrent requests that can hold Gated DeltaNet state."""
+    from vllm.config import get_current_vllm_config
+
+    return int(
+        os.environ.get(
+            STATE_SLOTS_ENV, get_current_vllm_config().scheduler_config.max_num_seqs
+        )
+    )
 
 # Checkpoint tensors kept in their stored precision. A_log is published as
 # F32; casting it to BF16 perturbs every decay rate exp(A_log).
@@ -584,9 +595,14 @@ class Qwen3_5ForCausalLM(nn.Module):
     """Text-only Qwen3.5. Serve with ``--no-enable-prefix-caching`` and with
     image/video disabled (``--limit-mm-per-prompt '{"image":0,"video":0}'``)."""
 
+    # The runner reads these to build its request -> slot map at load time
+    # (neuron_model_runner.load_model).
+    uses_gdn_state = True
+
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
         self.config = config
+        self.num_state_slots = state_slot_count()
         self.model = Qwen3_5Model(config)
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
@@ -645,7 +661,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         gdn_lengths=None,
         gdn_state_slots=None,
         gdn_state_reset=None,
-        gdn_max_len: int = 1,
         **kwargs,
     ):
         if inputs_embeds is not None and is_token_ids is not None:
@@ -661,7 +676,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             lengths=gdn_lengths,
             state_slots=gdn_state_slots,
             state_reset=gdn_state_reset,
-            max_len=gdn_max_len,
+            # From shapes, never a runtime int, so each bucket compiles once.
+            max_len=static_max_len(
+                input_ids.shape[0], _decode_meta(attn_metadata, self.model.meta_layer)
+            ),
         )
         hidden_states = self.model(
             input_ids,
@@ -710,13 +728,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self._allocate_gdn_state(device=attn.k_cache.device)
 
     def _allocate_gdn_state(self, device):
-        from vllm.config import get_current_vllm_config
-
-        slots = int(
-            os.environ.get(
-                STATE_SLOTS_ENV, get_current_vllm_config().scheduler_config.max_num_seqs
-            )
-        )
+        slots = self.num_state_slots
         gdn = self.model.layers[self.config.linear_attention_layers[0]].linear_attn
         per_slot = RecurrentStateBuffers.bytes_per_slot(
             num_layers=len(self.config.linear_attention_layers),

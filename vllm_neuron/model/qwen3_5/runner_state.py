@@ -33,6 +33,10 @@ Two more rules:
 - **One trailing sink row, always.** Tokens past the per-request segments
   (bucket padding of the whole flattened batch) go to it, which keeps the
   batch dimension fixed per compile bucket: ``num_reqs_padded + 1``.
+- **``max_len`` is a function of the compiled shape only**, never of the
+  step's contents (:func:`static_max_len`), so ``torch.compile`` sees one
+  value per bucket and never recompiles on it. The model derives the same
+  value from its input shapes rather than taking it as an argument.
 """
 
 from dataclasses import dataclass
@@ -41,6 +45,16 @@ import numpy as np
 import torch
 
 from .state import SlotAllocator
+
+
+def static_max_len(num_tokens: int, decode: bool) -> int:
+    """Padded segment length for a compiled shape.
+
+    Decode schedules one token per request. Prefill (including mixed
+    batches) can give one request the whole bucket, so its segments are as
+    long as the bucket.
+    """
+    return 1 if decode else num_tokens
 
 
 @dataclass
@@ -88,6 +102,7 @@ class GdnRunnerState:
         num_scheduled_tokens_padded: np.ndarray,
         num_reqs_padded: int,
         num_tokens: int,
+        decode: bool,
         device: torch.device | str = "cpu",
     ) -> GdnStepInputs:
         """Build this step's tensors.
@@ -100,6 +115,8 @@ class GdnRunnerState:
                 that request's own padding.
             num_reqs_padded: batch-row bucket (``>= len(req_ids)``).
             num_tokens: length of the flat ``input_ids`` for this step.
+            decode: whether this step runs the decode graph
+                (``max_query_len <= decode_token_threshold``).
         """
         num_reqs = len(req_ids)
         if num_reqs_padded < num_reqs:
@@ -135,9 +152,14 @@ class GdnRunnerState:
         slots = np.full(num_reqs_padded + 1, self.sink, dtype=np.int64)
         slots[:num_reqs] = self.allocator.slots_for_rows(list(req_ids), self.sink)
 
-        # The sink row's segment holds any tail tokens; its length stays 0.
-        counts = np.bincount(request_of_token, minlength=num_reqs_padded + 1)
-        max_len = int(max(1, counts.max()))
+        # The sink row's segment holds any tail tokens; its length stays 0
+        # and it may be longer than max_len (see padded_to_tokens).
+        max_len = static_max_len(num_tokens, decode)
+        if num_reqs and int(padded.max()) > max_len:
+            raise ValueError(
+                f"a request has {int(padded.max())} tokens in a step whose "
+                f"compiled segment length is {max_len}"
+            )
 
         as_tensor = lambda a, dtype: torch.as_tensor(a, dtype=dtype, device=device)
         return GdnStepInputs(
@@ -152,7 +174,7 @@ class GdnRunnerState:
         self,
         num_reqs_padded: int,
         num_tokens: int,
-        max_len: int,
+        decode: bool,
         device: torch.device | str = "cpu",
     ) -> GdnStepInputs:
         """Dummy inputs of the right shapes for compile warmup.
@@ -171,5 +193,5 @@ class GdnRunnerState:
                 (rows,), self.sink, dtype=torch.int64, device=device
             ),
             state_reset=torch.ones(rows, dtype=torch.bool, device=device),
-            max_len=max_len,
+            max_len=static_max_len(num_tokens, decode),
         )

@@ -246,9 +246,14 @@ def tokens_to_padded(
 def padded_to_tokens(
     x: torch.Tensor, request_of_token: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """``[B, max_len, ...]`` back to flat ``[N, ...]``; static output shape."""
+    """``[B, max_len, ...]`` back to flat ``[N, ...]``; static output shape.
+
+    A segment longer than ``max_len`` (only the sink row, which holds the
+    batch's trailing bucket padding) reads its last padded position for the
+    overflow; those outputs are discarded.
+    """
     tokens = torch.arange(request_of_token.shape[0], device=x.device)
-    position = tokens - offsets[request_of_token]
+    position = (tokens - offsets[request_of_token]).clamp(max=x.shape[1] - 1)
     return x[request_of_token, position]
 
 

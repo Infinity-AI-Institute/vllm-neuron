@@ -266,6 +266,17 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         return self.model_runner_output
 
 
+def _gdn_model_kwargs(step) -> dict[str, Any]:
+    """``GdnStepInputs`` as model kwargs. ``max_len`` stays out: the model
+    derives it from shapes, so no Python int enters the compiled graph."""
+    return {
+        "gdn_request_of_token": step.request_of_token,
+        "gdn_lengths": step.lengths,
+        "gdn_state_slots": step.state_slots,
+        "gdn_state_reset": step.state_reset,
+    }
+
+
 def _reinterpret_uint32_as_int32(
     tensor: torch.Tensor, target_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -1006,6 +1017,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._cp_rank = tp_rank % self._dcp_size
         return self._cp_rank
 
+    # Set by load_model() for models with recurrent (Gated DeltaNet) state.
+    _gdn = None
+
     def _setup_capture(
         self, compiled_model, modules, subdirectory="", capture_filter=None
     ):
@@ -1063,6 +1077,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Remove all requests from input_batch
         for req_id in list(self.input_batch.req_id_to_index.keys()):
             self.input_batch.remove_request(req_id)
+            if self._gdn is not None:
+                self._gdn.release(req_id)
         self.input_batch.condense()
 
         # Clear request cache
@@ -1487,6 +1503,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logger.info("Vision encoder compiled separately")
         else:
             self.vision_capture_backend = None
+
+        # Qwen3.5's Gated DeltaNet layers carry recurrent state that is keyed
+        # by request, not by batch row (input_batch.condense() moves rows).
+        # The runner owns the request -> slot map; see
+        # vllm_neuron/model/qwen3_5/runner_state.py.
+        inner = getattr(self.model, "_orig_mod", self.model)
+        if getattr(inner, "uses_gdn_state", False):
+            from vllm_neuron.model.qwen3_5.runner_state import GdnRunnerState
+
+            self._gdn = GdnRunnerState(inner.num_state_slots)
+            logger.info(
+                "Gated DeltaNet recurrent state: %d request slots",
+                inner.num_state_slots,
+            )
 
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
@@ -1934,6 +1964,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+            if self._gdn is not None:
+                self._gdn.release(req_id)
 
         # Free the cached encoder outputs.
         # NOTE: upstream GPUModelRunner stores encoder cache as a dict[str, torch.Tensor]
@@ -1965,6 +1997,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
+            if self._gdn is not None:
+                self._gdn.release(req_id)
 
         reqs_to_add: list[CachedRequestState] = []
         # Add new requests to the cached states.
@@ -2121,6 +2155,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
             self.input_batch.add_request(request)
+            if self._gdn is not None:
+                self._gdn.acquire(request.req_id)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -3045,6 +3081,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         padding_map,
                     )
                 )
+
+        # Gated DeltaNet per-step inputs. They ride along in mm_kwargs, which
+        # execute_model() merges into the model kwargs. Segments follow the
+        # padded layout ([req0_real, req0_pad, req1_real, ...]); real lengths
+        # mask each request's own padding, and tokens past the last request
+        # (whole-batch bucket padding) go to the sink row.
+        if self._gdn is not None:
+            meta = next(iter(attn_metadata.values()))
+            gdn_step = self._gdn.step_inputs(
+                req_ids=list(req_ids[:num_reqs]),
+                num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                actual_num_tokens=actual_num_tokens,
+                num_scheduled_tokens_padded=num_scheduled_tokens_padded,
+                num_reqs_padded=padded_num_reqs,
+                num_tokens=input_ids.shape[0],
+                decode=meta["max_query_len"] <= meta["decode_token_threshold"],
+                device=self.device,
+            )
+            mm_kwargs.update(_gdn_model_kwargs(gdn_step))
 
         return (
             input_ids,
@@ -4539,6 +4594,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dtype=torch.bool,
                 device=device,
             )
+        if self._gdn is not None:
+            # Every row points at the sink with length 0, so warmup traces the
+            # graph without touching a live request's state.
+            warmup_kwargs.update(
+                _gdn_model_kwargs(
+                    self._gdn.warmup_inputs(
+                        num_reqs_padded=num_reqs,
+                        num_tokens=num_tokens,
+                        decode=False,
+                        device=device,
+                    )
+                )
+            )
+
         return warmup_kwargs
 
     def extract_prefill_graphs(
@@ -4876,6 +4945,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 num_tokens,
                 dtype=torch.bool,
                 device=device,
+            )
+
+        if self._gdn is not None:
+            decode_warmup_kwargs.update(
+                _gdn_model_kwargs(
+                    self._gdn.warmup_inputs(
+                        num_reqs_padded=batch_size,
+                        num_tokens=num_tokens,
+                        decode=True,
+                        device=device,
+                    )
+                )
             )
 
         return decode_warmup_kwargs

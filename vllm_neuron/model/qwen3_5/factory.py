@@ -26,12 +26,19 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @classmethod
     def from_configs(
-        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        cls,
+        hf_config: PretrainedConfig,
+        neuron_config: NeuronConfig | None = None,
+        text_neuron_config: NeuronConfig | None = None,
+        vision_neuron_config: NeuronConfig | None = None,
     ) -> nn.Module:
+        """The runner passes ``text_neuron_config``/``vision_neuron_config``
+        whenever the checkpoint carries a vision tower, which Qwen3.5 does.
+        Only the text config is used here; the vision tower is not served."""
         cls._validate_config(hf_config)
         from .model import Qwen3_5ForCausalLM as Model
 
-        return Model.from_configs(hf_config, neuron_config)
+        return Model.from_configs(hf_config, neuron_config or text_neuron_config)
 
     @staticmethod
     def _validate_config(hf_config: PretrainedConfig) -> None:
