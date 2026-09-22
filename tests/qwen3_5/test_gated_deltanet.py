@@ -428,3 +428,27 @@ def test_unit_lower_inverse_matches_forward_substitution():
     torch.testing.assert_close(
         gdn._unit_lower_inverse(system), substituted, atol=1e-9, rtol=1e-9
     )
+
+
+@pytest.mark.parametrize("chunk_size", [4, 8, 64, 128])
+def test_prefill_output_is_independent_of_chunk_size(chunk_size):
+    """chunk_size only sets summation order. Neuron needs 128 (see
+    layer_step.CHUNK_SIZE); the result must not depend on that choice."""
+    torch.manual_seed(11)
+    batch, length, heads, dk, dv = 1, 256, 2, 16, 16
+    q = torch.randn(batch, length, heads, dk, dtype=torch.float32)
+    k = torch.randn(batch, length, heads, dk, dtype=torch.float32)
+    v = torch.randn(batch, length, heads, dv, dtype=torch.float32)
+    g = -torch.rand(batch, length, heads, dtype=torch.float32)
+    beta = torch.rand(batch, length, heads, dtype=torch.float32)
+    state = torch.zeros(batch, heads, dk, dv, dtype=torch.float32)
+    lengths = torch.tensor([length])
+
+    out, new_state = gdn.chunk_gated_delta_rule(
+        q, k, v, g, beta, state, lengths, chunk_size=chunk_size
+    )
+    want_out, want_state = gdn.recurrent_gated_delta_rule(
+        q, k, v, g, beta, state, lengths
+    )
+    torch.testing.assert_close(out, want_out, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(new_state, want_state, atol=1e-4, rtol=1e-4)

@@ -19,6 +19,15 @@ from .runner_state import GdnStepInputs
 from .state import RecurrentStateBuffers
 
 
+# Chunk width for the prefill delta rule. 128 is the only size that
+# neuronx-cc 2.32 compiles: 64 and 32 trip an internal vectorizer assertion
+# ("MacroGeneration ... Trying to vectorize non loop axis", NCC_IMGN901) when
+# a tile narrower than an SBUF partition feeds the chunk loop's matmuls, and
+# 256 fails ISA validation (NCC_IINAR001). It only sets summation order, so
+# the numerics are unchanged; docs/qwen3_5/RUNBOOK.md has the bisect.
+CHUNK_SIZE = 128
+
+
 def gdn_layer_step(
     hidden: torch.Tensor,
     weights: dict[str, torch.Tensor],
@@ -32,7 +41,7 @@ def gdn_layer_step(
     head_v_dim: int,
     eps: float,
     decode: bool,
-    chunk_size: int = 64,
+    chunk_size: int = CHUNK_SIZE,
 ) -> torch.Tensor:
     """Run layer ``layer``'s token mixer for one step; update its state in place.
 
