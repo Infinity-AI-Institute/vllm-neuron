@@ -313,7 +313,13 @@ def gated_deltanet_mixer(
 
     mixed, conv_state = causal_conv1d(mixed, weights["conv1d"], conv_state, lengths)
     mixed = mixed.transpose(1, 2)
-    query, key, value = torch.split(mixed, [key_dim, key_dim, value_dim], dim=-1)
+    # NOTE(trn2): sliced, not torch.split. neuronx-cc 2.32 miscompiles
+    # torch.split/torch.chunk on the last dim — it returns wrong values with
+    # no error, while the same slices are correct. Verified device vs CPU on
+    # this exact tensor; see docs/qwen3_5/RUNBOOK.md.
+    query = mixed[..., :key_dim]
+    key = mixed[..., key_dim : 2 * key_dim]
+    value = mixed[..., 2 * key_dim : 2 * key_dim + value_dim]
     query = query.reshape(batch, length, num_k_heads, head_k_dim)
     key = key.reshape(batch, length, num_k_heads, head_k_dim)
     value = value.reshape(batch, length, num_v_heads, head_v_dim)

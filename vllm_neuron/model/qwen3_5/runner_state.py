@@ -33,6 +33,11 @@ Two more rules:
 - **One trailing sink row, always.** Tokens past the per-request segments
   (bucket padding of the whole flattened batch) go to it, which keeps the
   batch dimension fixed per compile bucket: ``num_reqs_padded + 1``.
+- **Segment counts come from the runner, not the device.** ``index_add_``
+  (and the ``bincount`` it stands in for) returns wrong values under
+  neuronx-cc 2.32, which silently zeroes the padding mask. The runner
+  already knows every row's token count, so it passes ``counts`` and
+  ``offsets`` instead of having the graph recompute them.
 - **``max_len`` is a function of the compiled shape only**, never of the
   step's contents (:func:`static_max_len`), so ``torch.compile`` sees one
   value per bucket and never recompiles on it. The model derives the same
@@ -68,6 +73,8 @@ class GdnStepInputs:
     lengths: torch.Tensor  # [rows] int64: real tokens per row
     state_slots: torch.Tensor  # [rows] int64: stable state slot per row
     state_reset: torch.Tensor  # [rows] bool: start this row from zero state
+    counts: torch.Tensor  # [rows] int64: tokens per row, padding included
+    offsets: torch.Tensor  # [rows] int64: first flat token of each row
     max_len: int  # static padded segment length for this bucket
 
     @property
@@ -152,6 +159,10 @@ class GdnRunnerState:
         slots = np.full(num_reqs_padded + 1, self.sink, dtype=np.int64)
         slots[:num_reqs] = self.allocator.slots_for_rows(list(req_ids), self.sink)
 
+        # Row sizes on the host: the device must not recompute them.
+        counts = np.bincount(request_of_token, minlength=num_reqs_padded + 1)
+        offsets = np.cumsum(counts) - counts
+
         # The sink row's segment holds any tail tokens; its length stays 0
         # and it may be longer than max_len (see padded_to_tokens).
         max_len = static_max_len(num_tokens, decode)
@@ -167,6 +178,8 @@ class GdnRunnerState:
             lengths=as_tensor(lengths, torch.int64),
             state_slots=as_tensor(slots, torch.int64),
             state_reset=as_tensor(reset, torch.bool),
+            counts=as_tensor(counts, torch.int64),
+            offsets=as_tensor(offsets, torch.int64),
             max_len=max_len,
         )
 
@@ -193,5 +206,9 @@ class GdnRunnerState:
                 (rows,), self.sink, dtype=torch.int64, device=device
             ),
             state_reset=torch.ones(rows, dtype=torch.bool, device=device),
+            counts=torch.tensor(
+                [0] * num_reqs_padded + [num_tokens], dtype=torch.int64, device=device
+            ),
+            offsets=torch.zeros(rows, dtype=torch.int64, device=device),
             max_len=static_max_len(num_tokens, decode),
         )

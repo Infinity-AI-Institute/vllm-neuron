@@ -57,8 +57,9 @@ def gdn_layer_step(
         ``[num_tokens, hidden]``; a row-parallel partial sum under TP, which
         the caller reduces.
     """
-    rows = step.rows
-    counts, offsets = gdn.segment(step.request_of_token, rows)
+    # counts/offsets come from the runner: computing them here with
+    # index_add_ gives wrong values on Trainium2 (see runner_state).
+    counts, offsets = step.counts, step.offsets
     padded = gdn.tokens_to_padded(hidden, offsets, counts, step.max_len)
 
     conv, recurrent = buffers.read(layer, step.state_slots, step.state_reset)

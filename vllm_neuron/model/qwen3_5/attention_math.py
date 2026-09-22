@@ -74,7 +74,10 @@ def split_query_gate(
     """
     tokens = q_proj_out.shape[0]
     pair = q_proj_out.view(tokens, num_heads, 2 * head_dim)
-    query, gate = torch.chunk(pair, 2, dim=-1)
+    # Sliced rather than torch.chunk: chunk/split on the last dim is
+    # miscompiled by neuronx-cc 2.32 (silently wrong values on device).
+    query = pair[..., :head_dim]
+    gate = pair[..., head_dim:]
     return query, gate.reshape(tokens, num_heads * head_dim)
 
 

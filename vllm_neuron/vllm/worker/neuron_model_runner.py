@@ -274,6 +274,8 @@ def _gdn_model_kwargs(step) -> dict[str, Any]:
         "gdn_lengths": step.lengths,
         "gdn_state_slots": step.state_slots,
         "gdn_state_reset": step.state_reset,
+        "gdn_counts": step.counts,
+        "gdn_offsets": step.offsets,
     }
 
 

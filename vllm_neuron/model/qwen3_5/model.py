@@ -678,6 +678,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         gdn_lengths=None,
         gdn_state_slots=None,
         gdn_state_reset=None,
+        gdn_counts=None,
+        gdn_offsets=None,
         **kwargs,
     ):
         if inputs_embeds is not None and is_token_ids is not None:
@@ -693,6 +695,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             lengths=gdn_lengths,
             state_slots=gdn_state_slots,
             state_reset=gdn_state_reset,
+            counts=gdn_counts,
+            offsets=gdn_offsets,
             # From shapes, never a runtime int, so each bucket compiles once.
             max_len=static_max_len(
                 input_ids.shape[0], _decode_meta(attn_metadata, self.model.meta_layer)
@@ -717,6 +721,26 @@ class Qwen3_5ForCausalLM(nn.Module):
 
             return rejection_sampler(spec_decode_metadata, sampled)
         return sampled, None
+
+    # ── M-RoPE ───────────────────────────────────────────────────────────
+
+    # Qwen3.5's config carries the multimodal rope section, so the runner sets
+    # uses_mrope and requires vLLM's SupportsMRoPE protocol even though this
+    # model serves text only. For text the three axes (temporal, height,
+    # width) all hold the token's position, which is what the rotary in
+    # Qwen3_5Model already assumes.
+    supports_mrope = True
+
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        """``([3, T]`` positions, delta``)``. Text-only, so every axis is the
+        token index and the decode delta is zero."""
+        if mm_features:
+            raise NotImplementedError(
+                "this text model does not serve image or video input; "
+                "run with --limit-mm-per-prompt '{\"image\":0,\"video\":0}'"
+            )
+        positions = torch.arange(len(input_tokens), dtype=torch.int64)
+        return positions.unsqueeze(0).expand(3, -1).contiguous(), 0
 
     # ── KV cache: full-attention layers only ─────────────────────────────
 
