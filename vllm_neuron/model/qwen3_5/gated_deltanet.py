@@ -54,7 +54,14 @@ def rmsnorm_gated(
     """
     dtype = x.dtype
     h = x.to(torch.float32)
-    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)
+    # Divide by the row's largest magnitude before squaring. The chunked delta
+    # rule legitimately produces |core| ~ 1e19 when the gates decay hard (the
+    # norm is what scales it back), and squaring that overflows float32 to
+    # inf, so rsqrt gives 0 and the result is NaN. RMSNorm is scale-invariant
+    # apart from eps, so scaling first is the same function on finite input.
+    scale = h.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+    h = h / scale
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps / (scale * scale))
     h = weight * h.to(dtype)
     h = h * F.silu(gate.to(torch.float32))
     return h.to(dtype)
@@ -151,28 +158,31 @@ def recurrent_gated_delta_rule(
 
 
 def _unit_lower_inverse(system: torch.Tensor) -> torch.Tensor:
-    """``(I + strictly_lower(system))^{-1}``.
+    """``(I + strictly_lower(system))^{-1}`` by forward substitution.
 
-    With ``M = -strictly_lower(system)`` (nilpotent: ``M^size == 0``) the
-    inverse is the finite Neumann sum ``sum_k M^k``, and the binary
-    expansion collapses it to ``prod_j (I + M^(2^j))``: 6 matmuls for
-    chunk 64 instead of 64 sequential row updates.
+    Row ``i`` of the inverse is ``e_i - sum_{j<i} L[i, j] * row_j``, which is
+    what transformers does. It is written functionally (rows collected, then
+    stacked) because XLA cannot lower the in-place slice write of the
+    reference loop ("Error while lowering: xla::unselect").
 
-    The row-by-row forward substitution transformers uses writes into a
-    slice, which XLA cannot lower ("Error while lowering: xla::unselect")
-    and which unrolls into a large graph. Powers commute, so the product
-    can be taken in any order.
+    Do **not** replace this with the doubling product ``prod (I + M^(2^k))``.
+    That form is algebraically equal but numerically useless here: with this
+    model's gates the intermediate powers reach ~1e11 while the answer is
+    ~1e2, so float32 cancellation leaves no correct digits, and the error
+    compounds chunk over chunk into a state of ~1e20 and then NaN on device.
     """
     size = system.shape[-1]
-    power = -system.tril(-1)
+    lower = system.tril(-1)
     eye = torch.eye(size, dtype=system.dtype, device=system.device)
-    inverse = eye + power
-    span = 2
-    while span < size:
-        power = power @ power  # M^(2^j)
-        inverse = inverse @ (eye + power)
-        span *= 2
-    return inverse
+    rows: list[torch.Tensor] = []
+    for i in range(size):
+        row = eye[i].expand(system.shape[:-2] + (size,))
+        if i:
+            previous = torch.stack(rows, dim=-2)  # [..., i, size]
+            coefficients = lower[..., i, :i].unsqueeze(-1)  # [..., i, 1]
+            row = row - (coefficients * previous).sum(-2)
+        rows.append(row)
+    return torch.stack(rows, dim=-2)
 
 
 def chunk_gated_delta_rule(

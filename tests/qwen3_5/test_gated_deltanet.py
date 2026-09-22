@@ -452,3 +452,19 @@ def test_prefill_output_is_independent_of_chunk_size(chunk_size):
     )
     torch.testing.assert_close(out, want_out, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(new_state, want_state, atol=1e-4, rtol=1e-4)
+
+
+def test_rmsnorm_gated_survives_huge_inputs():
+    """The chunked delta rule feeds |core| ~ 1e19 into this norm when the
+    gates decay hard. Squaring that overflows float32, so the norm must
+    scale before squaring."""
+    x = torch.full((2, 128), 2.8e19, dtype=torch.float32)
+    x[0, ::2] = -1.4e19
+    gate = torch.randn(2, 128, dtype=torch.float32)
+    weight = torch.ones(128, dtype=torch.float32)
+    got = gdn.rmsnorm_gated(x, gate, weight, 1e-6)
+    assert torch.isfinite(got).all(), "norm overflowed on large input"
+    # Same function as the plain form on a scaled-down copy (scale invariance).
+    small = x / 1e19
+    want = gdn.rmsnorm_gated(small, gate, weight, 1e-6)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)

@@ -19,13 +19,19 @@ from .runner_state import GdnStepInputs
 from .state import RecurrentStateBuffers
 
 
-# Chunk width for the prefill delta rule. 128 is the only size that
-# neuronx-cc 2.32 compiles: 64 and 32 trip an internal vectorizer assertion
-# ("MacroGeneration ... Trying to vectorize non loop axis", NCC_IMGN901) when
-# a tile narrower than an SBUF partition feeds the chunk loop's matmuls, and
-# 256 fails ISA validation (NCC_IINAR001). It only sets summation order, so
-# the numerics are unchanged; docs/qwen3_5/RUNBOOK.md has the bisect.
-CHUNK_SIZE = 128
+# Chunk width for the prefill delta rule, as upstream: 64.
+#
+# The width is a numerical choice, not a free one. Inverting the chunk system
+# grows like 2^width: on Trainium2 with this checkpoint's own activations,
+# width 128 reaches 1.3e14 (intermediates 5.4e19) where width 64 reaches
+# 1.6e4. float32 on CPU absorbs 1e14, the device's matmul accumulation does
+# not, so width 128 produced NaN from the first layer whose chunk carried
+# real tokens -- only for prompts longer than one chunk, and it poisoned the
+# KV cache for every later request. See docs/qwen3_5/RUNBOOK.md.
+#
+# 64 also tripped an neuronx-cc vectorizer assertion until the torch.split
+# and index_add_ workarounds landed; the shipping mixer compiles at 64 now.
+CHUNK_SIZE = 64
 
 
 def gdn_layer_step(
