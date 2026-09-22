@@ -147,17 +147,47 @@ produce fluent text.
 
 `bench/qwen3_5/run_bench.sh`, same protocol as the H100 baselines.
 
+## Found on hardware (2026-09-22, trn2.48xlarge, SDK 2.32.0)
+
+The host runs Amazon Linux 2023 (glibc 2.34) and the pip wheels need glibc
+2.35, so everything runs in the AWS container that matches this release:
+
+```sh
+sudo docker run -d --name qwen35 --device=/dev/neuron0 \
+  -v /mnt/data/work/andre:/work -e HF_HOME=/work/hf --entrypoint sleep \
+  public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04 infinity
+sudo docker exec qwen35 pip install --no-deps -e /work/vllm-neuron-qwen35
+```
+
+Four things had to change, in the order they surfaced:
+
+1. **`NEURON_SKIP_EFA_AFFINITY=1`.** The container cannot read the EFA sysfs
+   path; without the flag every worker dies at startup. Not our code.
+2. **The factory must accept `text_neuron_config`/`vision_neuron_config`.**
+   The runner passes those whenever the checkpoint has a vision tower, and
+   Qwen3.5's does.
+3. **The model must declare `uses_gdn_state`/`num_state_slots`**, which is
+   what the runner keys on to build the slot map. Without it the `gdn_*`
+   kwargs were `None` and graph extraction died inside Dynamo.
+4. **head_dim 256 fits no NKI attention kernel.** Both cap at 128 (one SBUF
+   partition). `segmented_attention` raises on the kernel path, so
+   `_prefill_attention` calls its dynamo-traceable torch implementation
+   directly. This is the largest performance gap: 8 of 32 layers run
+   unfused, prefill and decode both.
+
 ## Known risks, most likely first
 
-1. `NF.flash_attention(tp_out=True)` output layout; the gate assumes
-   `[T, Hq * Dh]` (TODO in `_prefill_attention`).
-2. Tracing the chunked delta rule: a Python loop over chunks and a 64-step
+1. Tracing the chunked delta rule: a Python loop over chunks and a 64-step
    forward substitution per chunk unroll into a large graph.
-3. TP/SP collectives around the Gated DeltaNet layer.
-4. KV replication when TP exceeds 4 (KV heads).
+2. TP/SP collectives around the Gated DeltaNet layer.
+3. KV replication when TP exceeds 4 (KV heads).
 
 ## Performance work after it is correct
 
+- **Attention is the first target.** An NKI kernel for head_dim 256 would
+  have to split the head across two SBUF partitions and add the two partial
+  score matrices before the softmax; splitting into two 128-wide kernel
+  calls is not valid, because softmax does not distribute over the split.
 - Fused decode attention: fold `1 + w` into the norm weights, express partial
   rotary as `cos = 1, sin = 0` past channel 64, and find a way to apply the
   gate before `o_proj`.

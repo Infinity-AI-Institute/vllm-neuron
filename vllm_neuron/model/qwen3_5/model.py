@@ -55,6 +55,11 @@ from vllm_neuron.utils.weight_loader import (
     with_rank_override,
 )
 
+from vllm_neuron.functional.attention.attention_cte import MAX_HEAD_DIM
+from vllm_neuron.functional.attention.attention_segmented_cte import (
+    _torch_segmented_attention_impl,
+)
+
 from ..qwen3.model import Qwen3MLP
 from . import attention_math as am
 from .config import Qwen3_5Config
@@ -268,10 +273,23 @@ class Qwen3_5Attention(nn.Module):
         return out.contiguous()
 
     def _prefill_attention(self, query, key, value, attn_metadata):
-        """Mirrors qwen3's prefill kernels. Returns ``[T, Hq * Dh]``."""
+        """Prefill attention over the paged cache. Returns ``[T, Hq * Dh]``.
+
+        <-- MODEL-SPECIFIC: head_dim 256. Both NKI attention kernels cap
+        head_dim at 128 (one SBUF partition), so Qwen3.5's full-attention
+        layers cannot use them. ``segmented_attention`` raises on the kernel
+        path, so its own dynamo-traceable torch implementation is called
+        directly; ``flash_attention`` already falls back on its own. This is
+        the main performance gap: 8 of 32 layers run unfused.
+        """
         meta = attn_metadata[self.layer_name]
         if meta.get("kv_segment_size"):
-            attn = NF.segmented_attention(
+            segmented = (
+                _torch_segmented_attention_impl
+                if self.head_dim > MAX_HEAD_DIM
+                else NF.segmented_attention
+            )
+            attn = segmented(
                 query,
                 k_cache=self.k_cache,
                 v_cache=self.v_cache,
@@ -281,7 +299,7 @@ class Qwen3_5Attention(nn.Module):
                 kv_segment_size=meta["kv_segment_size"],
                 scale=self.scaling,
                 tp_q=True,
-                tp_out=True,
+                tp_out=False,
             )
         else:
             key = key.repeat_interleave(self.num_kv_groups, dim=0)
@@ -292,11 +310,10 @@ class Qwen3_5Attention(nn.Module):
                 value,
                 scale=self.scaling,
                 tp_q=False,
-                tp_out=True,
+                tp_out=False,
             )
-        # TODO(trn2): confirm tp_out=True yields [T, Hq * Dh] as qwen3's
-        # o_proj call implies; the gate multiplies that layout.
-        return attn
+        # [Hq, T, Dh] -> [T, Hq * Dh], the layout the gate and o_proj want.
+        return attn.permute(1, 0, 2).reshape(attn.shape[1], -1)
 
     def _decode_attention(self, query, positions, attn_metadata):
         """Unfused paged attention; the new token's K/V is already written.
