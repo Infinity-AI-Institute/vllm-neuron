@@ -8,6 +8,29 @@ hybrid of 24 Gated DeltaNet (linear-attention, recurrent) layers and 8 gated
 full-attention layers, and neither library implements the recurrent layer.
 This branch adds it.
 
+## Results (2026-09-23, trn2.48xlarge, 1 chip / TP=4, SDK 2.32.0)
+
+Greedy output is token-identical to transformers 5.17.0 on the pinned
+checkpoint for a short prompt, a generation prompt, and a 2393-token prompt
+that chunk-prefills across steps (`accuracy.py`, ALL_MATCH).
+
+`vllm bench serve`, 128 output tokens, concurrency 1, 12 prompts:
+
+| input | output tok/s | TTFT ms | TPOT ms | e2e s |
+| --- | --- | --- | --- | --- |
+| 128 | 5.85 | 915 | 165 | 21.9 |
+| 512 | 5.85 | 917 | 165 | 21.9 |
+| 2048 | 5.85 | 925 | 165 | 21.9 |
+
+For comparison, inf-lib's own `qwen3_5_9b/trainium2_x1` leaf reaches
+1.29 tok/s, so this is 4.5x that and matches the reference. It is still far
+off what the chip can do: decode is 165 ms/token and throughput does not
+move with input length, so the cost is per-step, not prefill. The 8
+full-attention layers run unfused (no NKI kernel takes head_dim 256), which
+is the first thing to fix.
+
+Raw results: `bench/qwen3_5/results/`.
+
 ## Status
 
 | Piece | File | Verified |
@@ -174,6 +197,44 @@ Four things had to change, in the order they surfaced:
    `_prefill_attention` calls its dynamo-traceable torch implementation
    directly. This is the largest performance gap: 8 of 32 layers run
    unfused, prefill and decode both.
+
+## What actually broke, and how it was found
+
+Five bring-up bugs (EFA flag, vision configs, the `uses_gdn_state` hook,
+head_dim 256, XLA's refusal to lower the in-place inverse) are covered
+above. Three more only appear on device, all silent:
+
+1. **`torch.split` / `torch.chunk` on the last dim return wrong values.**
+   Plain slicing of the same tensor is correct. Found by comparing one layer
+   device vs CPU on identical inputs and bisecting stage by stage.
+2. **`index_add_` returns wrong counts**, which zeroed the padding mask and
+   emptied every row. The runner now passes `counts`/`offsets` instead.
+3. **The doubling form of the chunk inverse is numerically unusable.** This
+   one was mine: XLA cannot lower transformers' in-place forward
+   substitution, so it was replaced by `prod (I + M^(2^k))`, which is
+   algebraically equal. With this model's gates its intermediates reach
+   ~1e11 for an answer of ~1e2, float32 cancellation leaves nothing, and the
+   error compounds into a state of ~1e20 -- which CPU float32 still absorbed
+   (CPU mode stayed correct at every length) and the device turned into NaN.
+
+The method that worked, after a lot of guessing that did not: run the same
+layer on device and on CPU with identical inputs, and bisect. Layer-level
+comparison found (1) and (2) in minutes each. For (3) the layer harness
+passed with random weights at every length, and only the model's own
+captured activations (tensor capture, then feeding layer N-1's output back
+through layer N) reproduced it. The decisive check was comparing both of our
+forms against `transformers` `torch_chunk_gated_delta_rule` on that real
+data: our recurrent form matched to 0.0, our chunked form did not.
+
+Useful while debugging, kept for the next person:
+
+- `--additional-config` with `neuron_config.tensor_capture.modules =
+  ["model.layers.0-31"]` dumps per-layer outputs per rank; concatenating the
+  ranks rebuilds the sequence.
+- NaN in *padding* rows is harmless, NaN in real rows is not; check which
+  rows before assuming.
+- A poisoned KV cache makes every later request fail, so a fresh server per
+  experiment is worth the six minutes.
 
 ## Known risks, most likely first
 
