@@ -361,10 +361,12 @@ def test_host_inventory_tampering_fails_closed(mutation: str) -> None:
 def test_driver_validates_the_same_contract_before_any_side_effect() -> None:
     driver = (PACKAGE / "command.sh").read_text(encoding="utf-8")
     validator = driver.index("validate_compile_authorization.py")
+    fresh_guard = driver.index('test ! -e "$COMPILE_RUN_ROOT/$output_dir"')
     mkdir = driver.index('mkdir -p "$COMPILE_RUN_ROOT"')
     copy = driver.index('cp -al "$COMPILE_RUN_ROOT/weights/')
     docker = driver.index("sudo docker run")
-    assert validator < mkdir < copy < docker
+    assert validator < fresh_guard < mkdir < copy < docker
+    assert "for output_dir in cache work artifacts logs; do" in driver
     assert '--compile-contract "$COMPILE_CONTRACT"' in driver
     assert '--evidence-root "$AUTH_EVIDENCE_ROOT"' in driver
     assert '--model-dir "$MODEL_DIR"' in driver
